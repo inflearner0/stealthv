@@ -360,37 +360,62 @@ Two guards exist because of that, and neither makes it a good idea:
 Watch data you expect to be touched rarely. For anything frequent, use an exec
 hook with a filter.
 
-## Parameters
+## Configuration
 
-`HKLM\SYSTEM\CurrentControlSet\Services\svmhv\Parameters`, all `REG_DWORD`:
+There is no registry key, and nothing is read at load time. Every option is a
+constant in `driver/config.h`, folded into the code at build time.
 
-| Value | Default | |
+That is itself a concealment decision. A driver that reads its own settings out
+of `HKLM` leaves the settings sitting in `HKLM`, where anyone curious about the
+machine can read the exact list of what is being hidden from them and switch it
+off — and the read is a behaviour worth noticing in its own right. The only way
+to change any of this is to rebuild.
+
+| Constant | Default | What it does |
 |---|---|---|
-| `NestedPaging` | 1 | nested page tables, and therefore hooks |
-| `HideSvmCpuid` | 1 | erase SVM from CPUID |
-| `HideEfer` | environment | intercept `EFER` so `SVME` reads as clear |
-| `TscOffset` | 1 | calibrate away the cost of an intercepted `CPUID` |
-| `HidePages` | 1 | hide the driver's own pages from the guest |
-| `AlwaysFlushTlb` | 0 | flush the guest ASID on every entry instead of on demand |
-| `ControlInterface` | 1 | publish `g_Control` and run the worker that answers it |
+| `STEALTHV_NESTED_PAGING` | 1 | nested page tables, and therefore hooks and page hiding |
+| `STEALTHV_HIDE_SVM_CPUID` | 1 | erase SVM from `8000_0001` and `8000_000A` |
+| `STEALTHV_HIDE_EFER` | 1 | intercept `EFER` so `SVME` reads as clear |
+| `STEALTHV_TSC_OFFSET` | 1 | calibrate away the cost of an intercepted `CPUID` |
+| `STEALTHV_HIDE_PAGES` | 1 | the driver's own pages read as zeroes |
+| `STEALTHV_ALWAYS_FLUSH_TLB` | 0 | flush the ASID every entry — **leave this off** |
+| `STEALTHV_CONTROL_INTERFACE` | 1 | answer the control leaf and run its worker |
 
-`AlwaysFlushTlb` restores the behaviour this driver had before nested paging.
-Do not turn it on: with nested paging it stops the guest making progress. See the
-TLB note below.
+Everything defaults to the most concealed setting it can. Two of them are worth
+understanding before you change anything.
 
-With `ControlInterface` at 0 the driver has no interface of any kind — nothing to
-open, nothing to call, and no thread waking up to look at a doorbell.
+**`STEALTHV_HIDE_EFER` is on, and it is not free.** The MSRPM describes only
+three MSR ranges, and anything outside them exits *unconditionally* once the MSR
+intercept is set. On bare metal every MSR Windows touches often is inside one of
+those ranges, so intercepting costs almost nothing. Under a parent hypervisor it
+is a different story: Hyper-V's synthetic MSRs live at `0x4000_00xx`, outside all
+three, and an APIC-enlightened guest writes `HV_X64_MSR_EOI` on every interrupt —
+about **200 000 exits per second**, measured in this lab.
 
-`HideEfer` defaults to on bare metal and off under a parent hypervisor, because
-the cost is wildly different. The MSRPM describes only three MSR ranges and
-anything outside them exits *unconditionally* once the MSR intercept is set. On
-bare metal every MSR Windows touches often is inside one of those ranges, so
-intercepting is nearly free. Under Hyper-V it is not: the synthetic MSRs live at
-`0x4000_00xx`, outside all three, and an APIC-enlightened guest writes
-`HV_X64_MSR_EOI` on every interrupt — about 200 000 exits per second, measured.
-So under Hyper-V a ring-0 `rdmsr` of `EFER` can still see `SVME` set. That is a
-deliberate trade, and `hvtest` reports it as a note rather than a failure when
-`HideEfer` is off; set it to 1 and the check becomes real.
+It is on anyway. A bit that says "a hypervisor is installed" is worth more to
+somebody looking for you than the cycles are to you, and this used to default off
+under a parent hypervisor precisely because the cost is visible — which meant the
+stealthiest configuration was the one nobody was running. If you are nested and
+want the throughput back, set it to 0 and accept that a ring-0 `RDMSR` can see
+`SVME`. The driver logs a line at load when it is hiding EFER under a parent
+hypervisor, so the cost is never a mystery later.
+
+**`STEALTHV_CONTROL_INTERFACE` is the last knob between instrumentable and
+absent.** With it at 1 there is still no device object, no symbolic link and no
+dispatch routine — nothing reachable from user mode without the key, and the
+control leaf passes straight through to the hardware for anyone who does not have
+it. What it does cost is a system thread that wakes ten times a second, which a
+scan of system threads can see, and one more CPUID leaf that answers.
+
+Set it to 0 and the driver has no interface of any kind: nothing to open, nothing
+to call, no thread waking up to look at a doorbell. `svmhvctl.exe` and the MCP
+server stop working, because there is nothing left to talk to. That is the
+trade — full concealment or a tool you can drive, and you cannot have both.
+
+Two capability checks **refuse to load** rather than quietly downgrading: a
+processor without nested paging, and a host with `EFER.NXE` clear. Both used to
+disable hooks and carry on, which meant a build that asked for concealment could
+end up running with the hooks and the page hiding silently absent.
 
 ## Running under Hyper-V
 
@@ -446,8 +471,8 @@ flushing it passes over and over.
 So flushing is now on demand: every forwarded hypercall flushes locally — which
 is exactly where the guest asked for one — the four flush call codes also raise a
 generation so the other processors flush on their next entry, and nothing else
-flushes at all. `AlwaysFlushTlb=1` restores the old behaviour for comparison and
-should be left alone otherwise.
+flushes at all. `STEALTHV_ALWAYS_FLUSH_TLB` restores the old behaviour for
+comparison and should be left alone otherwise.
 
 This also happens to be what makes the MSR intercept thinkable, since that
 multiplies the number of exits by a hundred.
@@ -535,7 +560,7 @@ here costs 6 000–19 000 cycles and Windows makes hypercalls continuously while
 creating processes, but plausible is not measured, and no bugcheck or dump was
 ever produced to settle it.
 
-The third row is also the reason `AlwaysFlushTlb` defaults to 0. That went the
+The third row is also the reason `STEALTHV_ALWAYS_FLUSH_TLB` defaults to 0. That went the
 opposite way to the guess: flush-every-entry was the historically safe setting,
 so it was tried as a fix, and it made a passing test fail.
 
@@ -569,10 +594,12 @@ Deliberate, in the name of staying readable:
 - TSC compensation is per-processor and cumulative, so a thread that executes a
   lot of `CPUID` drags that processor's clock behind the others. Measured over
   2400 forced migrations while `hvtest` hammered `CPUID`: a worst backwards step
-  of 28 ms. Windows tolerated it, but this is why the option is a switch.
-- Under a parent hypervisor, `EFER.SVME` is readable from ring 0 by default —
-  see `HideEfer` above.
-- `RDMSR`/`WRMSR` exits are not TSC-compensated, and when `HideEfer` is on, an
+  of 28 ms. Windows tolerated it, but this is why it is still a switch.
+- Hiding `EFER.SVME` costs about 200 000 extra exits per second under a parent
+  hypervisor, and that cost is now paid by default — see *Configuration* above.
+  Set `STEALTHV_HIDE_EFER` to 0 to get the throughput back, at the price of a
+  ring-0 `RDMSR` seeing `SVME` set.
+- `RDMSR`/`WRMSR` exits are not TSC-compensated, and while `EFER` is hidden, an
   MSR the hardware does not implement is passed through inside `__try`/`__except`
   — a `#GP` dispatched with `GIF` clear on the host stack. It should survive
   (the host IDT and GS base are the real ones by then) but it is untested,

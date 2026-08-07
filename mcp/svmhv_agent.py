@@ -77,7 +77,7 @@ def ctl(*arguments: str) -> str:
     if "present=0" in text or "is not loaded" in text:
         raise CtlError(
             "the hypervisor did not answer the control leaf: svmhv is not loaded, "
-            "or its ControlInterface parameter is 0"
+            "or was built with STEALTHV_CONTROL_INTERFACE 0"
         )
     return text
 

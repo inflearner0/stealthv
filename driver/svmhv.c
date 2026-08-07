@@ -25,6 +25,7 @@
  */
 
 #include "svmhv.h"
+#include "config.h"
 #include "hook.h"
 #include "trace.h"
 #include "control.h"
@@ -83,98 +84,15 @@ static UINT64        g_TscHidePerExit;     /* what an intercept adds to it  */
  */
 static volatile LONG g_FlushGeneration;
 
-/* Concealment options, overridable from the service's Parameters key. */
-static ULONG g_OptNestedPaging  = 1;
-static ULONG g_OptHideSvmCpuid  = 1;
-static ULONG g_OptHideEfer      = 2;   /* 2 = decide from the environment  */
-static ULONG g_OptTscOffset     = 1;
-static ULONG g_OptHidePages     = 1;
-/*
- * Whether to publish the control block and run the worker that answers it.  With
- * this at zero the driver has no interface of any kind: nothing to open, nothing
- * to call, and no thread waking up to look at a doorbell.
- */
-static ULONG g_OptControl       = 1;
-
-/*
- * Flush this guest's ASID on every entry, rather than only when the guest asked
- * for one.  This is what the driver did before nested paging existed, and with
- * nested paging it is ruinous: TLB_CONTROL 3 discards this ASID's *nested*
- * translations too, and running under Hyper-V that forces the layer above us to
- * rebuild the structures shadowing our nested page tables, every entry.  With it
- * on, even the short functional test stops making progress; with it off that
- * test passes repeatedly.  So it stays off, and exists only to get the
- * pre-nested-paging behaviour back for comparison.
- */
-static ULONG g_OptAlwaysFlush   = 0;
-
-/* --------------------------------------------------------- parameters */
-
-static ULONG SvReadDword(_In_ HANDLE Key, _In_ PCWSTR Name, _In_ ULONG Default)
-{
-    UNICODE_STRING name;
-    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
-    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
-    ULONG length;
-
-    RtlInitUnicodeString(&name, Name);
-
-    if (NT_SUCCESS(ZwQueryValueKey(Key, &name, KeyValuePartialInformation,
-                                   info, sizeof(buffer), &length)) &&
-        info->Type == REG_DWORD && info->DataLength == sizeof(ULONG))
-    {
-        return *(ULONG UNALIGNED*)info->Data;
-    }
-
-    return Default;
-}
-
-static VOID SvReadParameters(_In_ PUNICODE_STRING RegistryPath)
-{
-    OBJECT_ATTRIBUTES attributes;
-    UNICODE_STRING path;
-    WCHAR buffer[320];
-    HANDLE key;
-
-    path.Buffer = buffer;
-    path.Length = 0;
-    path.MaximumLength = sizeof(buffer);
-
-    if (!NT_SUCCESS(RtlAppendUnicodeStringToString(&path, RegistryPath)) ||
-        !NT_SUCCESS(RtlAppendUnicodeToString(&path, L"\\Parameters")))
-    {
-        return;
-    }
-
-    InitializeObjectAttributes(&attributes, &path,
-                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-                               NULL, NULL);
-
-    if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &attributes)))
-    {
-        return;
-    }
-
-    g_OptNestedPaging   = SvReadDword(key, L"NestedPaging", g_OptNestedPaging);
-    g_OptHideSvmCpuid   = SvReadDword(key, L"HideSvmCpuid", g_OptHideSvmCpuid);
-    g_OptHideEfer       = SvReadDword(key, L"HideEfer", g_OptHideEfer);
-    g_OptTscOffset      = SvReadDword(key, L"TscOffset", g_OptTscOffset);
-    g_OptHidePages      = SvReadDword(key, L"HidePages", g_OptHidePages);
-    g_OptControl        = SvReadDword(key, L"ControlInterface", g_OptControl);
-    g_OptAlwaysFlush    = SvReadDword(key, L"AlwaysFlushTlb", g_OptAlwaysFlush);
-
-    ZwClose(key);
-}
-
 static UINT32 SvOptionBits(VOID)
 {
     UINT32 bits = 0;
 
-    if (g_OptNestedPaging) bits |= SVMHV_OPT_NESTED_PAGING;
-    if (g_OptHideSvmCpuid) bits |= SVMHV_OPT_HIDE_SVM_CPUID;
-    if (g_OptHideEfer)     bits |= SVMHV_OPT_HIDE_EFER;
-    if (g_OptTscOffset)    bits |= SVMHV_OPT_TSC_OFFSET;
-    if (g_OptHidePages)    bits |= SVMHV_OPT_HIDE_PAGES;
+    if (STEALTHV_NESTED_PAGING) bits |= SVMHV_OPT_NESTED_PAGING;
+    if (STEALTHV_HIDE_SVM_CPUID) bits |= SVMHV_OPT_HIDE_SVM_CPUID;
+    if (STEALTHV_HIDE_EFER)     bits |= SVMHV_OPT_HIDE_EFER;
+    if (STEALTHV_TSC_OFFSET)    bits |= SVMHV_OPT_TSC_OFFSET;
+    if (STEALTHV_HIDE_PAGES)    bits |= SVMHV_OPT_HIDE_PAGES;
     if (g_ForwardHypercalls) bits |= SVMHV_OPT_PARENT_HYPERVISOR;
     if (g_1GbPages)        bits |= SVMHV_OPT_1GB_PAGES;
 
@@ -220,10 +138,13 @@ static BOOLEAN SvIsSvmSupported(VOID)
     g_TlbControl = (regs[3] & CPUID_SVM_FLUSH_BY_ASID) ? SVM_TLB_CONTROL_FLUSH_ASID
                                                        : SVM_TLB_CONTROL_FLUSH_ALL;
 
-    if (g_OptNestedPaging && (regs[3] & CPUID_SVM_NESTED_PAGING) == 0)
+    if (STEALTHV_NESTED_PAGING && (regs[3] & CPUID_SVM_NESTED_PAGING) == 0)
     {
-        DbgPrint("svmhv: nested paging not available - hooks disabled\n");
-        g_OptNestedPaging = 0;
+        /* Built expecting nested paging, and this processor has none.  Refusing
+           to load is better than running with the hooks and the page hiding
+           silently absent. */
+        DbgPrint("svmhv: nested paging is not available on this processor\n");
+        return FALSE;
     }
 
     /*
@@ -231,10 +152,12 @@ static BOOLEAN SvIsSvmSupported(VOID)
      * has EFER.NXE set.  Windows always does; without it the shadow hierarchy
      * would be executable everywhere and hooks would never fire.
      */
-    if (g_OptNestedPaging && (__readmsr(MSR_EFER) & EFER_NXE) == 0)
+    if (STEALTHV_NESTED_PAGING && (__readmsr(MSR_EFER) & EFER_NXE) == 0)
     {
-        DbgPrint("svmhv: host EFER.NXE is clear - hooks disabled\n");
-        g_OptNestedPaging = 0;
+        /* Without NXE the NX bit in a nested entry is ignored, the shadow
+           hierarchy is executable everywhere, and no hook would ever fire. */
+        DbgPrint("svmhv: host EFER.NXE is clear; nested paging cannot work\n");
+        return FALSE;
     }
 
     /*
@@ -245,31 +168,15 @@ static BOOLEAN SvIsSvmSupported(VOID)
     __cpuid(regs, CPUID_HV_VENDOR);
     g_ForwardHypercalls = (regs[1] == 'rciM' && regs[2] == 'foso' && regs[3] == 'vH t');
 
-    /*
-     * Deciding whether to hide EFER.SVME is a straight trade.  The MSRPM only
-     * describes three MSR ranges and anything outside them exits
-     * *unconditionally* once the MSR intercept is on.  On bare metal every MSR
-     * Windows touches often is inside one of those ranges, so intercepting is
-     * nearly free.  Under Hyper-V it is not: the synthetic MSRs live at
-     * 0x4000_00xx, outside all three, and an APIC-enlightened guest writes
-     * HV_X64_MSR_EOI on every interrupt - about 200k exits per second, measured.
-     * So hide it by default only where it is affordable, and let the registry
-     * override the choice either way.
-     */
-    if (g_OptHideEfer == 2)
-    {
-        g_OptHideEfer = g_ForwardHypercalls ? 0 : 1;
-    }
-
     DbgPrint("svmhv: SVM available (nrip=%d, asids=%d, tlbctl=%d, 1gb=%d, "
              "hyper-v parent=%d)\n",
              g_NripSupported, asidCount, g_TlbControl, g_1GbPages,
              g_ForwardHypercalls);
     DbgPrint("svmhv: options: npt=%lu hide-svm-cpuid=%lu hide-efer=%lu "
              "tsc-offset=%lu hide-pages=%lu debug-device=%lu always-flush=%lu\n",
-             g_OptNestedPaging, g_OptHideSvmCpuid, g_OptHideEfer,
-             g_OptTscOffset, g_OptHidePages, g_OptControl,
-             g_OptAlwaysFlush);
+             STEALTHV_NESTED_PAGING, STEALTHV_HIDE_SVM_CPUID, STEALTHV_HIDE_EFER,
+             STEALTHV_TSC_OFFSET, STEALTHV_HIDE_PAGES, STEALTHV_CONTROL_INTERFACE,
+             STEALTHV_ALWAYS_FLUSH_TLB);
 
     return TRUE;
 }
@@ -463,7 +370,7 @@ static BOOLEAN SvHandleCpuid(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Co
          * from VMRUN has found us; a guest told there is no SVM behaves
          * exactly as it would on a machine that has none.
          */
-        if (g_OptHideSvmCpuid)
+        if (STEALTHV_HIDE_SVM_CPUID)
         {
             regs[2] &= ~(int)CPUID_EXT_FEATURE_SVM;
         }
@@ -471,7 +378,7 @@ static BOOLEAN SvHandleCpuid(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Co
 
     case CPUID_SVM_FEATURES:
         /* Reserved on a processor without SVM. */
-        if (g_OptHideSvmCpuid)
+        if (STEALTHV_HIDE_SVM_CPUID)
         {
             regs[0] = regs[1] = regs[2] = regs[3] = 0;
         }
@@ -494,7 +401,7 @@ static BOOLEAN SvHandleCpuid(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Co
          * have, and only when the key is right - without it this leaf passes
          * through to the hardware like any other reserved one.
          */
-        if (g_OptControl && subLeaf == SVMHV_CONTROL_KEY)
+        if (STEALTHV_CONTROL_INTERFACE && subLeaf == SVMHV_CONTROL_KEY)
         {
             SvHandleControlCall(Context);
             SvAdvanceRip(&Cpu->GuestVmcb, 2);
@@ -839,7 +746,7 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
      * instruction pair, so paying for those as well would only drag this
      * processor's clock away from the others for no benefit.
      */
-    Cpu->Layout->TscHide = (g_OptTscOffset && timeable) ? g_TscHidePerExit : 0;
+    Cpu->Layout->TscHide = (STEALTHV_TSC_OFFSET && timeable) ? g_TscHidePerExit : 0;
     Cpu->TscOverhead = (INT64)Cpu->Layout->TscTotal;
     Cpu->TscHidden   = Cpu->Layout->TscOffset;
 
@@ -848,7 +755,7 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
         Cpu->FlushGeneration = g_FlushGeneration;
         Cpu->PendingFlush = TRUE;
     }
-    vmcb->Control.TlbControl = (g_OptAlwaysFlush || Cpu->PendingFlush)
+    vmcb->Control.TlbControl = (STEALTHV_ALWAYS_FLUSH_TLB || Cpu->PendingFlush)
                              ? g_TlbControl : SVM_TLB_CONTROL_NOTHING;
     Cpu->PendingFlush = FALSE;
 
@@ -892,7 +799,7 @@ static VOID SvPrepareVmcb(_Inout_ VIRTUAL_CPU* Cpu, _In_ const CONTEXT* Guest)
                                      SVM_INTERCEPT_CLGI    |
                                      SVM_INTERCEPT_SKINIT;
 
-    if (g_OptHideEfer)
+    if (STEALTHV_HIDE_EFER)
     {
         vmcb->Control.InterceptVector3 |= SVM_INTERCEPT_MSR;
     }
@@ -908,7 +815,7 @@ static VOID SvPrepareVmcb(_Inout_ VIRTUAL_CPU* Cpu, _In_ const CONTEXT* Guest)
     vmcb->Control.TlbControl = g_TlbControl;
     Cpu->FlushGeneration = g_FlushGeneration;
 
-    if (g_OptNestedPaging)
+    if (STEALTHV_NESTED_PAGING)
     {
         vmcb->Control.NpEnable = SVM_NP_ENABLE;
         vmcb->Control.NCr3     = g_NptPrimary.Pml4Pa;
@@ -1330,7 +1237,7 @@ VOID SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result)
     Result->CpuidCycles    = SvMeasureCpuid(TRUE);
     Result->BaselineCycles = SvMeasureCpuid(FALSE);
 
-    if (g_OptNestedPaging)
+    if (STEALTHV_NESTED_PAGING)
     {
         Result->Passed |= SVMHV_TEST_NPT_ACTIVE;
     }
@@ -1472,7 +1379,7 @@ VOID SvFillStats(_Out_ SVMHV_STATS* Stats)
     Stats->Options           = SvOptionBits();
     Stats->ActiveHooks       = SvHookActiveCount();
     Stats->NptSplitPagesUsed = SvNptSplitPagesUsed();
-    Stats->NptCoverageBytes  = g_OptNestedPaging ? SvNptCoverage() : 0;
+    Stats->NptCoverageBytes  = STEALTHV_NESTED_PAGING ? SvNptCoverage() : 0;
     Stats->NativeCpuidCycles = g_NativeCpuidCost;
     Stats->HiddenPerExit     = g_TscHidePerExit;
     SvTraceCounters(&Stats->TraceRecords, &Stats->TraceDropped,
@@ -1591,11 +1498,11 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     NTSTATUS status;
     ULONG i;
 
+    UNREFERENCED_PARAMETER(RegistryPath);
+
     DriverObject->DriverUnload = SvDriverUnload;
 
     DbgPrint("svmhv: loading\n");
-
-    SvReadParameters(RegistryPath);
 
     if (!SvIsSvmSupported())
     {
@@ -1609,7 +1516,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
         return status;
     }
 
-    if (g_OptNestedPaging)
+    if (STEALTHV_NESTED_PAGING)
     {
         status = SvNptInitialize();
         if (!NT_SUCCESS(status))
@@ -1651,7 +1558,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
                      status);
         }
 
-        if (g_OptHidePages)
+        if (STEALTHV_HIDE_PAGES)
         {
             SvHideHypervisorPages();
         }
@@ -1721,7 +1628,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
      * standing - including the part spent above us, which is most of it when
      * running nested - and that is what gets hidden from here on.
      */
-    if (g_OptTscOffset)
+    if (STEALTHV_TSC_OFFSET)
     {
         const UINT64 intercepted = SvMinimumCpuidCost();
 
@@ -1733,7 +1640,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
                  g_NativeCpuidCost, intercepted, g_TscHidePerExit);
     }
 
-    if (g_OptControl)
+    if (STEALTHV_CONTROL_INTERFACE)
     {
         status = SvControlStart();
         if (!NT_SUCCESS(status))

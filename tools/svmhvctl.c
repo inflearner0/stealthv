@@ -664,7 +664,8 @@ int main(int argc, char** argv)
     if (!Present())
     {
         printf("present=0\n");
-        fprintf(stderr, "svmhv is not loaded, or its ControlInterface is off\n");
+        fprintf(stderr, "svmhv is not loaded, or was built with "
+                        "STEALTHV_CONTROL_INTERFACE 0\n");
         return 1;
     }
 
