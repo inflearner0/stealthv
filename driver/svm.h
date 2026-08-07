@@ -1,0 +1,328 @@
+/*
+ * svm.h - AMD SVM (AMD-V) architectural definitions.
+ *
+ * Offsets follow AMD64 Architecture Programmer's Manual Vol. 2, Appendix B
+ * ("Layout of VMCB").  Every field that the driver touches is verified with a
+ * C_ASSERT against the architectural offset, so a typo in the padding is a
+ * build error rather than a triple fault.
+ */
+
+#pragma once
+
+#include <ntddk.h>
+#include <intrin.h>
+
+/* ------------------------------------------------------------------ MSRs */
+
+#define MSR_PAT                 0x00000277
+#define MSR_EFER                0xC0000080
+#define EFER_NXE                (1ULL << 11)
+#define EFER_SVME               (1ULL << 12)
+
+#define MSR_VM_CR               0xC0010114
+#define VM_CR_SVMDIS            (1ULL << 4)     /* SVM disabled and locked   */
+
+#define MSR_VM_HSAVE_PA         0xC0010117
+
+/* ---------------------------------------------------------------- CPUID */
+
+#define CPUID_EXT_FEATURES      0x80000001      /* ECX[2] = SVM             */
+#define CPUID_EXT_FEATURE_SVM   (1u << 2)
+#define CPUID_EXT_FEATURE_1GB   (1u << 26)      /* EDX[26] = PDPE1GB        */
+
+#define CPUID_SVM_FEATURES      0x8000000A      /* EBX = #ASIDs, EDX = feat */
+#define CPUID_SVM_NESTED_PAGING (1u << 0)
+#define CPUID_SVM_NRIP_SAVE     (1u << 3)
+#define CPUID_SVM_FLUSH_BY_ASID (1u << 6)
+
+#define CPUID_ADDRESS_SIZES     0x80000008      /* EAX[7:0] = MAXPHYADDR    */
+
+/* VMCB control area, TLB_CONTROL (offset 0x05C) */
+#define SVM_TLB_CONTROL_NOTHING     0
+#define SVM_TLB_CONTROL_FLUSH_ALL   1   /* entire TLB, every ASID          */
+#define SVM_TLB_CONTROL_FLUSH_ASID  3   /* every entry of this guest's ASID */
+
+#define CPUID_HV_VENDOR         0x40000000      /* hypervisor vendor leaf   */
+
+/*
+ * Private CPUID leaves.  0x4FFFFFFF is deliberately far away from the
+ * 0x4000_00xx block that Hyper-V owns: this hypervisor runs *nested* under
+ * Hyper-V, so the guest still needs to see the real Hyper-V leaves.
+ *
+ * Both leaves answer only when ECX carries the matching key; with any other
+ * ECX they are passed straight through to the hardware, so a guest sweeping
+ * CPUID space finds nothing that a bare machine would not also return.
+ */
+#define SVMHV_CPUID_SIGNATURE   0x4FFFFFFF      /* -> "SVMHV-SIMPLE"        */
+#define SVMHV_SIGNATURE_KEY     0x7A1D4C5F      /* required in ECX          */
+#define SVMHV_CPUID_UNLOAD      0x4FFFFFFE      /* ECX = magic -> devirt    */
+#define SVMHV_UNLOAD_MAGIC      0x53564D48      /* 'SVMH'                   */
+
+/*
+ * The control channel.  CPUID architecturally takes only EAX and ECX as inputs,
+ * but the hypervisor sees the whole register file at the moment of the exit, so
+ * the ABI can be as wide as we like: the command comes in RBX and arguments in
+ * RDX/RSI, and up to 48 bytes come back in RBX/RDX/RSI/RDI/R8/R9.
+ *
+ * This is the only way in.  There is no device object, no IOCTL and no doorbell
+ * a debugger could write - a client executes one instruction and the hypervisor
+ * answers it.  Which also means there is no ACL: the key in ECX is the whole
+ * access check, and anything that knows it can install a kernel hook.  Every
+ * offset a client can pass is bounded against the structure it names, so the
+ * channel cannot be turned into an arbitrary kernel read.
+ */
+#define SVMHV_CPUID_CONTROL     0x4FFFFFFD
+#define SVMHV_CONTROL_KEY       0x3C9F17B2      /* required in ECX          */
+
+#define SVMHV_HV_PING           0   /* -> rbx = magic, rdx = version        */
+#define SVMHV_HV_WRITE_REQUEST  1   /* rdx = offset, rsi = value            */
+#define SVMHV_HV_SUBMIT         2   /* rdx = command  -> rbx = sequence     */
+#define SVMHV_HV_POLL           3   /* -> rbx = completed, rdx = status     */
+#define SVMHV_HV_READ_SNAPSHOT  4   /* rdx = offset -> 48 bytes             */
+#define SVMHV_HV_READ_REQUEST   5   /* rdx = offset -> 48 bytes             */
+#define SVMHV_HV_READ_TRACE     6   /* rdx = index, rsi = offset -> 48      */
+#define SVMHV_HV_TRACE_STATE    7   /* -> produced, records, record size    */
+
+#define SVMHV_HV_STATUS_OK          0
+#define SVMHV_HV_STATUS_BADCOMMAND  1
+#define SVMHV_HV_STATUS_BADOFFSET   2
+#define SVMHV_HV_STATUS_UNAVAILABLE 3
+
+/* How many bytes one read command returns. */
+#define SVMHV_HV_READ_WINDOW    48
+
+/* ---------------------------------------------------------- exit codes */
+
+#define VMEXIT_INVLPGA          0x07A
+#define VMEXIT_CPUID            0x072
+#define VMEXIT_MSR              0x07C
+#define VMEXIT_VMRUN            0x080
+#define VMEXIT_VMMCALL          0x081
+#define VMEXIT_VMLOAD           0x082
+#define VMEXIT_VMSAVE           0x083
+#define VMEXIT_STGI             0x084
+#define VMEXIT_CLGI             0x085
+#define VMEXIT_SKINIT           0x086
+#define VMEXIT_NPF              0x400
+#define VMEXIT_INVALID          (-1LL)
+
+/* EXITINFO1 of a #NPF - the low bits mirror a #PF error code. */
+#define NPF_PRESENT             (1ULL << 0)
+#define NPF_WRITE               (1ULL << 1)
+#define NPF_USER                (1ULL << 2)
+#define NPF_RESERVED_BIT        (1ULL << 3)
+#define NPF_EXECUTE             (1ULL << 4)
+
+/* --------------------------------------------------- intercept vectors */
+
+/* Control area offset 0x00C */
+#define SVM_INTERCEPT_CPUID     (1u << 18)
+#define SVM_INTERCEPT_INVLPGA   (1u << 26)
+#define SVM_INTERCEPT_MSR       (1u << 28)
+
+/* Control area offset 0x010 */
+#define SVM_INTERCEPT_VMRUN     (1u << 0)       /* mandatory                */
+#define SVM_INTERCEPT_VMMCALL   (1u << 1)
+#define SVM_INTERCEPT_VMLOAD    (1u << 2)
+#define SVM_INTERCEPT_VMSAVE    (1u << 3)
+#define SVM_INTERCEPT_STGI      (1u << 4)
+#define SVM_INTERCEPT_CLGI      (1u << 5)
+#define SVM_INTERCEPT_SKINIT    (1u << 6)
+
+/* NP_ENABLE (control area 0x090) */
+#define SVM_NP_ENABLE           (1ULL << 0)
+
+/* EVENTINJ (control area 0x0A8) */
+#define SVM_EVENTINJ_VALID      (1ULL << 31)
+#define SVM_EVENTINJ_TYPE_EXCEPTION (3ULL << 8)
+#define SVM_EVENTINJ_ERRORCODE  (1ULL << 11)
+#define SVM_EXCEPTION_UD        6ULL
+#define SVM_EXCEPTION_GP        13ULL
+
+/* ------------------------------------------------- nested page tables */
+
+/*
+ * Nested page table entries use the ordinary long-mode page table format.
+ * The nested walk is a "user" access, so US must be set on every level or
+ * the guest cannot reach the page at all.
+ */
+#define NPT_PRESENT             (1ULL << 0)
+#define NPT_WRITE               (1ULL << 1)
+#define NPT_USER                (1ULL << 2)
+#define NPT_LARGE               (1ULL << 7)     /* PS: 1 GiB / 2 MiB leaf   */
+#define NPT_NO_EXECUTE          (1ULL << 63)
+#define NPT_PFN_MASK            0x000FFFFFFFFFF000ULL
+
+#define NPT_TABLE               (NPT_PRESENT | NPT_WRITE | NPT_USER)
+#define NPT_LEAF_RWX            (NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_LARGE)
+
+#define NPT_PML4_INDEX(gpa)     (((gpa) >> 39) & 0x1FF)
+#define NPT_PDPT_INDEX(gpa)     (((gpa) >> 30) & 0x1FF)
+#define NPT_PD_INDEX(gpa)       (((gpa) >> 21) & 0x1FF)
+#define NPT_PT_INDEX(gpa)       (((gpa) >> 12) & 0x1FF)
+
+#define NPT_1GB                 0x40000000ULL
+#define NPT_2MB                 0x00200000ULL
+
+/* --------------------------------------------------------------- VMCB */
+
+#pragma pack(push, 1)
+
+typedef struct _VMCB_SEGMENT
+{
+    UINT16 Selector;
+    UINT16 Attrib;          /* packed: desc bits 47:40 | 55:52 in 11:8      */
+    UINT32 Limit;
+    UINT64 Base;
+} VMCB_SEGMENT;
+
+C_ASSERT(sizeof(VMCB_SEGMENT) == 16);
+
+typedef struct _VMCB_CONTROL_AREA
+{
+    UINT16 InterceptCrRead;                 /* 0x000 */
+    UINT16 InterceptCrWrite;                /* 0x002 */
+    UINT16 InterceptDrRead;                 /* 0x004 */
+    UINT16 InterceptDrWrite;                /* 0x006 */
+    UINT32 InterceptException;              /* 0x008 */
+    UINT32 InterceptVector3;                /* 0x00C */
+    UINT32 InterceptVector4;                /* 0x010 */
+    UINT32 InterceptVector5;                /* 0x014 */
+    UINT8  Reserved1[0x03C - 0x018];
+    UINT16 PauseFilterThreshold;            /* 0x03C */
+    UINT16 PauseFilterCount;                /* 0x03E */
+    UINT64 IopmBasePa;                      /* 0x040 */
+    UINT64 MsrpmBasePa;                     /* 0x048 */
+    UINT64 TscOffset;                       /* 0x050 */
+    UINT32 GuestAsid;                       /* 0x058 */
+    UINT8  TlbControl;                      /* 0x05C */
+    UINT8  Reserved2[3];
+    UINT64 VIntr;                           /* 0x060 */
+    UINT64 InterruptShadow;                 /* 0x068 */
+    UINT64 ExitCode;                        /* 0x070 */
+    UINT64 ExitInfo1;                       /* 0x078 */
+    UINT64 ExitInfo2;                       /* 0x080 */
+    UINT64 ExitIntInfo;                     /* 0x088 */
+    UINT64 NpEnable;                        /* 0x090 */
+    UINT64 AvicApicBar;                     /* 0x098 */
+    UINT64 GuestPaOfGhcb;                   /* 0x0A0 */
+    UINT64 EventInj;                        /* 0x0A8 */
+    UINT64 NCr3;                            /* 0x0B0 */
+    UINT64 LbrVirtualizationEnable;         /* 0x0B8 */
+    UINT64 VmcbClean;                       /* 0x0C0 */
+    UINT64 NRip;                            /* 0x0C8 */
+    UINT8  NumOfBytesFetched;               /* 0x0D0 */
+    UINT8  GuestInstructionBytes[15];       /* 0x0D1 */
+    UINT8  Reserved3[0x400 - 0x0E0];
+} VMCB_CONTROL_AREA;
+
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, InterceptVector4) == 0x010);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, IopmBasePa)       == 0x040);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, TscOffset)        == 0x050);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, GuestAsid)        == 0x058);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, NpEnable)         == 0x090);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, NCr3)             == 0x0B0);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, ExitCode)         == 0x070);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, EventInj)         == 0x0A8);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, VmcbClean)        == 0x0C0);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, NRip)             == 0x0C8);
+C_ASSERT(sizeof(VMCB_CONTROL_AREA) == 0x400);
+
+typedef struct _VMCB_STATE_SAVE_AREA
+{
+    VMCB_SEGMENT Es;                        /* 0x000 */
+    VMCB_SEGMENT Cs;                        /* 0x010 */
+    VMCB_SEGMENT Ss;                        /* 0x020 */
+    VMCB_SEGMENT Ds;                        /* 0x030 */
+    VMCB_SEGMENT Fs;                        /* 0x040 */
+    VMCB_SEGMENT Gs;                        /* 0x050 */
+    VMCB_SEGMENT Gdtr;                      /* 0x060 */
+    VMCB_SEGMENT Ldtr;                      /* 0x070 */
+    VMCB_SEGMENT Idtr;                      /* 0x080 */
+    VMCB_SEGMENT Tr;                        /* 0x090 */
+    UINT8  Reserved1[0x0CB - 0x0A0];
+    UINT8  Cpl;                             /* 0x0CB */
+    UINT32 Reserved2;                       /* 0x0CC */
+    UINT64 Efer;                            /* 0x0D0 */
+    UINT8  Reserved3[0x148 - 0x0D8];
+    UINT64 Cr4;                             /* 0x148 */
+    UINT64 Cr3;                             /* 0x150 */
+    UINT64 Cr0;                             /* 0x158 */
+    UINT64 Dr7;                             /* 0x160 */
+    UINT64 Dr6;                             /* 0x168 */
+    UINT64 Rflags;                          /* 0x170 */
+    UINT64 Rip;                             /* 0x178 */
+    UINT8  Reserved4[0x1D8 - 0x180];
+    UINT64 Rsp;                             /* 0x1D8 */
+    UINT8  Reserved5[0x1F8 - 0x1E0];
+    UINT64 Rax;                             /* 0x1F8 */
+    UINT64 Star;                            /* 0x200 */
+    UINT64 LStar;                           /* 0x208 */
+    UINT64 CStar;                           /* 0x210 */
+    UINT64 SfMask;                          /* 0x218 */
+    UINT64 KernelGsBase;                    /* 0x220 */
+    UINT64 SysenterCs;                      /* 0x228 */
+    UINT64 SysenterEsp;                     /* 0x230 */
+    UINT64 SysenterEip;                     /* 0x238 */
+    UINT64 Cr2;                             /* 0x240 */
+    UINT8  Reserved6[0x268 - 0x248];
+    UINT64 GPat;                            /* 0x268 */
+    UINT64 DbgCtl;                          /* 0x270 */
+    UINT64 BrFrom;                          /* 0x278 */
+    UINT64 BrTo;                            /* 0x280 */
+    UINT64 LastExcpFrom;                    /* 0x288 */
+    UINT64 LastExcpTo;                      /* 0x290 */
+    UINT8  Reserved7[0xC00 - 0x298];
+} VMCB_STATE_SAVE_AREA;
+
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cpl)    == 0x0CB);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Efer)   == 0x0D0);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cr4)    == 0x148);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cr0)    == 0x158);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rflags) == 0x170);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rip)    == 0x178);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rsp)    == 0x1D8);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rax)    == 0x1F8);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, GPat)   == 0x268);
+C_ASSERT(sizeof(VMCB_STATE_SAVE_AREA) == 0xC00);
+
+typedef struct _VMCB
+{
+    VMCB_CONTROL_AREA    Control;
+    VMCB_STATE_SAVE_AREA StateSave;
+} VMCB;
+
+C_ASSERT(sizeof(VMCB) == PAGE_SIZE);
+
+/*
+ * The assembler needs the same offsets; keep them in lockstep with svmasm.asm
+ * (VMCB_TSC_OFFSET / VMCB_RFLAGS / VMCB_RIP / VMCB_RSP).
+ */
+C_ASSERT(FIELD_OFFSET(VMCB, Control.TscOffset)  == 0x050);
+C_ASSERT(FIELD_OFFSET(VMCB, StateSave.Rflags) == 0x570);
+C_ASSERT(FIELD_OFFSET(VMCB, StateSave.Rip)    == 0x578);
+C_ASSERT(FIELD_OFFSET(VMCB, StateSave.Rsp)    == 0x5D8);
+
+/* --------------------------------------------------- GDT descriptor --- */
+
+typedef struct _GDT_ENTRY
+{
+    UINT16 LimitLow;
+    UINT16 BaseLow;
+    UINT8  BaseMiddle;
+    UINT8  Attr0;           /* type, S, DPL, P                             */
+    UINT8  LimitHighAttr1;  /* limit 19:16, AVL, L, D/B, G                 */
+    UINT8  BaseHigh;
+} GDT_ENTRY;
+
+C_ASSERT(sizeof(GDT_ENTRY) == 8);
+
+typedef struct _DESCRIPTOR_TABLE_REGISTER
+{
+    UINT16 Limit;
+    UINT64 Base;
+} DESCRIPTOR_TABLE_REGISTER;
+
+C_ASSERT(sizeof(DESCRIPTOR_TABLE_REGISTER) == 10);
+
+#pragma pack(pop)

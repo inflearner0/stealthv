@@ -1,0 +1,21 @@
+# Build output. Everything here is reproducible from source with build.ps1,
+# and bin\ also collects the test signing certificate, which has no business
+# in source control.
+bin/
+*.obj
+*.pdb
+*.sys
+*.exe
+*.ilk
+*.cer
+*.pfx
+
+# Editors and tooling
+.vs/
+.vscode/
+*.user
+__pycache__/
+*.py[cod]
+
+# Lab scratch: the in-guest scripts write these next to themselves
+*.log

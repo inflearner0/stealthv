@@ -1,0 +1,17 @@
+# Normalise line endings on the way in, and check out CRLF for the things
+# Windows tooling is fussy about.
+* text=auto
+
+*.c      text eol=crlf
+*.h      text eol=crlf
+*.asm    text eol=crlf
+*.ps1    text eol=crlf
+*.md     text eol=lf
+*.py     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+LICENSE  text eol=lf
+
+*.sys    binary
+*.exe    binary
+*.cer    binary

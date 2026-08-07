@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A commit is "valid" here if the driver and both tools compile clean with /WX,
+# the layout assertions still hold, and the agent's own tests pass. Nothing runs
+# the hypervisor: that needs an AMD host with SVM and a VM to be a guest, which
+# no hosted runner has. See the release job for what actually ships.
+jobs:
+  build:
+    name: build driver and tools
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the WDK
+        shell: pwsh
+        run: |
+          # The runner ships the SDK but not the driver kit, and the driver
+          # needs km\ headers and ntoskrnl.lib.
+          choco install windowsdriverkit11 --no-progress -y
+          $kit = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $versions = Get-ChildItem "$kit\Include" -Directory -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path (Join-Path $_.FullName 'km') }
+          if (-not $versions) { throw "the WDK did not install any km\ headers" }
+          Write-Host "WDK versions with km headers: $($versions.Name -join ', ')"
+
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Check what came out
+        shell: pwsh
+        run: |
+          # /WX means a warning already failed the step; this is about the
+          # artefacts existing and being the right shape.
+          $expected = 'bin\svmhv.sys', 'bin\svmhvctl.exe', 'bin\hvtest.exe'
+          foreach ($file in $expected) {
+            if (-not (Test-Path $file)) { throw "missing: $file" }
+          }
+          Get-ChildItem $expected | Select-Object Name, Length | Format-Table -AutoSize
+
+          $driver = Get-Item 'bin\svmhv.sys'
+          if ($driver.Length -lt 20kb) { throw "svmhv.sys is suspiciously small" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stealthv-build
+          path: |
+            bin/svmhv.sys
+            bin/svmhvctl.exe
+            bin/hvtest.exe
+          if-no-files-found: error
+
+  agent:
+    name: mcp agent tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tests
+        # Standard library only, so there is nothing to install.
+        run: python mcp/test_agent.py
+
+      - name: Compile check every script
+        run: python -m compileall -q mcp/
+
+  hygiene:
+    name: repository hygiene
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nothing built or secret is committed
+        run: |
+          set -e
+          # bin/ is ignored, but an ignore file only helps if nobody forces past
+          # it, and a committed signing certificate would be worse than noise.
+          if git ls-files | grep -Ei '\.(sys|exe|obj|pdb|cer|pfx|ilk)$'; then
+            echo "::error::build output or a certificate is committed"
+            exit 1
+          fi
+          if git ls-files | grep -E '(^|/)bin/'; then
+            echo "::error::bin/ is committed"
+            exit 1
+          fi
+          echo "clean"
+
+      - name: The license is present
+        run: test -f LICENSE && head -1 LICENSE
