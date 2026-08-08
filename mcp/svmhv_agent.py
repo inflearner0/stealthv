@@ -2542,6 +2542,197 @@ def _note_key(address: str) -> str:
     return named if "!" in named or "+" in named else f"{resolved:#x}"
 
 
+# ------------------------------------------------------- tamper detection
+
+def tool_verify(module: str, limit: int = 24) -> str:
+    """Compare a module's code in memory against the file it was loaded from.
+
+    What this finds is somebody else's hooks.  An inline detour, a patched
+    prologue, a redirected import - all of them are a difference between the
+    bytes running and the bytes on disk, and all of them are invisible to
+    anything that only reads memory.
+
+    Relocations are the complication and the reason this reports rather than
+    judges: a loaded image has had its absolute addresses fixed up, so a naive
+    comparison flags every one of them.  Differences inside a relocation are
+    filtered out; what is left is either a patch or a section this cannot
+    account for, and both are worth a human deciding about.
+    """
+    resolved = module_by_name(module)
+    if resolved is None:
+        return f"no loaded module called {module!r}"
+
+    path = resolved["path"]
+    for prefix, replacement in ((r"\SystemRoot", r"C:\Windows"),
+                                (r"\??\\", ""), (r"\\??\\", "")):
+        if path.startswith(prefix):
+            path = replacement + path[len(prefix):]
+    try:
+        with open(path, "rb") as handle:
+            disk = handle.read()
+    except OSError as error:
+        return (f"cannot read {path}: {error}\n"
+                "Without the file there is nothing to compare against.")
+
+    sections = pe_sections(resolved["base"])
+    code = [s for s in sections if s["characteristics"] & 0x20000000]
+    if not code:
+        return f"{resolved['name']} has no executable section"
+
+    # File offsets differ from memory offsets; the section table has both.
+    header = read_bytes(resolved["base"], 0x400)
+    pe = int.from_bytes(header[0x3C:0x40], "little")
+    count = int.from_bytes(header[pe + 6:pe + 8], "little")
+    optional_size = int.from_bytes(header[pe + 20:pe + 22], "little")
+    table = pe + 24 + optional_size
+    raw_offsets = {}
+    for i in range(min(count, 32)):
+        entry = header[table + i * 40:table + i * 40 + 40]
+        name = entry[:8].rstrip(b"\0").decode("ascii", "replace")
+        raw_offsets[name] = int.from_bytes(entry[20:24], "little")
+
+    relocated = _relocation_targets(resolved["base"], disk, header, pe,
+                                    optional_size)
+
+    differences = []
+    scanned = 0
+    for section in code:
+        raw = raw_offsets.get(section["name"])
+        if raw is None:
+            continue
+        size = min(section["size"], 1 << 20)
+        scanned += size
+        live = dump_range(resolved["base"] + section["rva"], size)
+        for page, blob in sorted(live.items()):
+            page_rva = page - resolved["base"]
+            for offset, byte in enumerate(blob):
+                rva = page_rva + offset
+                file_at = raw + (rva - section["rva"])
+                if file_at >= len(disk) or disk[file_at] == byte:
+                    continue
+                if any(r <= rva < r + 8 for r in relocated):
+                    continue                    # a fixed-up address, not a patch
+                differences.append((resolved["base"] + rva, disk[file_at], byte))
+                if len(differences) >= limit * 4:
+                    break
+
+    if not differences:
+        return (f"{resolved['name']}: {scanned:,} bytes of code match the file "
+                f"on disk exactly. Nothing has patched it.")
+
+    # Report runs, not bytes: a hook is a stretch of consecutive differences.
+    runs = []
+    for address, was, now in differences:
+        if runs and address == runs[-1][0] + runs[-1][1]:
+            runs[-1][1] += 1
+            runs[-1][2].append(now)
+            runs[-1][3].append(was)
+        else:
+            runs.append([address, 1, [now], [was]])
+
+    expected = [r for r in runs if _loader_patch(r[3], r[2])]
+    suspect = [r for r in runs if not _loader_patch(r[3], r[2])]
+
+    lines = [f"{resolved['name']}: {scanned:,} bytes of code compared",
+             f"  {len(expected)} difference(s) Windows makes itself",
+             f"  {len(suspect)} difference(s) it does not", ""]
+
+    if suspect:
+        lines.append("unexplained - these are what a hook looks like:")
+        for address, length, now, was in suspect[:limit]:
+            lines.append(f"  {address:#018x}  {symbolize(address)}")
+            lines.append(f"      on disk: {bytes(was).hex()}")
+            lines.append(f"      running: {bytes(now).hex()}")
+        if len(suspect) > limit:
+            lines.append(f"  ... and {len(suspect) - limit} more")
+        lines.append("")
+    else:
+        lines.append("Nothing unexplained: every difference is one the loader "
+                     "is known to make.")
+        lines.append("")
+
+    if expected:
+        lines.append(f"accounted for ({len(expected)}): retpoline and import "
+                     "optimisation. Windows rewrites indirect calls through "
+                     "the import table into direct ones at load, and patches "
+                     "the CFG dispatch stubs, so those bytes never match the "
+                     "file and never did.")
+    return "\n".join(lines)
+
+
+def _loader_patch(was: list, now: list) -> bool:
+    """Is this difference one Windows makes to every module at load time?
+
+    Two of them account for almost all of it.  Import optimisation rewrites
+    "call [__imp_Foo]" - an ff 15 indirect through the import table - into a
+    direct e8 call, and pads what is left with nops.  Retpoline and CFG do the
+    same to the dispatch stubs, turning an ff e0 or ff 25 into a jmp.
+
+    Both leave the running bytes starting with a direct call or jump where the
+    file had an indirect one or padding.  That is a narrow enough shape to
+    recognise, and getting it wrong only moves an entry between two lists that
+    are both printed.
+    """
+    was_bytes, now_bytes = bytes(was), bytes(now)
+
+    # Padding either way.  Rewriting an indirect call as a shorter direct one
+    # leaves slack, and the loader fills it - zeroes become int3, or the other
+    # way about. Nothing hides in a gap between functions.
+    padding = set(b"\x00\xcc\x90")
+    if set(was_bytes) <= padding and set(now_bytes) <= padding:
+        return True
+
+    indirect = (was_bytes[:2] in (b"\xff\x15", b"\xff\x25", b"\xff\xe0",
+                                  b"\xff\xd0")
+                or was_bytes[:1] in (b"\x48", b"\x4c")      # rex + indirect
+                or was_bytes.startswith(b"\x0f\x1f")        # nop padding
+                or was_bytes.startswith(b"\xcc"))
+    direct = now_bytes[:1] in (b"\xe8", b"\xe9") or \
+        now_bytes[:1] in (b"\x48", b"\x4c") or now_bytes.startswith(b"\xcc")
+    return indirect and direct
+
+
+def _relocation_targets(base: int, disk: bytes, header: bytes, pe: int,
+                        optional_size: int) -> set[int]:
+    """RVAs the loader rewrote, so a diff does not report them as patches."""
+    directory = pe + 0x18 + (0x70 if int.from_bytes(
+        header[pe + 0x18:pe + 0x1A], "little") == 0x20B else 0x60)
+    rva = int.from_bytes(header[directory + 5 * 8:directory + 5 * 8 + 4], "little")
+    size = int.from_bytes(header[directory + 5 * 8 + 4:directory + 5 * 8 + 8],
+                          "little")
+    if rva == 0 or size == 0:
+        return set()
+
+    # Find the relocation directory in the file, via the section it lives in.
+    count = int.from_bytes(header[pe + 6:pe + 8], "little")
+    table = pe + 24 + optional_size
+    file_at = None
+    for i in range(min(count, 32)):
+        entry = header[table + i * 40:table + i * 40 + 40]
+        section_rva = int.from_bytes(entry[12:16], "little")
+        section_size = int.from_bytes(entry[8:12], "little")
+        if section_rva <= rva < section_rva + max(section_size, 1):
+            file_at = int.from_bytes(entry[20:24], "little") + (rva - section_rva)
+            break
+    if file_at is None or file_at + size > len(disk):
+        return set()
+
+    targets = set()
+    at = file_at
+    end = file_at + size
+    while at + 8 <= end:
+        page_rva = int.from_bytes(disk[at:at + 4], "little")
+        block_size = int.from_bytes(disk[at + 4:at + 8], "little")
+        if block_size < 8 or at + block_size > end:
+            break
+        for i in range(8, block_size, 2):
+            entry = int.from_bytes(disk[at + i:at + i + 2], "little")
+            if (entry >> 12) != 0:              # 0 is padding
+                targets.add(page_rva + (entry & 0xFFF))
+        at += block_size
+    return targets
+
+
 # ------------------------------------------------------------- processes
 
 def processes(name_filter: str = "") -> list[dict]:
@@ -3409,6 +3600,25 @@ TOOLS = [
             "required": ["name"],
         },
         "handler": lambda a: tool_symbol(a["name"]),
+    },
+    {
+        "name": "svmhv_verify",
+        "description":
+            "Compare a module's executable sections against the file it was "
+            "loaded from. This is how you find SOMEBODY ELSE'S hooks - an "
+            "inline detour or a patched prologue is a difference between what "
+            "is running and what shipped, and nothing that only reads memory "
+            "can see it. Relocations are filtered out, so what is reported is "
+            "a real difference.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string"},
+                "limit": {"type": "integer", "description": "runs to show"},
+            },
+            "required": ["module"],
+        },
+        "handler": lambda a: tool_verify(a["module"], a.get("limit", 24)),
     },
     {
         "name": "svmhv_note",
