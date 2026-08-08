@@ -2475,6 +2475,73 @@ def tool_symbols_auto(enabled: bool = True) -> str:
             f"{SYMBOL_CACHE}. Modules already tried will be retried.")
 
 
+# --------------------------------------------------------------- findings
+
+FINDINGS_PATH = r"C:\lab\findings.json"
+
+
+def _findings_read() -> dict:
+    try:
+        with open(FINDINGS_PATH, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def tool_note(address: str = "", text: str = "", contains: str = "") -> str:
+    """Record what was worked out about an address, or read it back.
+
+    Reverse engineering is mostly accumulated conclusions - this offset is the
+    lock, this field is the flags, this branch is the licence check - and none
+    of it is recoverable from the binary a second time. Without somewhere to
+    put them, every session re-derives the same things from scratch.
+
+    Keyed by symbol rather than address where one is known, because addresses
+    move with every reboot and a note pinned to one is worthless tomorrow.
+    """
+    notes = _findings_read()
+
+    if not text:
+        wanted = contains.lower()
+        chosen = {k: v for k, v in notes.items()
+                  if not wanted or wanted in k.lower()
+                  or wanted in str(v).lower()}
+        if address:
+            key = _note_key(address)
+            chosen = {k: v for k, v in notes.items() if k == key}
+        if not chosen:
+            return "nothing recorded yet" if not (contains or address) else \
+                   f"nothing recorded matching {contains or address!r}"
+        lines = [f"{len(chosen)} note(s)", ""]
+        for key, entries in sorted(chosen.items()):
+            lines.append(f"{key}")
+            for entry in entries:
+                lines.append(f"    {entry}")
+        return "\n".join(lines)
+
+    if not address:
+        return "give an address or symbol to attach the note to"
+
+    key = _note_key(address)
+    notes.setdefault(key, []).append(text)
+    try:
+        with open(FINDINGS_PATH, "w", encoding="utf-8") as handle:
+            json.dump(notes, handle, indent=1, sort_keys=True)
+    except OSError as error:
+        return f"could not write {FINDINGS_PATH}: {error}"
+    return f"noted against {key}: {text}"
+
+
+def _note_key(address: str) -> str:
+    """A name that survives a reboot, if one can be had."""
+    try:
+        resolved = resolve(address)
+    except CtlError:
+        return address
+    named = symbolize(resolved)
+    return named if "!" in named or "+" in named else f"{resolved:#x}"
+
+
 # ------------------------------------------------------------- processes
 
 def processes(name_filter: str = "") -> list[dict]:
@@ -3342,6 +3409,29 @@ TOOLS = [
             "required": ["name"],
         },
         "handler": lambda a: tool_symbol(a["name"]),
+    },
+    {
+        "name": "svmhv_note",
+        "description":
+            "Record what you worked out about an address, or read it back. "
+            "Reverse engineering is accumulated conclusions - this field is "
+            "the flags, this branch is the check - and none of it is "
+            "recoverable from the binary twice. Notes are keyed by symbol "
+            "where one is known, so they survive the reboot that moves every "
+            "address. Call with no text to read; with 'contains' to search.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string",
+                            "description": "hex address or module!symbol"},
+                "text": {"type": "string",
+                         "description": "what you concluded; omit to read"},
+                "contains": {"type": "string",
+                             "description": "search existing notes"},
+            },
+        },
+        "handler": lambda a: tool_note(a.get("address", ""), a.get("text", ""),
+                                       a.get("contains", "")),
     },
     {
         "name": "svmhv_processes",
