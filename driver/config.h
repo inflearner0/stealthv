@@ -22,11 +22,21 @@
 #define STEALTHV_NESTED_PAGING      1
 
 /*
- * Erase SVM from CPUID: 8000_0001.ECX.SVM and the whole of 8000_000A.  A guest
- * told there is no SVM behaves the way it would on a machine that has none; a
- * guest that believes it has SVM and then takes a #UD from VMRUN has found us.
+ * CPUID is not intercepted, and so its feature bits cannot be masked.
+ *
+ * On AMD that intercept is a single optional bit, unlike Intel where CPUID
+ * exits unconditionally.  Leaving it clear is what makes rdtsc-cpuid-rdtsc read
+ * exactly what the bare processor reads - and it removes the reason the TSC
+ * ever had to be adjusted, which is what used to reset the machine a few
+ * minutes after load.
+ *
+ * The price is the one concealment this design gives up: the guest sees
+ * 8000_0001.ECX.SVM set and 8000_000A populated, while VMRUN still raises #UD.
+ * That is a real discrepancy, just a much narrower one - code that times CPUID
+ * is everywhere, code that tries to use SVM is rare.  Closing it completely
+ * means virtualising SVM for the guest, which is a different project.
  */
-#define STEALTHV_HIDE_SVM_CPUID     1
+#define STEALTHV_HIDE_SVM_CPUID     0
 
 /*
  * Hide EFER.SVME, so a ring-0 RDMSR sees the bit clear.
@@ -48,16 +58,21 @@
 #define STEALTHV_HIDE_EFER          1
 
 /*
- * Subtract the cost of an intercepted CPUID from the guest's TSC, calibrated
- * against the same instruction measured before the first VMRUN.  Without it,
- * rdtsc-cpuid-rdtsc is the whole detection.
+ * Gone, and it cannot come back while CPUID runs natively.
  *
- * The compensation is per-processor and cumulative, so a thread executing a lot
- * of CPUID drags that processor's clock behind the others - measured at a
- * worst backwards step of 28 ms over 2400 forced migrations while hvtest
- * hammered CPUID.  Ordinary code never comes close.
+ * This used to subtract the cost of an intercepted CPUID from the guest's TSC.
+ * The subtraction went into a per-processor running total that only ever
+ * decreased, so every processor's clock walked backwards without bound and
+ * away from the others; Windows needs the TSC invariant and synchronised, and
+ * a few minutes in it stopped tolerating the skew and reset the machine - no
+ * bugcheck, no dump, only a Kernel-Power event 41.
+ *
+ * Capping the drift fixed the resets and destroyed the concealment: the budget
+ * was spent in about a hundred exits.  Not intercepting CPUID removes the
+ * overhead instead of hiding it, which is the only version of this that is both
+ * stable and undetectable.
  */
-#define STEALTHV_TSC_OFFSET         1
+#define STEALTHV_TSC_OFFSET         0
 
 /*
  * Point the driver's own pages - VMCBs, host save areas, MSRPM, IOPM, host

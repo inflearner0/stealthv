@@ -245,6 +245,49 @@ AsmForwardHypercall PROC
 AsmForwardHypercall ENDP
 
 ;
+; UINT64 AsmUnloadCall(VOID)
+;
+; The unload doorbell.  Rings the same VMMCALL channel the control interface
+; uses, from CPL 0, and returns the status the hypervisor leaves in RAX.  RBX is
+; non-volatile in the Windows x64 convention and carries the command, so it has
+; to be saved around the call.
+;
+AsmUnloadCall PROC
+        push    rbx
+        mov     rax, 53564D485643414Ch          ; SVMHV_HYPERCALL_MAGIC
+        mov     rbx, 8                          ; SVMHV_HV_UNLOAD
+        vmmcall
+        pop     rbx
+        ret
+AsmUnloadCall ENDP
+
+;
+; VOID AsmSignatureCall(SVMHV_HV_SIGNATURE_RESULT *Out)   -- RCX = Out
+;
+; The signature probe, on the same channel.  RBX, RSI and RDI are non-volatile
+; and the hypervisor overwrites them, so they are saved around the call.
+;
+AsmSignatureCall PROC
+        push    rbx
+        push    rsi
+        push    rdi
+
+        mov     r10, rcx
+        mov     rax, 53564D485643414Ch          ; SVMHV_HYPERCALL_MAGIC
+        mov     rbx, 9                          ; SVMHV_HV_SIGNATURE
+        vmmcall
+
+        mov     [r10 + 00h], rbx
+        mov     [r10 + 08h], rdx
+        mov     [r10 + 10h], rsi
+
+        pop     rdi
+        pop     rsi
+        pop     rbx
+        ret
+AsmSignatureCall ENDP
+
+;
 ; VOID AsmTraceEntry(VOID)
 ;
 ; Reached from a hook stub that has just loaded R11 with the hook id.  Nothing

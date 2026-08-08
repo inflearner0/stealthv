@@ -87,6 +87,13 @@ VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context)
                                     (volatile LONG64*)&g_Control.Sequence);
         break;
 
+    case SVMHV_HV_SIGNATURE:
+        /* What the CPUID signature leaf used to answer, for probes. */
+        Context->Rbx = 0x484D5653;      /* "SVMH" */
+        Context->Rdx = 0x49532D56;      /* "V-SI" */
+        Context->Rsi = 0x454C504D;      /* "MPLE" */
+        break;
+
     case SVMHV_HV_POLL:
         Context->Rbx = g_Control.Completed;
         Context->Rdx = (UINT64)(UINT32)g_Control.Status;

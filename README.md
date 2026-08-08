@@ -4,8 +4,8 @@
 hooks that are invisible to anything reading memory.**
 
 *stealth + `hv`.* Read a hooked page and you get the original instructions;
-execute it and you get a substitution. Time an intercepted `CPUID` and the clock
-has already been adjusted. Ask whether the processor has SVM and it says no.
+execute it and you get a substitution. Time a `CPUID` and it costs exactly what
+the bare processor costs, because it never left it.
 Read the driver's own pages and they are zeroes. Not being seen is not a feature
 here, it is the design — the same trick applied in four places.
 
@@ -31,15 +31,14 @@ executable-but-substituted in another, and that is enough to hold a code hook
 that nothing can find by reading memory.
 
 The other half of the driver is about not being noticed. SVM is erased from
-CPUID and from the guest's view of `EFER`, every SVM instruction faults exactly
-as it would on a machine without SVM, the driver's own pages read as zeroes, and
-the time an intercepted instruction takes is calibrated away.
+the guest's view of `EFER`, every SVM instruction faults exactly as it would on
+a machine without SVM, and the driver's own pages read as zeroes. `CPUID` is
+left unintercepted, so timing it proves nothing.
 
 | Intercept | Why |
 |---|---|
-| `CPUID` | hide SVM, answer the private leaves, and the unload doorbell |
 | `RDMSR`/`WRMSR` of `EFER` | keep `EFER.SVME` set and hide it from the guest |
-| `VMMCALL` | forwarded to the hypervisor above us (see below) |
+| `VMMCALL` | the control channel and the unload doorbell, on the magic in RAX; forwarded to the hypervisor above us otherwise |
 | `VMRUN`, `VMLOAD`, `VMSAVE`, `STGI`, `CLGI`, `SKINIT`, `INVLPGA` | inject `#UD` — what a CPU with `EFER.SVME` clear does |
 | `#NPF` | the hook engine: the guest crossed between code and data on a hooked page |
 
@@ -53,10 +52,10 @@ driver/     the kernel driver
   hook.c/.h     shadow-page hooks and watchpoints
   trace.c/.h    the trace ring and the argument recorder
   control.c/.h  the doorbell and the worker thread that answers it
-  hvcall.c/.h   the CPUID control channel
+  hvcall.c/.h   the VMMCALL control channel
   svmasm.asm    the VMRUN loop, the devirtualise tail, the trace thunk
 include/    svmhvctl.h - the control interface, shared with the tools
-tools/      svmhvctl.c + hvasm.asm (the CPUID client), hvtest.c (the probe)
+tools/      svmhvctl.c + hvasm.asm (the VMMCALL client), hvtest.c (the probe)
 mcp/        svmhv_agent.py - the in-guest MCP server, and its README
 scripts/    runtests.ps1, soak.ps1 - in-guest test runs
 bin/        build output, not in source control
@@ -138,11 +137,11 @@ therefore `vmload guest → vmrun → vmsave guest → vmload host` around the C
 handler. Exits run with `GIF == 0` — no interrupts, no NMIs — so the handler
 stays short, allocates nothing and touches nothing pageable.
 
-**Leaving.** `CPUID` leaf `0x4FFFFFFE` with `ECX = 'SVMH'`, from CPL 0 only, is
+**Leaving.** `VMMCALL` with the magic in RAX and command 8, from CPL 0 only, is
 the unload doorbell. The tail `VMLOAD`s the guest's segment state back into the
 CPU, `STGI`s, clears `EFER.SVME`, builds a `[RFLAGS][RIP]` frame on the guest's
 own stack and finishes with `POPFQ; RET` — so every register survives and
-execution continues inside `SvDevirtualizeDpc` as if the `CPUID` had returned.
+execution continues inside `SvDevirtualizeDpc` as if the `VMMCALL` had returned.
 
 ## Nested paging
 
@@ -217,13 +216,32 @@ unload, once no processor can still be in guest mode.
 
 ## Staying unnoticed
 
-**CPUID.** `8000_0001.ECX.SVM` is cleared and `8000_000A` reads as reserved. A
-guest told there is no SVM behaves the way it would on a machine that has none;
-a guest that believes it has SVM and then takes a `#UD` from `VMRUN` has found
-us. The private leaves at `0x4FFFFFFx` answer only when `ECX` carries a key, and
-pass straight through to the hardware otherwise, so sweeping CPUID space finds
-nothing a bare machine would not also return. Leaf `0x40000000` is left alone —
-running nested, the guest still needs to see the real Hyper-V leaves.
+**CPUID is not intercepted at all.** That is the single most important
+concealment decision here, and it is available because this is AMD: `CPUID`
+interception is one optional bit in the VMCB, where on Intel `CPUID` exits
+unconditionally and no hypervisor has the choice. Leaving the bit clear means
+`rdtsc; cpuid; rdtsc` measures exactly what the bare processor measures, because
+it *is* the bare processor. There is no overhead to hide and nothing to
+calibrate.
+
+| `rdtsc; cpuid; rdtsc`, minimum of 2000 | cycles |
+|---|---|
+| before the driver loads | 2376 |
+| hypervisor live | 2376 |
+| an earlier build that did intercept | 12309 |
+
+The cost is that the SVM feature bits cannot be masked: the guest sees
+`8000_0001.ECX.SVM` set and `8000_000A` populated, while `VMRUN` still raises
+`#UD`. That is a real discrepancy and it is not pretended otherwise — it is
+simply a much narrower one. Code that times `CPUID` is everywhere; code that
+tries to *use* SVM is rare. Closing it completely means virtualising SVM for the
+guest, which is a different project.
+
+Do not judge this by the ratio to `lfence`. Under a parent hypervisor `CPUID`
+already exits to *it*, so ~2376 against a 66-cycle `lfence` — about 36x — is
+what the machine looks like with nothing of ours loaded. `hvtest` takes the
+verdict from the hypervisor's own exit counter instead, which cannot be argued
+with: `cpuid exits taken: 0`.
 
 **The rest of the instruction set.** `VMLOAD`, `VMSAVE`, `STGI`, `CLGI`,
 `SKINIT` and `INVLPGA` are intercepted and answered with `#UD`. Leaving them
@@ -234,43 +252,30 @@ alone would be worse than detectable: with `EFER.SVME` really set, a guest
 and the host stacks are pointed at a shared zero page in both hierarchies. The
 processor reaches a VMCB by physical address, and the host stacks are only ever
 touched with SVM's host state loaded, so none of it is affected — but a guest
-reading physical memory now finds nothing there. This is visible from inside the
-guest: with the driver loaded, `dq` on a VMCB in the kernel debugger returns
-zeroes.
+reading physical memory now finds nothing there.
+
+That mapping is **read-only**, and the reason is worth recording. It used to be
+writable, and because every hidden page points at the *same* dummy page, a guest
+could write a pattern into one hidden page and read it back out of another. Two
+supposedly distinct physical pages that mirror each other is a sharper tell than
+anything their contents would have given away.
 
 Not hidden: the nested page tables themselves and the hooks' shadow pages. Both
 are edited from guest context, so hiding them would mean the driver writing to
 the dummy page instead.
 
-**Time.** This is the one that needs care. An intercepted `CPUID` is
-enormously more expensive than a real one, and `rdtsc; cpuid; rdtsc` is the
-first thing anything looks at. The driver measures the minimum of that sequence
-twice — once before the first `VMRUN`, once from inside the guest with
-compensation still switched off — and subtracts the difference from the guest's
-TSC on every `CPUID` exit via `TSC_OFFSET`.
+**Time.** Nothing is adjusted, and nothing needs to be. The driver no longer
+writes `TSC_OFFSET` at all.
 
-Calibrating from *inside the guest* rather than timing the handler is the whole
-point. Running nested, most of what an intercepted instruction costs is spent in
-the layer above us emulating the `#VMEXIT` and the `VMRUN`, which this driver
-never gets to see; in the lab VM the handler's own residency is about 5 000
-cycles out of the 11 600 the guest can measure. Compensating only the residency
-leaves a 4.7× signature intact. Compensating the full measured difference
-removes it:
-
-| `rdtsc; cpuid; rdtsc`, minimum of 2000 | cycles |
-|---|---|
-| before the driver loads | 2376 |
-| hypervisor live | 2343 – 2376 |
-| after unload | 2376 |
-
-Hiding the residency *in full* would be a mistake in the other direction — it
-makes `CPUID` measure ~33 cycles, faster than the hardware can execute it, which
-is as much of a tell as making it look slow.
-
-Only `CPUID` exits are compensated. A nested page fault or a hypercall cannot be
-attributed to a particular instruction pair, and the compensation is a constant
-calibrated against `CPUID`, so applying it to a cheaper exit would push the clock
-backwards rather than merely behind.
+It used to. The compensation went into a per-processor running total that only
+ever decreased, so every processor's clock walked backwards without bound and
+away from the others. Windows needs the TSC invariant and synchronised across
+processors; it absorbed the skew for a few minutes and then reset the machine —
+no bugcheck, no dump, only a Kernel-Power event 41 afterwards. Capping the drift
+stopped the resets and destroyed the concealment in the same stroke: the budget
+was spent in about a hundred exits. Not intercepting `CPUID` removes the
+overhead instead of hiding it, which is the only version of this that is both
+stable and undetectable.
 
 ## Driving it: there is no IOCTL
 
@@ -374,9 +379,9 @@ to change any of this is to rebuild.
 | Constant | Default | What it does |
 |---|---|---|
 | `STEALTHV_NESTED_PAGING` | 1 | nested page tables, and therefore hooks and page hiding |
-| `STEALTHV_HIDE_SVM_CPUID` | 1 | erase SVM from `8000_0001` and `8000_000A` |
+| `STEALTHV_HIDE_SVM_CPUID` | 0 | impossible without intercepting `CPUID`; see above |
 | `STEALTHV_HIDE_EFER` | 1 | intercept `EFER` so `SVME` reads as clear |
-| `STEALTHV_TSC_OFFSET` | 1 | calibrate away the cost of an intercepted `CPUID` |
+| `STEALTHV_TSC_OFFSET` | 0 | removed: `CPUID` is not intercepted, so there is no cost |
 | `STEALTHV_HIDE_PAGES` | 1 | the driver's own pages read as zeroes |
 | `STEALTHV_ALWAYS_FLUSH_TLB` | 0 | flush the ASID every entry — **leave this off** |
 | `STEALTHV_CONTROL_INTERFACE` | 1 | answer the control leaf and run its worker |
@@ -405,7 +410,7 @@ absent.** With it at 1 there is still no device object, no symbolic link and no
 dispatch routine — nothing reachable from user mode without the key, and the
 control leaf passes straight through to the hardware for anyone who does not have
 it. What it does cost is a system thread that wakes ten times a second, which a
-scan of system threads can see, and one more CPUID leaf that answers.
+scan of system threads can see, and a `VMMCALL` that answers the magic.
 
 Set it to 0 and the driver has no interface of any kind: nothing to open, nothing
 to call, no thread waking up to look at a doorbell. `svmhvctl.exe` and the MCP
@@ -500,12 +505,9 @@ Verified in the lab VM (Ryzen 9 6900HS, 8 vCPU, Windows 11 22621, nested under
 Hyper-V), twice per run with zero failures:
 
 ```
-[pass] the signature leaf is silent without the key
-[pass] SVM feature bit is hidden
-[pass] SVM feature leaf reads as reserved
-[pass] every cpuid produced exactly one exit
+[pass] the channel is silent without the magic
+[pass] cpuid is not intercepted: no exit, nothing to time   (cpuid exits: 0)
 [pass] nested paging is on
-[pass] kernel-mode cpuid also shows no SVM
 [pass] hook installed
 [pass] the detour ran
 [pass] the trampoline reached the original code
@@ -520,15 +522,32 @@ guest. The nested page tables are demonstrably live: hardware sets the accessed
 bit in the PML4, and a `#NPF` count of exactly 4 per hooked call matches the four
 transitions the design predicts.
 
-**Long-duration stability under concurrent load is not verified.** The soak in
-`soak.ps1` never ran to completion. What is established is only the negative
-evidence, which is worth stating precisely because it is easy to overclaim in
-either direction:
+**The guest used to reset a few minutes after load. That is fixed.** For a long
+time this was described as the guest "hanging" or "wedging", and it was not: it
+was a hard reset, and the instrumentation hid it. `Get-VM Uptime` keeps counting
+straight across the reset, `Heartbeat` reads OK again as soon as the guest is
+back up, and PowerShell Direct "recovering" is just the machine having rebooted.
+Compare `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime` before and
+after; nothing else here can be trusted.
 
-- `nt!KiBugCheckData` was zero on every inspection, there is not a single
-  bugcheck (event 1001) in the guest's log, and no crash dump was ever written.
-- Every "rebooted without cleanly shutting down" (event 41) in that log traces to
-  a hard power-off performed from the host during this work.
+The cause was the TSC compensation described above, and removing the `CPUID`
+intercept removed it. Bisected by rebuilding one constant at a time with a
+200-second observation each, which cleared `STEALTHV_CONTROL_INTERFACE`,
+`STEALTHV_HIDE_EFER` and `STEALTHV_HIDE_PAGES` in turn before
+`STEALTHV_TSC_OFFSET` gave the first clean pass.
+
+Verified with every option enabled: 200 seconds and then 220 seconds with an
+unchanged boot time, the service still RUNNING, `hvtest` at `RESULT: OK`, the
+control channel answering from ring 3, and `cpuid_exits=0` across 461 123 exits.
+
+The negative evidence from before the fix still holds and is worth keeping,
+because it is what identified the failure as a triple fault rather than a
+bugcheck: `nt!KiBugCheckData` was zero on every inspection, there is not a single
+event 1001 in the guest's log, and no crash dump was ever written.
+
+**Long-duration stability under concurrent load is still not verified.** The
+soak in `soak.ps1` has not been re-run since the fix. Minutes of idle stability
+is not hours of load.
 
 Part of what went wrong is the guest, and it has to be dealt with first or it
 hides everything else. Windows Defender scanning the soak's own scratch files,
@@ -591,10 +610,11 @@ Deliberate, in the name of staying readable:
   takes effect on the target processor's next exit. In practice every vCPU exits
   constantly, so the window is short; closing it properly would mean IPI-ing the
   other processors out of guest mode on every flush hypercall.
-- TSC compensation is per-processor and cumulative, so a thread that executes a
-  lot of `CPUID` drags that processor's clock behind the others. Measured over
-  2400 forced migrations while `hvtest` hammered `CPUID`: a worst backwards step
-  of 28 ms. Windows tolerated it, but this is why it is still a switch.
+- The SVM feature bits are visible to the guest. Masking them requires
+  intercepting `CPUID`, which is what produced a timing signature and, through
+  the compensation it needed, the resets. This is the deliberate trade; a guest
+  that tries to *use* SVM still finds a `#UD` from `VMRUN` where it did not
+  expect one.
 - Hiding `EFER.SVME` costs about 200 000 extra exits per second under a parent
   hypervisor, and that cost is now paid by default — see *Configuration* above.
   Set `STEALTHV_HIDE_EFER` to 0 to get the throughput back, at the price of a

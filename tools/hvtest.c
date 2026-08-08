@@ -17,8 +17,24 @@
 #include <stdio.h>
 #include <string.h>
 
-#define CPUID_SIGNATURE_LEAF    0x4FFFFFFF
-#define SIGNATURE_KEY           0x7A1D4C5F
+/* The VMMCALL channel; see driver/svm.h. */
+#define SVMHV_HYPERCALL_MAGIC   0x53564D485643414CULL
+#define HV_READ_SNAPSHOT        4
+#define HV_SIGNATURE            9
+
+/*
+ * Where SVMHV_STATS.CpuidExits lands in the snapshot: the stats block starts at
+ * 16 and the counter is 32 bytes into it.  Asserted against the struct by the
+ * C_ASSERTs in include/svmhvctl.h.
+ */
+#define SNAP_CPUID_EXITS        48
+
+typedef struct _HV_REGS
+{
+    unsigned __int64 Rax, Rbx, Rcx, Rdx, Rsi, Rdi, R8, R9;
+} HV_REGS;
+
+extern void AsmHypercall(HV_REGS* Regs);
 
 static int g_Failures;
 
@@ -31,16 +47,56 @@ static void Check(int ok, const char* what)
     }
 }
 
-static void ReadSignature(unsigned int subLeaf, char out[13], unsigned int* eax)
+/*
+ * With nothing loaded, VMMCALL is #UD - which is exactly what a machine with no
+ * hypervisor does, and is how a probe discovers there is nothing here.  Every
+ * call goes through the guard, not just the decoy.
+ */
+static void Signature(unsigned __int64 magic, char out[13])
 {
-    int regs[4];
+    HV_REGS regs;
 
-    __cpuidex(regs, CPUID_SIGNATURE_LEAF, (int)subLeaf);
-    memcpy(out + 0, &regs[1], 4);
-    memcpy(out + 4, &regs[2], 4);
-    memcpy(out + 8, &regs[3], 4);
-    out[12] = 0;
-    *eax = (unsigned int)regs[0];
+    memset(&regs, 0, sizeof(regs));
+    regs.Rax = magic;
+    regs.Rbx = HV_SIGNATURE;
+
+    __try
+    {
+        AsmHypercall(&regs);
+        memcpy(out + 0, &regs.Rbx, 4);
+        memcpy(out + 4, &regs.Rdx, 4);
+        memcpy(out + 8, &regs.Rsi, 4);
+        out[12] = 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        memcpy(out, "#UD", 4);
+    }
+}
+
+static void ReadSignature(char out[13])
+{
+    Signature(SVMHV_HYPERCALL_MAGIC, out);
+}
+
+/* How many CPUID exits the hypervisor has taken, across every processor. */
+static unsigned __int64 ReadCpuidExits(void)
+{
+    HV_REGS regs;
+
+    memset(&regs, 0, sizeof(regs));
+    regs.Rax = SVMHV_HYPERCALL_MAGIC;
+    regs.Rbx = HV_READ_SNAPSHOT;
+    regs.Rdx = SNAP_CPUID_EXITS;
+
+    AsmHypercall(&regs);
+    return regs.Rbx;
+}
+
+/* The same call with the magic one bit out: it must not answer. */
+static void ReadDecoy(char out[13])
+{
+    Signature(SVMHV_HYPERCALL_MAGIC ^ 1, out);
 }
 
 /*
@@ -111,15 +167,11 @@ int main(void)
     int regs[4];
     char signature[13];
     char decoy[13];
-    unsigned int exits;
-    unsigned int decoyEax;
-    unsigned int before;
-    unsigned int after;
     unsigned __int64 cpuidCycles;
     unsigned __int64 baselineCycles;
+    unsigned __int64 cpuidExits;
     int svmBit;
     int svmLeaf;
-    int i;
 
     printf("=== processor ===\n");
     __cpuid(regs, 0);
@@ -165,12 +217,11 @@ int main(void)
     printf("  ratio                 : %.1fx\n",
            baselineCycles ? (double)cpuidCycles / (double)baselineCycles : 0.0);
 
-    printf("\n=== private leaves ===\n");
-    ReadSignature(SIGNATURE_KEY, signature, &exits);
-    ReadSignature(SIGNATURE_KEY ^ 1, decoy, &decoyEax);
-    printf("  leaf %08X + key      : \"%s\"\n", CPUID_SIGNATURE_LEAF, signature);
-    printf("  leaf %08X, wrong key : \"%s\" (eax %08X)\n",
-           CPUID_SIGNATURE_LEAF, decoy, decoyEax);
+    printf("\n=== the control channel ===\n");
+    ReadSignature(signature);
+    ReadDecoy(decoy);
+    printf("  vmmcall + magic       : \"%s\"\n", signature);
+    printf("  vmmcall, wrong magic  : \"%s\"\n", decoy);
 
     if (strcmp(signature, "SVMHV-SIMPLE") != 0)
     {
@@ -179,22 +230,32 @@ int main(void)
     }
     printf("\nsvmhv                   : PRESENT\n");
     Check(strcmp(decoy, "SVMHV-SIMPLE") != 0,
-          "the signature leaf is silent without the key");
-    Check(svmBit == 0, "SVM feature bit is hidden");
-    Check(svmLeaf == 0, "SVM feature leaf reads as reserved");
-    printf("  vm exits on this cpu  : %u\n", exits);
+          "the channel is silent without the magic");
 
-    /* The counter is per-CPU; the thread was pinned to cpu 0 above. */
-    ReadSignature(SIGNATURE_KEY, signature, &before);
-    for (i = 0; i < 1000; i++)
-    {
-        __cpuid(regs, 0);
-    }
-    ReadSignature(SIGNATURE_KEY, signature, &after);
+    /*
+     * The point of the whole design, taken from the hypervisor's own counter
+     * rather than from the clock.
+     *
+     * The ratio above cannot be the verdict, and it is worth being clear why:
+     * under a parent hypervisor CPUID already exits to *it*, so ~2400 cycles
+     * against a 66-cycle lfence - a ratio around 36x - is what this machine
+     * looks like with no driver loaded at all.  Judging the ratio would fail a
+     * correct build for something Hyper-V is doing.  Whether *this* hypervisor
+     * adds an exit is not a matter of interpretation: it either took one or it
+     * did not.
+     */
+    cpuidExits = ReadCpuidExits();
+    printf("  cpuid exits taken     : %llu\n", cpuidExits);
+    Check(cpuidExits == 0, "cpuid is not intercepted: no exit, nothing to time");
 
-    /* 1000 loop iterations + the trailing signature read = 1001. */
-    printf("  after 1000 cpuids     : %u (+%u)\n", after, after - before);
-    Check(after - before == 1001, "every cpuid produced exactly one exit");
+    /*
+     * SVM stays visible, deliberately: the feature bits cannot be masked
+     * without intercepting CPUID, which is the thing that gave the hypervisor
+     * away on the clock. Reported, not judged.
+     */
+    printf("  8000_0001.ECX.SVM     : %d (visible by design)\n", svmBit);
+    printf("  8000_000A             : %s\n",
+           svmLeaf ? "populated (visible by design)" : "reserved");
 
     /*
      * That is as far as a user-mode probe can go, and deliberately so: the

@@ -13,14 +13,6 @@
 #define SVMHV_GUEST_ASID        1
 
 /*
- * How far behind real time a processor's clock is allowed to fall through TSC
- * compensation, in cycles.  Bounds both the backwards drift and the divergence
- * between processors; see the cap in SvHandleVmExit for why an unbounded total
- * is fatal rather than untidy.
- */
-#define SVMHV_MAX_TSC_DRIFT     1000000ULL
-
-/*
  * Guest GPRs as pushed by the PUSHAQ macro in svmasm.asm.  Lowest address
  * first, i.e. reverse push order.  'Rsp' is a dummy slot pushed only to keep
  * the frame 16-byte aligned; the real guest RSP lives in the VMCB.
@@ -137,6 +129,19 @@ VOID     AsmLaunchVm(_In_ HOST_STACK_LAYOUT* HostRsp, _In_ PCONTEXT GuestContext
 /* Re-issues a guest VMMCALL in host context so the L0 hypervisor sees it. */
 UINT64   AsmForwardHypercall(_In_ UINT64 Rcx, _In_ UINT64 Rdx, _In_ UINT64 R8,
                              _Inout_ PVOID XmmSaveArea);
+
+/* Rings the VMMCALL unload doorbell from CPL 0; returns the hypervisor's status. */
+UINT64   AsmUnloadCall(VOID);
+
+/* The three registers the signature command answers in. */
+typedef struct _SVMHV_HV_SIGNATURE_RESULT
+{
+    UINT64 Rbx;
+    UINT64 Rdx;
+    UINT64 Rsi;
+} SVMHV_HV_SIGNATURE_RESULT;
+
+VOID     AsmSignatureCall(_Out_ SVMHV_HV_SIGNATURE_RESULT* Out);
 
 VOID     AsmReadGdtr(_Out_ DESCRIPTOR_TABLE_REGISTER* Gdtr);
 VOID     AsmReadIdtr(_Out_ DESCRIPTOR_TABLE_REGISTER* Idtr);

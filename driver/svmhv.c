@@ -74,8 +74,6 @@ static BOOLEAN       g_NripSupported;
 static BOOLEAN       g_ForwardHypercalls;  /* TRUE when running under L0   */
 static BOOLEAN       g_1GbPages;
 static UINT8         g_TlbControl;
-static UINT64        g_NativeCpuidCost;    /* minimum, before virtualising  */
-static UINT64        g_TscHidePerExit;     /* what an intercept adds to it  */
 
 /*
  * Everyone flushes their own ASID when this moves.  Bumped by nested page
@@ -301,137 +299,6 @@ static VOID SvInjectUd(_Inout_ VMCB* Vmcb)
     SvInjectException(Vmcb, SVM_EXCEPTION_UD, FALSE);
 }
 
-/*
- * Timing a single instruction from C needs help: RDTSC is not a barrier and the
- * optimiser is free to hoist a CPUID whose result nobody reads straight out of
- * the loop - which it does, leaving a "measurement" of two back-to-back RDTSCs.
- * A volatile leaf keeps the call inside the loop and a volatile sink keeps it
- * from being deleted outright.
- */
-static volatile ULONG g_TimingLeaf;     /* stays 0; volatile on purpose      */
-static volatile int   g_TimingSink;
-
-/*
- * The cheapest rdtsc-cpuid-rdtsc this processor can manage, which is the number
- * a detector looks at: it samples in a loop and keeps the minimum, precisely so
- * that interrupts and scheduling do not pollute the answer.
- *
- * Called twice - once before the first VMRUN and once from inside the guest with
- * compensation still switched off.  The difference is what an intercepted CPUID
- * costs over and above a normal one, and that is exactly what gets taken off the
- * guest's clock afterwards.  Measuring it from the guest rather than in the exit
- * handler is the whole point: it includes the time the hypervisor above us
- * spends emulating the #VMEXIT and the VMRUN, which this driver cannot see.
- */
-static UINT64 SvMinimumCpuidCost(VOID)
-{
-    const ULONG samples = 4096;
-    UINT64 best = ~0ULL;
-    ULONG i;
-    int regs[4];
-    KIRQL irql;
-
-    irql = KeRaiseIrqlToDpcLevel();
-
-    __cpuid(regs, (int)g_TimingLeaf);
-    for (i = 0; i < samples; i++)
-    {
-        const UINT64 start = __rdtsc();
-        __cpuid(regs, (int)g_TimingLeaf);
-        const UINT64 delta = __rdtsc() - start;
-        g_TimingSink += regs[0];
-        if (delta < best)
-        {
-            best = delta;
-        }
-    }
-
-    KeLowerIrql(irql);
-    return best;
-}
-
-/* ---------------------------------------------------------- CPUID */
-
-static BOOLEAN SvHandleCpuid(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context)
-{
-    int regs[4];
-    const UINT32 leaf = (UINT32)Context->Rax;
-    const UINT32 subLeaf = (UINT32)Context->Rcx;
-    BOOLEAN devirtualise = FALSE;
-
-    /* Executed in host context, so nested leaves come from the layer above. */
-    __cpuidex(regs, (int)leaf, (int)subLeaf);
-
-    switch (leaf)
-    {
-    case CPUID_EXT_FEATURES:
-        /*
-         * Erase SVM.  A guest that believes it has SVM and then takes a #UD
-         * from VMRUN has found us; a guest told there is no SVM behaves
-         * exactly as it would on a machine that has none.
-         */
-        if (STEALTHV_HIDE_SVM_CPUID)
-        {
-            regs[2] &= ~(int)CPUID_EXT_FEATURE_SVM;
-        }
-        break;
-
-    case CPUID_SVM_FEATURES:
-        /* Reserved on a processor without SVM. */
-        if (STEALTHV_HIDE_SVM_CPUID)
-        {
-            regs[0] = regs[1] = regs[2] = regs[3] = 0;
-        }
-        break;
-
-    case SVMHV_CPUID_SIGNATURE:
-        /* Only answers to the key; any other ECX passes straight through. */
-        if (subLeaf == SVMHV_SIGNATURE_KEY)
-        {
-            regs[0] = (int)(UINT32)Cpu->ExitCount;
-            regs[1] = 0x484D5653;   /* "SVMH" */
-            regs[2] = 0x49532D56;   /* "V-SI" */
-            regs[3] = 0x454C504D;   /* "MPLE" */
-        }
-        break;
-
-    case SVMHV_CPUID_CONTROL:
-        /*
-         * The control channel.  Answered entirely from the registers we already
-         * have, and only when the key is right - without it this leaf passes
-         * through to the hardware like any other reserved one.
-         */
-        if (STEALTHV_CONTROL_INTERFACE && subLeaf == SVMHV_CONTROL_KEY)
-        {
-            SvHandleControlCall(Context);
-            SvAdvanceRip(&Cpu->GuestVmcb, 2);
-            return FALSE;               /* Context is already what we want */
-        }
-        break;
-
-    case SVMHV_CPUID_UNLOAD:
-        /* Kernel mode only - user mode must not be able to unload us. */
-        if (Cpu->GuestVmcb.StateSave.Cpl == 0 && subLeaf == SVMHV_UNLOAD_MAGIC)
-        {
-            devirtualise = TRUE;
-            regs[0] = 1;
-            regs[1] = regs[2] = regs[3] = 0;
-        }
-        break;
-
-    default:
-        break;
-    }
-
-    Context->Rax = (UINT32)regs[0];
-    Context->Rbx = (UINT32)regs[1];
-    Context->Rcx = (UINT32)regs[2];
-    Context->Rdx = (UINT32)regs[3];
-
-    SvAdvanceRip(&Cpu->GuestVmcb, 2);
-    return devirtualise;
-}
-
 /* ------------------------------------------------------------ MSRs */
 
 static VOID SvHandleMsr(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context)
@@ -493,16 +360,39 @@ static VOID SvHandleMsr(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context
 
 /* ------------------------------------------------------- hypercalls */
 
-static VOID SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
-                            _Inout_ PVOID XmmSaveArea)
+static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
+                               _Inout_ PVOID XmmSaveArea)
 {
     UINT32 callCode;
+
+    /*
+     * Ours?  Checked before anything else, and only on the exact magic, so a
+     * VMMCALL from anybody else - a Hyper-V enlightenment, or a probe testing
+     * whether the instruction faults - takes the paths below untouched.
+     */
+    if (STEALTHV_CONTROL_INTERFACE && Context->Rax == SVMHV_HYPERCALL_MAGIC)
+    {
+        const BOOLEAN unload = (Context->Rbx == SVMHV_HV_UNLOAD) &&
+                               (Cpu->GuestVmcb.StateSave.Cpl == 0);
+
+        if (unload)
+        {
+            /* Kernel mode only - user mode must not be able to unload us. */
+            Context->Rax = SVMHV_HV_STATUS_OK;
+            SvAdvanceRip(&Cpu->GuestVmcb, 3);
+            return TRUE;
+        }
+
+        SvHandleControlCall(Context);
+        SvAdvanceRip(&Cpu->GuestVmcb, 3);
+        return FALSE;
+    }
 
     if (!g_ForwardHypercalls)
     {
         /* Bare metal: VMMCALL is #UD to everyone but the hypervisor. */
         SvInjectUd(&Cpu->GuestVmcb);
-        return;
+        return FALSE;
     }
 
     callCode = (UINT32)(Context->Rcx & 0xFFFF);
@@ -533,6 +423,8 @@ static VOID SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Con
     default:
         break;
     }
+
+    return FALSE;
 }
 
 /* ------------------------------------------------ nested page faults */
@@ -660,7 +552,6 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
 {
     VMCB* vmcb = &Cpu->GuestVmcb;
     BOOLEAN devirtualise = FALSE;
-    BOOLEAN timeable = FALSE;
 
     /* RAX and RSP live in the VMCB rather than on the host stack. */
     Context->Rax = vmcb->StateSave.Rax;
@@ -674,20 +565,11 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
 
     switch (vmcb->Control.ExitCode)
     {
-    case VMEXIT_CPUID:
-        Cpu->CpuidExits++;
-        timeable = TRUE;
-        devirtualise = SvHandleCpuid(Cpu, Context);
-        break;
-
     case VMEXIT_MSR:
         /*
-         * Not marked timeable: the compensation constant is calibrated against
-         * CPUID, and taking that many cycles off an exit that may be cheaper
-         * would push the guest's clock backwards rather than merely behind.
-         * Timing RDMSR to find a hypervisor is a much rarer trick than timing
-         * CPUID, and the MSR intercept is off by default under a parent
-         * hypervisor anyway.
+         * Nothing is taken off the guest's clock for this, or for anything
+         * else.  Timing RDMSR to find a hypervisor is a much rarer trick than
+         * timing CPUID, and CPUID is no longer intercepted at all.
          */
         Cpu->MsrExits++;
         SvHandleMsr(Cpu, Context);
@@ -698,7 +580,7 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
         break;
 
     case VMEXIT_VMMCALL:
-        SvHandleVmmcall(Cpu, Context, XmmSaveArea);
+        devirtualise = SvHandleVmmcall(Cpu, Context, XmmSaveArea);
         break;
 
     /*
@@ -747,24 +629,20 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
      * processor's clock away from the others for no benefit.
      */
     /*
-     * The compensation is subtracted from a per-processor running total that
-     * only ever decreases, so left alone it walks this processor's clock
-     * backwards without bound and away from every other processor's.  Windows
-     * needs the TSC invariant and synchronised across processors; it tolerates
-     * a small skew and then, some minutes in, it does not - which is the whole
-     * "resets a few minutes after load, no bugcheck" symptom.
+     * Nothing is subtracted from the guest's clock any more, and nothing can be.
      *
-     * Stop hiding once the accumulated drift reaches the cap.  A detector times
-     * one rdtsc-cpuid-rdtsc pair, so what it can observe is the compensation
-     * for the exit it just caused - a bounded budget covers any realistic burst
-     * of measurements, while the total can never grow into something the guest
-     * notices.  The cap is roughly a third of a millisecond at 3 GHz: far more
-     * than any timing loop needs, far less than Windows cares about.
+     * Hiding the cost of an exit meant writing a per-processor running total
+     * into the VMCB that only ever decreased, so each processor's clock walked
+     * backwards without bound and away from every other processor's.  Windows
+     * needs the TSC invariant and synchronised; it absorbed the skew for a few
+     * minutes and then reset the machine, with no bugcheck and no dump.
+     *
+     * The instruction that made compensation necessary is no longer intercepted,
+     * so there is no overhead to hide and TscOffset stays where it started.
+     * TscTotal is still accumulated - it is the only measurement of what this
+     * hypervisor costs - but it is never charged to the guest.
      */
-    Cpu->Layout->TscHide =
-        (STEALTHV_TSC_OFFSET && timeable &&
-         Cpu->Layout->TscOffset > -(INT64)SVMHV_MAX_TSC_DRIFT)
-            ? g_TscHidePerExit : 0;
+    Cpu->Layout->TscHide = 0;
     Cpu->TscOverhead = (INT64)Cpu->Layout->TscTotal;
     Cpu->TscHidden   = Cpu->Layout->TscOffset;
 
@@ -836,7 +714,15 @@ static VOID SvPrepareVmcb(_Inout_ VIRTUAL_CPU* Cpu, _In_ const CONTEXT* Guest)
     __svm_vmsave(guestVmcbPa);
     __svm_vmsave(hostVmcbPa);
 
-    vmcb->Control.InterceptVector3 = SVM_INTERCEPT_CPUID | SVM_INTERCEPT_INVLPGA;
+    /*
+     * CPUID is deliberately absent.  On AMD that intercept is one optional bit,
+     * and leaving it clear is the difference between rdtsc-cpuid-rdtsc reading
+     * ~12000 cycles and reading exactly what the bare processor reads.  It costs
+     * the ability to mask the SVM feature bits, which is the one concealment
+     * this design gives up; everything the leaves used to carry - the control
+     * channel, the signature, the unload doorbell - moved to VMMCALL.
+     */
+    vmcb->Control.InterceptVector3 = SVM_INTERCEPT_INVLPGA;
     vmcb->Control.InterceptVector4 = SVM_INTERCEPT_VMRUN   |
                                      SVM_INTERCEPT_VMMCALL |
                                      SVM_INTERCEPT_VMLOAD  |
@@ -952,12 +838,8 @@ static VOID SvDevirtualizeDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Context,
 
     if (cpu->Virtualized != 0)
     {
-        int regs[4];
-
         /* Traps into the hypervisor, which drops SVM and returns here. */
-        __cpuidex(regs, SVMHV_CPUID_UNLOAD, SVMHV_UNLOAD_MAGIC);
-
-        if (regs[0] == 1)
+        if (AsmUnloadCall() == SVMHV_HV_STATUS_OK)
         {
             cpu->Virtualized = 0;
         }
@@ -1211,6 +1093,15 @@ static ULONG_PTR SvVictimIpi(_In_ ULONG_PTR Argument)
     return Argument;
 }
 
+/*
+ * RDTSC is not a barrier and the optimiser will hoist a CPUID whose result
+ * nobody reads clean out of the loop, leaving a "measurement" of two
+ * back-to-back RDTSCs.  A volatile leaf keeps the call inside the loop and a
+ * volatile sink keeps it from being deleted outright.
+ */
+static volatile ULONG g_TimingLeaf;     /* stays 0; volatile on purpose      */
+static volatile int   g_TimingSink;
+
 static UINT64 SvMeasureCpuid(_In_ BOOLEAN WithCpuid)
 {
     const ULONG count = 2000;
@@ -1426,8 +1317,9 @@ VOID SvFillStats(_Out_ SVMHV_STATS* Stats)
     Stats->ActiveHooks       = SvHookActiveCount();
     Stats->NptSplitPagesUsed = SvNptSplitPagesUsed();
     Stats->NptCoverageBytes  = STEALTHV_NESTED_PAGING ? SvNptCoverage() : 0;
-    Stats->NativeCpuidCycles = g_NativeCpuidCost;
-    Stats->HiddenPerExit     = g_TscHidePerExit;
+    /* Nothing is measured or hidden now that CPUID runs natively. */
+    Stats->NativeCpuidCycles = 0;
+    Stats->HiddenPerExit     = 0;
     SvTraceCounters(&Stats->TraceRecords, &Stats->TraceDropped,
                     &Stats->TraceFiltered);
 
@@ -1610,10 +1502,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
         }
     }
 
-    /* Has to happen before anybody is a guest: this is the only chance to see
-       what CPUID costs when nothing is intercepting it. */
-    g_NativeCpuidCost = SvMinimumCpuidCost();
-
     KeGenericCallDpc(SvVirtualizeDpc, NULL);
 
     for (i = 0; i < g_CpuCount; i++)
@@ -1644,46 +1532,27 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     DbgPrint("svmhv: %lu processors are now guests\n", g_CpuCount);
 
     /*
-     * Self-test: ask ourselves who we are.  This CPUID is intercepted by the
-     * hypervisor we just installed, so a correct answer here proves the whole
-     * path - VMRUN, the exit handler, and the return to the guest - is live.
+     * Self-test: ask ourselves who we are, over the VMMCALL channel.  A correct
+     * answer proves the whole path - VMRUN, the exit handler, and the return to
+     * the guest - is live.  It used to be a CPUID leaf; CPUID is no longer
+     * intercepted, which is the point.
      */
+    if (STEALTHV_CONTROL_INTERFACE)
     {
-        int regs[4];
+        SVMHV_HV_SIGNATURE_RESULT probe;
         char signature[13] = { 0 };
 
-        __cpuidex(regs, SVMHV_CPUID_SIGNATURE, SVMHV_SIGNATURE_KEY);
-        RtlCopyMemory(signature + 0, &regs[1], 4);
-        RtlCopyMemory(signature + 4, &regs[2], 4);
-        RtlCopyMemory(signature + 8, &regs[3], 4);
+        AsmSignatureCall(&probe);
+        RtlCopyMemory(signature + 0, &probe.Rbx, 4);
+        RtlCopyMemory(signature + 4, &probe.Rdx, 4);
+        RtlCopyMemory(signature + 8, &probe.Rsi, 4);
 
-        DbgPrint("svmhv: self-test leaf %08X -> \"%s\", %u exits on this cpu\n",
-                 SVMHV_CPUID_SIGNATURE, signature, (ULONG)regs[0]);
+        DbgPrint("svmhv: self-test -> \"%s\"\n", signature);
 
         if (strcmp(signature, "SVMHV-SIMPLE") != 0)
         {
-            DbgPrint("svmhv: SELF-TEST FAILED - cpuid was not intercepted\n");
+            DbgPrint("svmhv: SELF-TEST FAILED - vmmcall was not intercepted\n");
         }
-    }
-
-    /*
-     * Second half of the calibration, now that CPUID is intercepted and while
-     * compensation is still switched off (g_TscHidePerExit is zero, so the exit
-     * handler is not touching anybody's clock yet).  The difference between the
-     * two minima is what the interception costs from where the guest is
-     * standing - including the part spent above us, which is most of it when
-     * running nested - and that is what gets hidden from here on.
-     */
-    if (STEALTHV_TSC_OFFSET)
-    {
-        const UINT64 intercepted = SvMinimumCpuidCost();
-
-        g_TscHidePerExit = (intercepted > g_NativeCpuidCost)
-                         ? (intercepted - g_NativeCpuidCost) : 0;
-
-        DbgPrint("svmhv: cpuid costs %llu cycles natively, %llu intercepted; "
-                 "hiding %llu per exit\n",
-                 g_NativeCpuidCost, intercepted, g_TscHidePerExit);
     }
 
     if (STEALTHV_CONTROL_INTERFACE)

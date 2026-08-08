@@ -53,26 +53,35 @@
  * ECX they are passed straight through to the hardware, so a guest sweeping
  * CPUID space finds nothing that a bare machine would not also return.
  */
-#define SVMHV_CPUID_SIGNATURE   0x4FFFFFFF      /* -> "SVMHV-SIMPLE"        */
-#define SVMHV_SIGNATURE_KEY     0x7A1D4C5F      /* required in ECX          */
-#define SVMHV_CPUID_UNLOAD      0x4FFFFFFE      /* ECX = magic -> devirt    */
-#define SVMHV_UNLOAD_MAGIC      0x53564D48      /* 'SVMH'                   */
-
 /*
- * The control channel.  CPUID architecturally takes only EAX and ECX as inputs,
- * but the hypervisor sees the whole register file at the moment of the exit, so
- * the ABI can be as wide as we like: the command comes in RBX and arguments in
- * RDX/RSI, and up to 48 bytes come back in RBX/RDX/RSI/RDI/R8/R9.
+ * The control channel, carried on VMMCALL.
+ *
+ * CPUID is deliberately *not* intercepted (see config.h): on AMD that intercept
+ * is a single optional bit, and leaving it clear is what makes rdtsc-cpuid-rdtsc
+ * read exactly what bare metal reads.  VMMCALL replaces it because it is the
+ * other instruction a guest can trap on from CPL 3 - unlike VMRUN, VMLOAD,
+ * VMSAVE, STGI and CLGI, it has no privilege requirement, precisely so guest
+ * applications can talk to a VMM.
+ *
+ * It is also a quieter channel than CPUID ever was.  Ordinary code never
+ * executes VMMCALL, so there is no exit storm and no per-exit overhead to hide;
+ * and natively VMMCALL raises #UD, so there is no "native cost" for a detector
+ * to time this against.  Without the magic in RAX the instruction behaves
+ * exactly as it did before - #UD on bare metal, forwarded to the hypervisor
+ * above us when nested - so the channel is invisible to anyone without it.
+ *
+ * The magic sits in RAX because Hyper-V's hypercall convention uses RCX, RDX
+ * and R8 as inputs and RAX only as the return register, so a 64-bit value there
+ * cannot be confused with a real hypercall.  The command comes in RBX and
+ * arguments in RDX/RSI, and up to 48 bytes come back in RBX/RDX/RSI/RDI/R8/R9.
  *
  * This is the only way in.  There is no device object, no IOCTL and no doorbell
- * a debugger could write - a client executes one instruction and the hypervisor
- * answers it.  Which also means there is no ACL: the key in ECX is the whole
- * access check, and anything that knows it can install a kernel hook.  Every
- * offset a client can pass is bounded against the structure it names, so the
- * channel cannot be turned into an arbitrary kernel read.
+ * a debugger could write.  Which also means there is no ACL: the magic is the
+ * whole access check, and anything that knows it can install a kernel hook.
+ * Every offset a client can pass is bounded against the structure it names, so
+ * the channel cannot be turned into an arbitrary kernel read.
  */
-#define SVMHV_CPUID_CONTROL     0x4FFFFFFD
-#define SVMHV_CONTROL_KEY       0x3C9F17B2      /* required in ECX          */
+#define SVMHV_HYPERCALL_MAGIC   0x53564D485643414CULL   /* "SVMHVCAL" */
 
 #define SVMHV_HV_PING           0   /* -> rbx = magic, rdx = version        */
 #define SVMHV_HV_WRITE_REQUEST  1   /* rdx = offset, rsi = value            */
@@ -82,6 +91,8 @@
 #define SVMHV_HV_READ_REQUEST   5   /* rdx = offset -> 48 bytes             */
 #define SVMHV_HV_READ_TRACE     6   /* rdx = index, rsi = offset -> 48      */
 #define SVMHV_HV_TRACE_STATE    7   /* -> produced, records, record size    */
+#define SVMHV_HV_UNLOAD         8   /* CPL 0 only -> devirtualise           */
+#define SVMHV_HV_SIGNATURE      9   /* -> rbx/rdx/rsi = "SVMHV-SIMPLE"      */
 
 #define SVMHV_HV_STATUS_OK          0
 #define SVMHV_HV_STATUS_BADCOMMAND  1

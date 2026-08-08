@@ -434,7 +434,15 @@ NTSTATUS SvNptHideRange(_In_ PVOID Va, _In_ SIZE_T Size)
         const UINT64 gpa = (UINT64)MmGetPhysicalAddress(page).QuadPart;
         UINT64* primary = SvNptSplitTo4Kb(&g_NptPrimary, gpa);
         UINT64* shadow  = SvNptSplitTo4Kb(&g_NptShadow, gpa);
-        const UINT64 entry = g_DummyPagePa | NPT_PRESENT | NPT_WRITE |
+        /*
+         * Read-only, deliberately.  Every hidden page points at the same dummy
+         * page, so leaving it writable let a guest write a pattern into one
+         * hidden page and read it back out of another - two supposedly distinct
+         * physical pages that mirror each other, which is a sharper tell than
+         * anything the contents would have given away.  Writes now fault and are
+         * handled like any other nested page fault.
+         */
+        const UINT64 entry = g_DummyPagePa | NPT_PRESENT |
                              NPT_USER | NPT_NO_EXECUTE;
 
         if (primary == NULL || shadow == NULL)

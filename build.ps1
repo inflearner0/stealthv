@@ -164,8 +164,17 @@ $umInc = @(
     "/I$kit\Include\$SdkVersion\ucrt"
 )
 
+# The ring-3 side of the VMMCALL channel, shared by both tools.  It has to be
+# assembled: the ABI puts the magic in RAX and the command in RBX, which no
+# compiler intrinsic can reach, and MSVC has no inline assembler on x64.
+Invoke-Tool $ml64 @(
+    "/nologo", "/c", "/W3", "/Zi",
+    "/Fo", "$out\hvasm.obj", "$root\tools\hvasm.asm"
+) "ml64 hvasm.asm"
+
 Invoke-Tool $cl (@("/nologo", "/W4", "/O2", "/MT", "/Zi", "/FC") + $umInc + @(
     "/Fo$out\", "/Fd$out\hvtest.pdb", "/Fe$out\hvtest.exe", "$root\tools\hvtest.c",
+    "$out\hvasm.obj",
     "/link", "/INCREMENTAL:NO",
     "/LIBPATH:$msvc\lib\x64",
     "/LIBPATH:$kit\Lib\$SdkVersion\um\x64",
@@ -173,13 +182,6 @@ Invoke-Tool $cl (@("/nologo", "/W4", "/O2", "/MT", "/Zi", "/FC") + $umInc + @(
 )) "cl hvtest.c"
 
 # -------------------------------------------------------- control helper
-# The ring-3 side of the CPUID channel.  Its hypercall stub has to be
-# assembled: the ABI puts the command in RBX, which no compiler intrinsic can
-# reach, and MSVC has no inline assembler on x64.
-Invoke-Tool $ml64 @(
-    "/nologo", "/c", "/W3", "/Zi",
-    "/Fo", "$out\hvasm.obj", "$root\tools\hvasm.asm"
-) "ml64 hvasm.asm"
 
 Invoke-Tool $cl (@("/nologo", "/W4", "/WX", "/O2", "/MT", "/Zi", "/FC") + $umInc + @(
     "/Fo$out\", "/Fd$out\svmhvctl.pdb", "/Fe$out\svmhvctl.exe",

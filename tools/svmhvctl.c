@@ -17,8 +17,8 @@
 
 #include "svmhvctl.h"
 
-#define SVMHV_CPUID_CONTROL     0x4FFFFFFD
-#define SVMHV_CONTROL_KEY       0x3C9F17B2
+/* The magic in RAX is the whole access check; see svm.h. */
+#define SVMHV_HYPERCALL_MAGIC   0x53564D485643414CULL
 
 #define HV_PING                 0
 #define HV_WRITE_REQUEST        1
@@ -28,8 +28,11 @@
 #define HV_READ_REQUEST         5
 #define HV_READ_TRACE           6
 #define HV_TRACE_STATE          7
+#define HV_UNLOAD               8
+#define HV_SIGNATURE            9
 
 #define HV_OK                   0
+#define HV_ABSENT               0xFFFFFFFFFFFFFFFFULL   /* VMMCALL raised #UD */
 #define HV_READ_WINDOW          48
 
 /* Mirrors svmhvctl.h's view of the driver; see the C_ASSERTs there. */
@@ -75,13 +78,26 @@ static unsigned __int64 Call(unsigned __int64 command, unsigned __int64 a,
     HV_REGS regs;
 
     memset(&regs, 0, sizeof(regs));
-    regs.Rax = SVMHV_CPUID_CONTROL;
-    regs.Rcx = SVMHV_CONTROL_KEY;
+    regs.Rax = SVMHV_HYPERCALL_MAGIC;
     regs.Rbx = command;
     regs.Rdx = a;
     regs.Rsi = b;
 
-    AsmHypercall(&regs);
+    /*
+     * With no hypervisor of ours loaded, VMMCALL is #UD - which is the whole
+     * point of the instruction being a safe channel, but it means the very
+     * first call is how we discover the driver is absent.  Catching it here
+     * covers every command rather than just the presence probe.
+     */
+    __try
+    {
+        AsmHypercall(&regs);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        memset(&regs, 0, sizeof(regs));
+        regs.Rax = HV_ABSENT;
+    }
 
     if (out != NULL)
     {
