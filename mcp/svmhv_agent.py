@@ -3564,6 +3564,267 @@ def tool_ioctls(name: str) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------- callbacks
+
+# The registration function that is exported, and what it registers. The arrays
+# themselves - PspCreateProcessNotifyRoutine and the rest - are static data and
+# are not in the public symbols even when private symbols are loaded, so there
+# is nothing to look up. They are found by reading the function that writes to
+# them, which is exported precisely because drivers have to call it.
+CALLBACK_TABLES = [
+    ("process creation", "PsSetCreateProcessNotifyRoutineEx",
+     "runs on every process create and exit"),
+    ("thread creation", "PsSetCreateThreadNotifyRoutine",
+     "runs on every thread create and exit"),
+    ("image load", "PsSetLoadImageNotifyRoutine",
+     "runs on every driver and DLL mapped"),
+    ("registry", "CmRegisterCallbackEx",
+     "runs on every registry operation"),
+]
+
+CALLBACK_SLOTS = 64
+RIP_ABSOLUTE = re.compile(r"\[0x([0-9a-f]{6,16})\]")
+
+
+def array_shape(raw: bytes) -> list[int] | None:
+    """The callback blocks in a candidate array, or None if it is not one.
+
+    Decided entirely from the array's own contents, before anything in it is
+    dereferenced - and that ordering is the point. A dereference goes wherever
+    the contents point, so scanning a region of .data that is not one of these
+    arrays means chasing arbitrary numbers as kernel pointers, thousands of
+    them, through the read path. Reads are guarded, so this is a bound on work
+    rather than a proven fix for anything: the guest did triple-fault during an
+    unbounded version of this scan, but it also reset later with the scan
+    finished and nothing running, which is the instability CLAUDE.md already
+    describes. Do not read this filter as having closed that.
+
+    An entry is a pointer to an EX_CALLBACK_ROUTINE_BLOCK with the low four
+    bits used as a reference count. A real table holds a handful of them packed
+    at the front and then zeroes; anything with a gap, a repeat, a non-kernel
+    pointer or twenty entries is some other structure that happens to contain
+    pointers.
+    """
+    blocks = []
+    ended = False
+    for slot in range(CALLBACK_SLOTS):
+        value = int.from_bytes(raw[slot * 8:slot * 8 + 8], "little")
+        if value == 0:
+            ended = True                # registrations are packed at the front
+            continue
+        if ended:
+            return None                 # a gap: not one of these tables
+        block = value & ~0xF
+        if block < 0xFFFF800000000000:
+            return None                 # not a kernel pointer: wrong array
+        blocks.append(block)
+
+    if not blocks or len(blocks) > 16:
+        return None
+    if len(blocks) != len(set(blocks)):
+        return None                     # the same entry twice: not a table
+    return blocks
+
+
+def callback_entries(array: int) -> list[tuple[int, int]] | None:
+    """Decode a candidate array of EX_CALLBACK, or decide it is not one.
+
+    An entry is a pointer to an EX_CALLBACK_ROUTINE_BLOCK with the low four
+    bits used as a reference count, and the routine is at +0x8 in that block.
+    That shape is what identifies the array: it does not have to be found by
+    recognising the right instruction, only by testing every data address the
+    registration function touches and keeping the one whose contents decode.
+
+    Returns (block, routine) pairs, or None when this is not such an array.
+    """
+    try:
+        raw = read_bytes(array, CALLBACK_SLOTS * 8)
+    except CtlError:
+        return None
+    if len(raw) < CALLBACK_SLOTS * 8:
+        return None
+
+    blocks = array_shape(raw)
+    if blocks is None:
+        return None
+
+    entries = []
+    for block in blocks:
+        try:
+            routine = int.from_bytes(read_bytes(block + 8, 8), "little")
+        except CtlError:
+            return None
+        # The routine has to be code in something loaded. A stale or wrongly
+        # identified array fails here, which is the whole point of checking.
+        if module_for(routine) is None:
+            return None
+        entries.append((block, routine))
+
+    return entries
+
+
+def callback_candidates(export: str) -> list[int]:
+    """Data addresses a registration function touches.
+
+    Reads the exported function and follows its direct calls two levels - these
+    wrappers nest, PsSetCreateProcessNotifyRoutineEx through
+    PsSetCreateProcessNotifyRoutineEx2 and on. Every RIP-relative address it
+    sees is a candidate; which of them is the array is settled by the probe,
+    not here.
+    """
+    try:
+        start = resolve(f"nt!{export}")
+    except (CtlError, ValueError):
+        return []
+
+    seen: set[int] = set()
+    queue = [(start, 0)]
+    candidates: list[int] = []
+
+    # Bounded on purpose. Every function read is a round trip through the
+    # control channel, and following calls two levels out of four exports
+    # reaches far more of the kernel than it needs to.
+    while queue and len(seen) < 12:
+        address, depth = queue.pop(0)
+        if address in seen or depth > 2:
+            continue
+        seen.add(address)
+
+        try:
+            code = read_bytes(address, 1024)
+        except CtlError:
+            continue
+
+        offset = 0
+        while offset < len(code):
+            try:
+                length, text, branch = disassemble_one(code, offset,
+                                                       address + offset)
+            except DecodeError:
+                offset += 1
+                continue
+
+            for literal in RIP_ABSOLUTE.findall(text):
+                value = int(literal, 16)
+                if value not in candidates:
+                    candidates.append(value)
+
+            if (branch is not None and text.startswith("call")
+                    and depth < 2):
+                queue.append((branch, depth + 1))
+            offset += length
+
+    return candidates
+
+
+def probe_addresses(arm: bool) -> dict[str, int]:
+    """Arm or disarm the driver's own callbacks and say where they are.
+
+    Refuses to answer if the four addresses are not distinct. They were once
+    folded into a single function by the linker, and identical addresses do not
+    fail - they silently identify whichever array is looked at first as all
+    four kinds at once.
+    """
+    found = {}
+    distinct = True
+    for line in ctl("probe", "on" if arm else "off").splitlines():
+        if not line.startswith("probe "):
+            continue
+        kind, _, value = line[len("probe "):].partition("=")
+        if kind.strip() == "distinct":
+            distinct = value.strip() == "1"
+            continue
+        if kind.strip() == "hits":
+            continue
+        try:
+            found[kind.strip()] = int(value, 0)
+        except ValueError:
+            continue
+
+    if arm and (not distinct or len(set(found.values())) != len(found)):
+        raise CtlError("the driver's probe routines share an address, so they "
+                       "cannot tell the callback arrays apart")
+    return found
+
+
+def tool_callbacks() -> str:
+    """Every driver that asked to be told when something happens.
+
+    This is the answer to "what else is watching", and for reverse engineering
+    a driver it is often the whole story: a .sys with no device object and no
+    IOCTL interface still runs on every process creation if it registered for
+    it, and the registration is the only trace of that.
+
+    It is also how the machine's own monitoring shows itself - anti-cheat,
+    endpoint protection and the kernel's own consumers all appear here, named
+    by the module each routine lives in.
+    """
+    # Every data address any of the four registration functions touches. The
+    # arrays sit next to each other in .data and hold structurally identical
+    # entries, so nothing here distinguishes them - the probe does.
+    candidates: list[int] = []
+    for _, export, _ in CALLBACK_TABLES:
+        for candidate in callback_candidates(export):
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    probes = probe_addresses(True)
+    try:
+        identified: dict[str, tuple[int, list[tuple[int, int]]]] = {}
+        for candidate in candidates:
+            if len(identified) == len(probes):
+                break                   # every kind placed; stop reading
+            entries = callback_entries(candidate)
+            if not entries:
+                continue
+            routines = {routine for _, routine in entries}
+            for kind, probe in probes.items():
+                if probe in routines and kind not in identified:
+                    identified[kind] = (candidate, entries)
+    finally:
+        # Whatever happened above, the registry probe must not stay registered:
+        # it runs on every registry operation in the system.
+        probe_addresses(False)
+
+    lines = ["registered notification callbacks", ""]
+    total = 0
+
+    for label, export, what in CALLBACK_TABLES:
+        kind = label.split()[0]
+        if kind not in identified:
+            lines += [f"  {label} ({what})",
+                      "    not identified - the driver's own probe did not "
+                      f"turn up in any array reachable from nt!{export}", ""]
+            continue
+
+        array, entries = identified[kind]
+        others = [(block, routine) for block, routine in entries
+                  if routine != probes[kind]]
+        lines.append(f"  {label} ({what})")
+        lines.append(f"    array at {array:#x}, {len(others)} registered")
+        for _, routine in others:
+            module = module_for(routine)
+            owner = module["name"] if module else "?"
+            lines.append(f"      {routine:#018x}  {symbolize(routine):<44} "
+                         f"[{owner}]")
+        lines.append("")
+        total += len(others)
+
+    lines += ["Each array was identified by registering a callback of our own "
+              "through the",
+              "documented API and finding that exact address in it, then "
+              "unregistering - the",
+              "arrays have no symbol and look identical, so anything less is a "
+              "guess.", ""]
+
+    if total:
+        lines += [f"{total} callback(s). Each runs in the context of the "
+                  f"thread that caused the event,",
+                  "so a hook on any of them sees the process it was called "
+                  "for."]
+    return "\n".join(lines)
+
+
 def tool_explain(target: str) -> str:
     """Everything known about one address, in a single call."""
     address = resolve(target)
@@ -4379,6 +4640,19 @@ TOOLS = [
             "required": ["name"],
         },
         "handler": lambda a: tool_ioctls(a["name"]),
+    },
+    {
+        "name": "svmhv_callbacks",
+        "description":
+            "Every driver registered for process creation, thread creation, "
+            "image load or registry notifications, named by the module each "
+            "routine lives in. This is what else is watching: a .sys with no "
+            "device object and no IOCTL interface still runs on every process "
+            "creation if it registered for one, and the registration is the "
+            "only trace of that. Anti-cheat and endpoint protection show up "
+            "here.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": lambda a: tool_callbacks(),
     },
     {
         "name": "svmhv_sections",

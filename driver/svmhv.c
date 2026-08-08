@@ -30,6 +30,7 @@
 #include "trace.h"
 #include "control.h"
 #include "hvcall.h"
+#include "objects.h"
 
 #ifndef STATUS_HV_FEATURE_UNAVAILABLE
 #define STATUS_HV_FEATURE_UNAVAILABLE ((NTSTATUS)0xC0350011L)
@@ -1683,6 +1684,10 @@ static VOID SvDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 
     SvControlStop();
     SvPowerUnregister();
+
+    /* A client that armed the callback probe and went away leaves four
+       registrations behind, one of which fires on every registry operation. */
+    SvObjectsProbeStop();
 
     if (g_Cpus != NULL)
     {

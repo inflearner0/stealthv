@@ -210,6 +210,9 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
     case SVMHV_CMD_SYMLINKS:
         return SvObjectsSymbolicLinks(&g_Control.Request);
 
+    case SVMHV_CMD_CALLBACK_PROBE:
+        return SvObjectsCallbackProbe(&g_Control.Request);
+
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
     }

@@ -187,6 +187,20 @@ def fake_ctl(*arguments):
         return ("status=0x00000000\nbytes=16\n"
                 "fffff78000000000  48 89 5c 24 08 57 48 83 ec 20 48 8b d9 33 c0 c3"
                 "  H..$.WH.. H..3..\n")
+    if arguments[0] == "probe":
+        if fake_ctl.folded:
+            # What the linker did to the first version: four names, one
+            # address, and an identification that cannot mean anything.
+            return ("status=0x00000000\nprobe process=0xfffff80000020000\n"
+                    "probe thread=0xfffff80000020000\n"
+                    "probe image=0xfffff80000020000\n"
+                    "probe registry=0xfffff80000020000\n"
+                    "probe distinct=0\nprobe hits=0,0,0,0\n")
+        return ("status=0x00000000\nprobe process=0xfffff80000020000\n"
+                "probe thread=0xfffff80000020010\n"
+                "probe image=0xfffff80000020020\n"
+                "probe registry=0xfffff80000020030\n"
+                "probe distinct=1\nprobe hits=1,2,3,4\n")
     if arguments[0] == "devices":
         if arguments[1] == "quiet":
             return "status=0x00000000\ndevices=0\n"
@@ -214,6 +228,7 @@ def fake_ctl(*arguments):
     return "status=0x00000000\nhookid=1\ngpa=0x1000\ntrampoline=0x2000\n"
 
 
+fake_ctl.folded = False
 agent.ctl = fake_ctl
 
 text = rpc("tools/call", {"name": "svmhv_status", "arguments": {}})["result"]["content"][0]["text"]
@@ -572,6 +587,49 @@ check("a physical write reports what it wrote",
       "wrote 4 of 4 bytes at guest physical" in text, text)
 check("a physical write takes no pid",
       calls[-1] == ("writephys", "1000", "deadbeef"), calls[-1])
+
+# The filter that decides whether an address is one of the callback arrays.
+# It is the thing standing between this tool and dereferencing arbitrary
+# numbers as kernel pointers, which reset the machine once.
+def array_bytes(values):
+    raw = bytearray(agent.CALLBACK_SLOTS * 8)
+    for index, value in enumerate(values):
+        raw[index * 8:index * 8 + 8] = value.to_bytes(8, "little")
+    return raw
+
+
+check("an empty array is not a callback table",
+      agent.array_shape(array_bytes([])) is None)
+check("a table with a gap in it is refused",
+      agent.array_shape(array_bytes(
+          [0xffffab0000001001, 0, 0xffffab0000002001])) is None)
+check("a densely populated region is refused",
+      agent.array_shape(array_bytes(
+          [0xffffab0000001000 + i * 0x100 + 1 for i in range(20)])) is None)
+check("the same entry twice is refused",
+      agent.array_shape(array_bytes(
+          [0xffffab0000001001, 0xffffab0000001002])) is None)
+check("a user-mode pointer is refused",
+      agent.array_shape(array_bytes([0x00007ff600001001])) is None)
+check("a plausible table is accepted",
+      agent.array_shape(array_bytes(
+          [0xffffab0000001001, 0xffffab0000002003]))
+      == [0xffffab0000001000, 0xffffab0000002000])
+
+probes = agent.probe_addresses(True)
+check("the probe reports one address per kind",
+      len(set(probes.values())) == 4, probes)
+check("the probe's hit counts are not mistaken for an address",
+      "hits" not in probes and "distinct" not in probes, probes)
+
+fake_ctl.folded = True
+try:
+    agent.probe_addresses(True)
+    check("probes sharing an address are refused", False)
+except agent.CtlError as error:
+    check("probes sharing an address are refused",
+          "cannot tell the callback arrays apart" in str(error), error)
+fake_ctl.folded = False
 
 text = rpc("tools/call", {"name": "svmhv_driver", "arguments": {
     "name": "onedispatch"}})["result"]["content"][0]["text"]

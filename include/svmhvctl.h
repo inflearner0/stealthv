@@ -464,6 +464,7 @@ typedef struct _SVMHV_SNAPSHOT
 #define SVMHV_CMD_TRANSLATE     10
 #define SVMHV_CMD_DEVICES       11
 #define SVMHV_CMD_SYMLINKS      12
+#define SVMHV_CMD_CALLBACK_PROBE 13
 
 typedef struct _SVMHV_CONTROL
 {

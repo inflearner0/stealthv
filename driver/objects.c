@@ -331,6 +331,146 @@ NTSTATUS SvObjectsDevices(_Inout_ SVMHV_HOOK_REQUEST* Request)
     return STATUS_SUCCESS;
 }
 
+/* ----------------------------------------------------------------- probe */
+
+/*
+ * Four routines whose only purpose is to have an address a client can look for.
+ *
+ * Each counts its own hits, and that is not instrumentation - it is what keeps
+ * them apart.  Written as four empty functions they were folded into one by
+ * /OPT:ICF, all four addresses came back identical, and the probe could not
+ * distinguish the arrays it exists to distinguish.  Incrementing a different
+ * counter makes the bodies genuinely different, so there is nothing to fold,
+ * and the counts double as proof that the callback really was registered.
+ */
+static volatile LONG g_ProbeHits[4];
+
+VOID SvProbeProcessNotify(_In_ HANDLE Parent, _In_ HANDLE Process,
+                          _In_ BOOLEAN Create)
+{
+    UNREFERENCED_PARAMETER(Parent);
+    UNREFERENCED_PARAMETER(Process);
+    UNREFERENCED_PARAMETER(Create);
+    InterlockedIncrement(&g_ProbeHits[0]);
+}
+
+VOID SvProbeThreadNotify(_In_ HANDLE Process, _In_ HANDLE Thread,
+                         _In_ BOOLEAN Create)
+{
+    UNREFERENCED_PARAMETER(Process);
+    UNREFERENCED_PARAMETER(Thread);
+    UNREFERENCED_PARAMETER(Create);
+    InterlockedIncrement(&g_ProbeHits[1]);
+}
+
+VOID SvProbeImageNotify(_In_opt_ PUNICODE_STRING Name, _In_ HANDLE Process,
+                        _In_ PIMAGE_INFO Info)
+{
+    UNREFERENCED_PARAMETER(Name);
+    UNREFERENCED_PARAMETER(Process);
+    UNREFERENCED_PARAMETER(Info);
+    InterlockedIncrement(&g_ProbeHits[2]);
+}
+
+NTSTATUS SvProbeRegistryNotify(_In_ PVOID Context, _In_opt_ PVOID Argument1,
+                               _In_opt_ PVOID Argument2)
+{
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Argument1);
+    UNREFERENCED_PARAMETER(Argument2);
+    InterlockedIncrement(&g_ProbeHits[3]);
+    return STATUS_SUCCESS;
+}
+
+static BOOLEAN g_ProbeArmed;
+static LARGE_INTEGER g_ProbeRegistryCookie;
+
+VOID SvObjectsProbeStop(VOID)
+{
+    if (!g_ProbeArmed)
+    {
+        return;
+    }
+
+    (VOID)PsSetCreateProcessNotifyRoutine(SvProbeProcessNotify, TRUE);
+    (VOID)PsRemoveCreateThreadNotifyRoutine(SvProbeThreadNotify);
+    (VOID)PsRemoveLoadImageNotifyRoutine(SvProbeImageNotify);
+    if (g_ProbeRegistryCookie.QuadPart != 0)
+    {
+        (VOID)CmUnRegisterCallback(g_ProbeRegistryCookie);
+        g_ProbeRegistryCookie.QuadPart = 0;
+    }
+
+    g_ProbeArmed = FALSE;
+}
+
+NTSTATUS SvObjectsCallbackProbe(_Inout_ SVMHV_HOOK_REQUEST* Request)
+{
+    SVMHV_WRITER writer;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    Request->MemoryReturned = 0;
+
+    if (Request->MemoryAddress == 0)
+    {
+        SvObjectsProbeStop();
+        /* Falls through to the report: the hit counts are only interesting
+           once the probe has been armed for a while, which is now. */
+    }
+    else if (!g_ProbeArmed)
+    {
+        /*
+         * Each is allowed to fail on its own.  A kind that could not be
+         * registered simply goes unidentified at the far end, which is a
+         * better answer than refusing to identify any of them.
+         */
+        (VOID)PsSetCreateProcessNotifyRoutine(SvProbeProcessNotify, FALSE);
+        (VOID)PsSetCreateThreadNotifyRoutine(SvProbeThreadNotify);
+        (VOID)PsSetLoadImageNotifyRoutine(SvProbeImageNotify);
+
+        g_ProbeRegistryCookie.QuadPart = 0;
+        (VOID)CmRegisterCallback(SvProbeRegistryNotify, NULL,
+                                 &g_ProbeRegistryCookie);
+
+        g_ProbeArmed = TRUE;
+    }
+
+    RtlZeroMemory(Request->MemoryData, sizeof(Request->MemoryData));
+    writer.Buffer = (CHAR*)Request->MemoryData;
+    writer.Capacity = sizeof(Request->MemoryData);
+    writer.Used = 0;
+
+    SvWriteText(&writer, "probe process=");
+    SvWriteHex(&writer, (UINT64)(ULONG_PTR)SvProbeProcessNotify);
+    SvWriteText(&writer, "\nprobe thread=");
+    SvWriteHex(&writer, (UINT64)(ULONG_PTR)SvProbeThreadNotify);
+    SvWriteText(&writer, "\nprobe image=");
+    SvWriteHex(&writer, (UINT64)(ULONG_PTR)SvProbeImageNotify);
+    SvWriteText(&writer, "\nprobe registry=");
+    SvWriteHex(&writer, (UINT64)(ULONG_PTR)SvProbeRegistryNotify);
+
+    /* Four addresses that are all the same mean the linker folded them and
+       nothing downstream can tell the arrays apart; say so here rather than
+       let a client draw conclusions from it. */
+    SvWriteText(&writer, "\nprobe distinct=");
+    SvWriteDecimal(&writer,
+        (SvProbeProcessNotify != (PCREATE_PROCESS_NOTIFY_ROUTINE)
+                                 (PVOID)SvProbeThreadNotify) ? 1u : 0u);
+    SvWriteText(&writer, "\nprobe hits=");
+    SvWriteDecimal(&writer, (ULONG)g_ProbeHits[0]);
+    SvWriteChar(&writer, ',');
+    SvWriteDecimal(&writer, (ULONG)g_ProbeHits[1]);
+    SvWriteChar(&writer, ',');
+    SvWriteDecimal(&writer, (ULONG)g_ProbeHits[2]);
+    SvWriteChar(&writer, ',');
+    SvWriteDecimal(&writer, (ULONG)g_ProbeHits[3]);
+    SvWriteChar(&writer, '\n');
+
+    Request->MemoryReturned = writer.Used;
+    return STATUS_SUCCESS;
+}
+
 /* --------------------------------------------------------- symbolic links */
 
 /*

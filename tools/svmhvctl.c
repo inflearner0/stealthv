@@ -1106,6 +1106,7 @@ static void Usage(void)
         "  svmhvctl driverobj <name>\n"
         "  svmhvctl devices   <name>\n"
         "  svmhvctl symlinks  [start]\n"
+        "  svmhvctl probe     on|off\n"
         "  svmhvctl read  <address> [length] [pid]\n"
         "  svmhvctl dump  <address> <length> [pid]\n"
         "  svmhvctl readphys  <gpa> [length]\n"
@@ -1296,6 +1297,22 @@ int main(int argc, char** argv)
 
         if (!SubmitMemory(SVMHV_CMD_DEVICES, 0, REQ_MEM_MAX, 0, data, data,
                           &returned))
+        {
+            return 2;
+        }
+        data[(returned < REQ_MEM_MAX) ? returned : REQ_MEM_MAX - 1] = 0;
+        fputs((const char*)data, stdout);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "probe") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX] = { 0 };
+        unsigned int returned = 0;
+        const unsigned __int64 arm = (_stricmp(argv[2], "on") == 0) ? 1 : 0;
+
+        if (!SubmitMemory(SVMHV_CMD_CALLBACK_PROBE, arm, REQ_MEM_MAX, 0, NULL,
+                          data, &returned))
         {
             return 2;
         }
