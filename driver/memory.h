@@ -42,3 +42,36 @@ NTSTATUS SvMemoryWrite(_Inout_ SVMHV_HOOK_REQUEST* Request);
  * what the nested page tables are actually presenting.
  */
 NTSTATUS SvMemoryReadPhysical(_Inout_ SVMHV_HOOK_REQUEST* Request);
+
+/*
+ * Look up \Driver\<name> and hand back the address of its DRIVER_OBJECT.
+ *
+ * This is the one thing about a driver that a client cannot reach with a read:
+ * the object lives in the object namespace, not at any address the image
+ * advertises.  With it, everything else follows from reads the client already
+ * has - and what follows is the dispatch table, which is the map of every way
+ * that driver can be entered.  A .sys usually exports nothing, so for reverse
+ * engineering one this is worth more than the symbol table it does not have.
+ *
+ * MemoryData carries the name in on the way in and the address out.
+ */
+NTSTATUS SvMemoryDriverObject(_Inout_ SVMHV_HOOK_REQUEST* Request);
+
+/*
+ * Attach to a process so that a user-mode address means something.
+ *
+ * These live here rather than in hook.c only because KAPC_STATE and
+ * KeStackAttachProcess come from ntifs.h, which cannot be included alongside
+ * the ntddk.h everything else has already taken.  The state is carried in an
+ * opaque buffer for the same reason: hook.c must be able to hold one without
+ * being able to see the type.  PASSIVE_LEVEL, and every attach needs its
+ * detach.
+ */
+typedef struct _SVMHV_ATTACH
+{
+    UINT8 Opaque[64];               /* a KAPC_STATE, sized with room to spare */
+    PVOID Process;                  /* NULL when nothing was attached         */
+} SVMHV_ATTACH;
+
+NTSTATUS SvMemoryAttachProcess(_In_ UINT32 ProcessId, _Out_ SVMHV_ATTACH* Attach);
+VOID     SvMemoryDetachProcess(_Inout_ SVMHV_ATTACH* Attach);

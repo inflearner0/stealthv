@@ -6,6 +6,7 @@
 #include "trace.h"
 #include "svmhv.h"
 #include "control.h"    /* SvIsHypervisorMemory: what a watch may not touch */
+#include "memory.h"     /* SvMemoryAttachProcess: user-mode targets        */
 
 typedef struct _SVM_HOOK
 {
@@ -21,6 +22,24 @@ typedef struct _SVM_HOOK
     PVOID   Trampoline;         /* original prologue + jump back            */
     PVOID   ShellcodePage;      /* ACTION_SHELLCODE                          */
     PMDL    Mdl;                /* keeps the target page resident           */
+
+    /*
+     * Non-zero when the target is a user-mode address, and the reason the MDL
+     * above has to be treated completely differently.
+     *
+     * A kernel page never goes away, so pinning it for the life of the driver
+     * costs nothing and lets install-and-remove reuse everything.  A user page
+     * belongs to a process, and a process cannot exit while somebody holds its
+     * pages locked - Windows bugchecks 0x76, PROCESS_HAS_LOCKED_PAGES, naming
+     * the count of pages still locked.  That is not theoretical: it is what
+     * this driver did the first time a user-mode watch was tested and the
+     * target was closed afterwards.
+     *
+     * So a user hook's MDL is released the moment the hook is removed, and a
+     * process-exit notification removes any hook still on a process that is
+     * going away.
+     */
+    UINT32  TargetProcessId;
     UINT64* PrimaryPte;
     UINT64* ShadowPte;
     ULONG   PrologLength;
@@ -66,10 +85,68 @@ VOID SvHookFreeExecutable(_In_ PVOID Va)
 
 /* ------------------------------------------------------------ lifecycle */
 
+/*
+ * A process going away takes its pages with it, and it cannot go anywhere while
+ * we hold one locked.  Unhooking here is not tidiness - it is the difference
+ * between the target closing normally and the machine bugchecking 0x76 as it
+ * tries to.
+ *
+ * Runs at PASSIVE_LEVEL in the context of the exiting process, which is exactly
+ * where SvHookRemove needs to be.
+ */
+static VOID SvHookProcessNotify(_In_ HANDLE ParentId, _In_ HANDLE ProcessId,
+                                _In_ BOOLEAN Create)
+{
+    const UINT32 pid = (UINT32)(ULONG_PTR)ProcessId;
+    ULONG i;
+
+    UNREFERENCED_PARAMETER(ParentId);
+
+    if (Create)
+    {
+        return;
+    }
+
+    for (i = 0; i < SVMHV_MAX_HOOKS; i++)
+    {
+        PVOID target;
+
+        /* Read the target before dropping into SvHookRemove, which takes the
+           lock this loop deliberately does not hold. */
+        if (g_Hooks[i].Active == 0 || g_Hooks[i].TargetProcessId != pid)
+        {
+            continue;
+        }
+        target = g_Hooks[i].TargetVa;
+        if (target == NULL)
+        {
+            continue;
+        }
+
+        DbgPrint("svmhv: process %lu is exiting with hook %lu still on it; "
+                 "removing\n", pid, i);
+        (VOID)SvHookRemove(target);
+    }
+}
+
 NTSTATUS SvHookInitialize(VOID)
 {
+    NTSTATUS status;
+
     KeInitializeGuardedMutex(&g_HookLock);
     RtlZeroMemory(g_Hooks, sizeof(g_Hooks));
+
+    /*
+     * Registered unconditionally, because a user-mode hook can be installed at
+     * any time and there is no second chance to notice the process leaving.
+     */
+    status = PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, FALSE);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint("svmhv: no process-exit notification (%08X); user-mode hooks "
+                 "will not be safe\n", status);
+        return status;
+    }
 
     g_TrampolinePage = (UINT8*)SvHookAllocateExecutable(PAGE_SIZE);
     if (g_TrampolinePage == NULL)
@@ -92,6 +169,9 @@ NTSTATUS SvHookInitialize(VOID)
 VOID SvHookCleanup(VOID)
 {
     ULONG i;
+
+    /* Before anything is freed: the callback reaches into g_Hooks. */
+    (VOID)PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, TRUE);
 
     for (i = 0; i < SVMHV_MAX_HOOKS; i++)
     {
@@ -520,15 +600,57 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     UINT64 gpa;
     PVOID shadowVa = NULL;
     PMDL mdl = NULL;
+    SVMHV_ATTACH attach = { 0 };
     const BOOLEAN isExec = (Request->Kind == SVMHV_HOOK_EXEC);
 
     Request->Trampoline = 0;
     Request->Gpa = 0;
     Request->HookId = 0;
 
+    /*
+     * A user-mode target is allowed, but only with a process to pin it to.
+     *
+     * The mechanism never cared: a hook keys on a guest physical page, and a
+     * user page is as hookable as a kernel one.  What a user target needs that
+     * a kernel one does not is a context - the address means nothing without a
+     * process, MmGetPhysicalAddress would translate it against whatever address
+     * space the worker thread happens to be in, and the answer would be a page
+     * belonging to somebody else entirely.  So attach first, and refuse if the
+     * caller did not say to what.
+     *
+     * Two things follow that a caller has to know, and they are documented
+     * rather than defended against.  The hook is on the *physical* page, so a
+     * page shared between processes - which is every mapped image - fires for
+     * all of them; the process filters exist to narrow the recording, and they
+     * are the right tool for it.  And a private page can be copied on write
+     * afterwards, at which point the hook is watching the copy nobody is using
+     * any more.
+     */
     if (Request->Target < (UINT64)MM_SYSTEM_RANGE_START)
     {
-        return STATUS_INVALID_PARAMETER;
+        if (Request->TargetProcessId == 0)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        /*
+         * Watchpoints only, for now, and the reason is worth writing down
+         * because it is not a policy decision.
+         *
+         * A watch executes nothing: the fault handler records the access and
+         * switches this processor's view, which works identically whoever owns
+         * the page.  An exec hook has to jump somewhere, and everywhere this
+         * driver can put a detour - the trace stub, a shellcode page, a
+         * trampoline - is kernel memory.  Jumping there from CPL 3 faults, and
+         * on any modern processor SMEP would stop it even if the mapping
+         * allowed it.  Making exec hooks work in user mode means allocating the
+         * detour inside the target process, which is a different piece of work
+         * and not one to fake.
+         */
+        if (Request->Kind == SVMHV_HOOK_EXEC)
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
     }
     if (Request->Kind > SVMHV_HOOK_ACCESS)
     {
@@ -574,6 +696,20 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     }
 
     KeAcquireGuardedMutex(&g_HookLock);
+
+    /*
+     * Everything from here to the MDL has to run in the target's address space
+     * when there is one, because that is what makes the translation below mean
+     * anything.  Kernel targets attach to nothing and are unaffected.
+     */
+    if (Request->TargetProcessId != 0)
+    {
+        status = SvMemoryAttachProcess(Request->TargetProcessId, &attach);
+        if (!NT_SUCCESS(status))
+        {
+            goto done;
+        }
+    }
 
     /*
      * One hook per guest physical page.  Two in the same page would have to
@@ -741,6 +877,7 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     hook->ShadowPa     = (shadowVa != NULL)
                        ? (UINT64)MmGetPhysicalAddress(shadowVa).QuadPart : 0;
     hook->Mdl          = mdl;
+    hook->TargetProcessId = Request->TargetProcessId;
     hook->PrologLength = isExec ? Request->PrologLength : 0;
     hook->Hits         = 0;
 
@@ -814,6 +951,13 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
              hook->DetourVa, hook->PrologLength, hook->Trampoline);
 
 done:
+    /*
+     * Before anything else on the way out: the shadow copy, the trampoline and
+     * the page table edits above all read the target through the attached
+     * address space, and everything after this point must not.
+     */
+    SvMemoryDetachProcess(&attach);
+
     if (!NT_SUCCESS(status))
     {
         if (shadowVa != NULL)
@@ -859,6 +1003,28 @@ NTSTATUS SvHookRemove(_In_ PVOID Target)
 
         SvHookRestoreEntries(hook);
         SvSyncTlbFlush();
+
+        /*
+         * A user page's pin cannot outlive the hook.  Everything else about a
+         * removed hook is deliberately kept so that re-installing costs
+         * nothing, but holding this would stop the target process from ever
+         * exiting - it would bugcheck 0x76 on its way out instead.
+         *
+         * The flush above is what makes this safe to do here: no processor is
+         * still using a translation that depended on the page staying put.
+         */
+        if (hook->TargetProcessId != 0 && hook->Mdl != NULL)
+        {
+            MmUnlockPages(hook->Mdl);
+            IoFreeMdl(hook->Mdl);
+            hook->Mdl = NULL;
+
+            /* The record is reusable only for a target that gets re-pinned, so
+               make the install path treat it as a fresh one. */
+            hook->PrimaryPte = NULL;
+            hook->ShadowPte = NULL;
+            hook->TargetVa = NULL;
+        }
 
         DbgPrint("svmhv: hook %u removed at %p after %lld hits\n",
                  i, Target, hook->Hits);

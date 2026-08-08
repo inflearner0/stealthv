@@ -190,6 +190,131 @@ NTSTATUS SvMemoryWrite(_Inout_ SVMHV_HOOK_REQUEST* Request)
     return SvMemoryInProcess(Request, SvMemoryWriteOperation);
 }
 
+/* --------------------------------------------------------------- attach */
+
+C_ASSERT(sizeof(KAPC_STATE) <= RTL_FIELD_SIZE(SVMHV_ATTACH, Opaque));
+
+NTSTATUS SvMemoryAttachProcess(_In_ UINT32 ProcessId, _Out_ SVMHV_ATTACH* Attach)
+{
+    PEPROCESS process = NULL;
+    NTSTATUS status;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    RtlZeroMemory(Attach, sizeof(*Attach));
+
+    status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)ProcessId, &process);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    KeStackAttachProcess(process, (PKAPC_STATE)Attach->Opaque);
+    Attach->Process = process;
+    return STATUS_SUCCESS;
+}
+
+VOID SvMemoryDetachProcess(_Inout_ SVMHV_ATTACH* Attach)
+{
+    if (Attach->Process == NULL)
+    {
+        return;
+    }
+
+    KeUnstackDetachProcess((PKAPC_STATE)Attach->Opaque);
+    ObDereferenceObject((PEPROCESS)Attach->Process);
+    Attach->Process = NULL;
+}
+
+/* ---------------------------------------------------------- driver object */
+
+extern POBJECT_TYPE* IoDriverObjectType;
+
+NTKERNELAPI NTSTATUS ObReferenceObjectByName(
+    _In_ PUNICODE_STRING ObjectName, _In_ ULONG Attributes,
+    _In_opt_ PACCESS_STATE AccessState, _In_opt_ ACCESS_MASK DesiredAccess,
+    _In_ POBJECT_TYPE ObjectType, _In_ KPROCESSOR_MODE AccessMode,
+    _Inout_opt_ PVOID ParseContext, _Out_ PVOID* Object);
+
+NTSTATUS SvMemoryDriverObject(_Inout_ SVMHV_HOOK_REQUEST* Request)
+{
+    WCHAR path[128];
+    UNICODE_STRING name;
+    ANSI_STRING ansi;
+    UNICODE_STRING converted;
+    PVOID object = NULL;
+    NTSTATUS status;
+    ULONG i;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    Request->MemoryReturned = 0;
+
+    /* The name arrives as ASCII in the data buffer; bound it before trusting
+       it, since everything about the request block is client-supplied. */
+    for (i = 0; i < 64 && Request->MemoryData[i] != 0; i++)
+    {
+        if (Request->MemoryData[i] < 0x20 || Request->MemoryData[i] > 0x7E)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    if (i == 0 || i >= 64)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ansi.Buffer = (PCHAR)Request->MemoryData;
+    ansi.Length = (USHORT)i;
+    ansi.MaximumLength = (USHORT)i;
+
+    status = RtlAnsiStringToUnicodeString(&converted, &ansi, TRUE);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    RtlZeroMemory(path, sizeof(path));
+    name.Buffer = path;
+    name.Length = 0;
+    name.MaximumLength = sizeof(path);
+
+    /* A bare name means \Driver\<name>; anything already rooted is taken as
+       given, so \FileSystem\Ntfs can be asked for too. */
+    if (converted.Length >= sizeof(WCHAR) && converted.Buffer[0] != L'\\')
+    {
+        RtlAppendUnicodeToString(&name, L"\\Driver\\");
+    }
+    status = RtlAppendUnicodeStringToString(&name, &converted);
+    RtlFreeUnicodeString(&converted);
+
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    status = ObReferenceObjectByName(&name, OBJ_CASE_INSENSITIVE, NULL, 0,
+                                     *IoDriverObjectType, KernelMode, NULL,
+                                     &object);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    /*
+     * The address, not a copy.  Handing back the pointer lets the client read
+     * the object with the ordinary read path and parse it at its leisure - and
+     * it keeps the layout of DRIVER_OBJECT, which is a Windows detail rather
+     * than ours, out of this file entirely.
+     */
+    RtlZeroMemory(Request->MemoryData, sizeof(Request->MemoryData));
+    *(UINT64*)Request->MemoryData = (UINT64)(ULONG_PTR)object;
+    Request->MemoryReturned = sizeof(UINT64);
+
+    ObDereferenceObject(object);
+    return STATUS_SUCCESS;
+}
+
 /* -------------------------------------------------------------- physical */
 
 NTSTATUS SvMemoryReadPhysical(_Inout_ SVMHV_HOOK_REQUEST* Request)

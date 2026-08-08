@@ -181,7 +181,16 @@ typedef struct _SVMHV_HOOK_REQUEST
     UINT32 FilterCount;
     SVMHV_FILTER Filters[SVMHV_MAX_FILTERS];
     UINT32 ShellcodeSize;
-    UINT32 Reserved;
+
+    /*
+     * Which process Target belongs to.  Zero means kernel space, which is what
+     * every kernel hook uses and why this could take over a Reserved field
+     * without moving anything.  A user-mode target requires it: the address is
+     * meaningless without a context, and translating it against whichever
+     * address space the worker thread happened to be in would pin a page
+     * belonging to somebody else.
+     */
+    UINT32 TargetProcessId;
 
     /* out */
     UINT64 Trampoline;
@@ -395,6 +404,9 @@ typedef struct _SVMHV_SNAPSHOT
 #define SVMHV_CMD_READ_MEMORY   5
 #define SVMHV_CMD_WRITE_MEMORY  6
 #define SVMHV_CMD_READ_PHYSICAL 7
+
+/* Resolve \Driver\<name> to its DRIVER_OBJECT address; see memory.h. */
+#define SVMHV_CMD_DRIVER_OBJECT 8
 
 typedef struct _SVMHV_CONTROL
 {

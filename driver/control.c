@@ -148,6 +148,9 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
     case SVMHV_CMD_READ_PHYSICAL:
         return SvMemoryReadPhysical(&g_Control.Request);
 
+    case SVMHV_CMD_DRIVER_OBJECT:
+        return SvMemoryDriverObject(&g_Control.Request);
+
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
     }

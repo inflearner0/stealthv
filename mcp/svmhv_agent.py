@@ -127,7 +127,7 @@ CAPTURE_TYPES = ("ansi", "wide", "unicode", "objattr", "bytes")
 
 def hook_options(process=None, pid=None, caller_base=None, caller_size=None,
                  filter_expr=None, capture=None, capture2=None,
-                 spoof=None, spoof2=None, block=None) -> list[str]:
+                 spoof=None, spoof2=None, block=None, in_process=None) -> list[str]:
     """
     Turn the tool parameters into svmhvctl's named options.
 
@@ -170,6 +170,10 @@ def hook_options(process=None, pid=None, caller_base=None, caller_size=None,
 
     if block is not None:
         options += ["--block", str(block)]
+    if in_process is not None:
+        # Which address space the *target* is in, as opposed to --pid, which
+        # narrows what gets recorded once the hook is already placed.
+        options += ["--in-process", str(int(in_process))]
 
     return options
 
@@ -999,6 +1003,176 @@ def tool_explain(target: str) -> str:
     return "\n".join(lines)
 
 
+# ----------------------------------------------------------- driver objects
+
+# DRIVER_OBJECT on x64. Stable across every Windows 10/11 build; the dispatch
+# table is the last field and the reason this structure is interesting at all.
+#   0x00 Type/Size   0x08 DeviceObject   0x10 Flags
+#   0x18 DriverStart 0x20 DriverSize     0x28 DriverSection
+#   0x30 DriverExtension                 0x38 DriverName (UNICODE_STRING, 16)
+#   0x48 HardwareDatabase                0x50 FastIoDispatch
+#   0x58 DriverInit  0x60 DriverStartIo  0x68 DriverUnload
+#   0x70 MajorFunction[28]
+DRIVER_OBJECT_SIZE = 0x150
+DRIVER_START = 0x18
+DRIVER_SIZE = 0x20
+DRIVER_SECTION = 0x28
+DRIVER_NAME = 0x38
+DRIVER_INIT = 0x58
+DRIVER_STARTIO = 0x60
+DRIVER_UNLOAD = 0x68
+DRIVER_MAJOR = 0x70
+
+IRP_NAMES = [
+    "CREATE", "CREATE_NAMED_PIPE", "CLOSE", "READ", "WRITE",
+    "QUERY_INFORMATION", "SET_INFORMATION", "QUERY_EA", "SET_EA",
+    "FLUSH_BUFFERS", "QUERY_VOLUME_INFORMATION", "SET_VOLUME_INFORMATION",
+    "DIRECTORY_CONTROL", "FILE_SYSTEM_CONTROL", "DEVICE_CONTROL",
+    "INTERNAL_DEVICE_CONTROL", "SHUTDOWN", "LOCK_CONTROL", "CLEANUP",
+    "CREATE_MAILSLOT", "QUERY_SECURITY", "SET_SECURITY", "POWER",
+    "SYSTEM_CONTROL", "DEVICE_CHANGE", "QUERY_QUOTA", "SET_QUOTA", "PNP",
+]
+
+
+def describe_pointer(value: int) -> str:
+    """A field that is often legitimately empty.
+
+    Windows clears DriverInit once a driver has started and plenty of drivers
+    have no StartIo or Unload at all, so "not set" is the common answer and has
+    to be said rather than rendered as a symbol lookup for address zero.
+    """
+    if value == 0:
+        return "(not set)"
+    named = symbolize(value)
+    return named if "!" in named or "+" in named else f"{value:#x}"
+
+
+def driver_object(name: str) -> int:
+    values = pairs(ctl("driverobj", name))
+    address = as_int(values, "driver_object")
+    if address == 0:
+        raise CtlError(f"no driver object for {name!r} "
+                       f"(status {values.get('status', '?')})")
+    return address
+
+
+def tool_driver(name: str) -> str:
+    """The dispatch table and everything around it, for one driver.
+
+    This is the closest thing a .sys has to a symbol table. Almost none of them
+    export anything, so the exported-name path that works for the kernel gives
+    nothing here - but every driver has to publish its entry points in a
+    DRIVER_OBJECT, and those are precisely the functions worth hooking.
+    """
+    address = driver_object(name)
+    raw = read_bytes(address, DRIVER_OBJECT_SIZE)
+
+    def pointer(at):
+        return int.from_bytes(raw[at:at + 8], "little")
+
+    base = pointer(DRIVER_START)
+    size = int.from_bytes(raw[DRIVER_SIZE:DRIVER_SIZE + 4], "little")
+
+    lines = [
+        f"{name}",
+        f"  driver object : {address:#x}",
+        f"  image         : {base:#x} + {size:#x}",
+        f"  DriverEntry   : {describe_pointer(pointer(DRIVER_INIT))}",
+        f"  StartIo       : {describe_pointer(pointer(DRIVER_STARTIO))}",
+        f"  Unload        : {describe_pointer(pointer(DRIVER_UNLOAD))}",
+        "",
+        "  dispatch table (only the entries it actually handles):",
+    ]
+
+    # Most slots point at nt!IopInvalidDeviceRequest; the interesting ones are
+    # those that do not, so find the majority pointer and treat it as "unset".
+    handlers = [pointer(DRIVER_MAJOR + i * 8) for i in range(len(IRP_NAMES))]
+    common = max(set(handlers), key=handlers.count) if handlers else 0
+
+    shown = 0
+    for index, handler in enumerate(handlers):
+        if handler in (0, common):
+            continue
+        shown += 1
+        inside = base <= handler < base + size
+        lines.append(f"    IRP_MJ_{IRP_NAMES[index]:<24} {handler:#018x}"
+                     f"  {symbolize(handler)}"
+                     f"{'' if inside else '   [outside the image]'}")
+
+    if shown == 0:
+        lines.append("    none - every slot points at the default handler")
+    lines += ["",
+              f"  {shown} entry point(s) worth hooking. Hook one with "
+              f"svmhv_hook_trace on its address."]
+    return "\n".join(lines)
+
+
+def tool_imports(module_name: str) -> str:
+    """What a module calls. For a driver with no exports, this is the profile."""
+    module = module_by_name(module_name)
+    if module is None:
+        return f"no loaded module called {module_name!r}"
+    base = module["base"]
+
+    header = read_bytes(base, 0x400)
+    if header[:2] != b"MZ":
+        return f"no MZ header at {base:#x}"
+    pe = int.from_bytes(header[0x3C:0x40], "little")
+    optional = pe + 0x18
+    magic = int.from_bytes(header[optional:optional + 2], "little")
+    directory = optional + (0x70 if magic == 0x20B else 0x60)
+    # The import directory is the second entry, so 8 bytes past the export one.
+    rva = int.from_bytes(header[directory + 8:directory + 12], "little")
+    if rva == 0:
+        return f"{module['name']} imports nothing"
+
+    blob = read_bytes(base + rva, 0x1000)
+    pages: dict[int, bytes] = {}
+
+    def string_at(string_rva):
+        page = (base + string_rva) & ~0xFFF
+        if page not in pages:
+            try:
+                pages[page] = read_bytes(page, 0x1000)
+            except CtlError:
+                return ""
+        chunk = pages[page][(base + string_rva) & 0xFFF:]
+        return chunk.split(b"\0", 1)[0].decode("ascii", "replace")
+
+    lines = [f"{module['name']} imports", ""]
+    for i in range(0, len(blob), 20):
+        entry = blob[i:i + 20]
+        if len(entry) < 20 or entry == b"\0" * 20:
+            break
+        name_rva = int.from_bytes(entry[12:16], "little")
+        thunk_rva = int.from_bytes(entry[0:4], "little") or \
+            int.from_bytes(entry[16:20], "little")
+        source = string_at(name_rva)
+        if not source:
+            continue
+
+        functions = []
+        try:
+            thunks = read_bytes(base + thunk_rva, 0x800)
+            for j in range(0, len(thunks), 8):
+                value = int.from_bytes(thunks[j:j + 8], "little")
+                if value == 0:
+                    break
+                if value & (1 << 63):
+                    functions.append(f"#{value & 0xFFFF}")
+                else:
+                    functions.append(string_at(value + 2))
+        except CtlError:
+            pass
+
+        lines.append(f"  {source}  ({len(functions)})")
+        for function in functions[:40]:
+            lines.append(f"      {function}")
+        if len(functions) > 40:
+            lines.append(f"      ... and {len(functions) - 40} more")
+    return "\n".join(lines)
+
+
 def tool_selftest() -> str:
     values = pairs(ctl("selftest"))
     passed = as_int(values, "passed")
@@ -1130,6 +1304,40 @@ TOOLS = [
             "required": ["target"],
         },
         "handler": lambda a: tool_explain(a["target"]),
+    },
+    {
+        "name": "svmhv_driver",
+        "description":
+            "A driver's DRIVER_OBJECT: its image range, DriverEntry, Unload, "
+            "and the IRP dispatch table with every handler symbolized. This is "
+            "the closest thing a .sys has to a symbol table - almost none of "
+            "them export anything, but every one has to publish its entry "
+            "points here, and those are exactly the functions worth hooking. "
+            "Start here when reverse engineering a driver.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {
+                "type": "string",
+                "description": "driver name, e.g. 'null' for \\Driver\\Null"}},
+            "required": ["name"],
+        },
+        "handler": lambda a: tool_driver(a["name"]),
+    },
+    {
+        "name": "svmhv_imports",
+        "description":
+            "What a module calls, by DLL and function, from its import table. "
+            "For a driver with no exports this is the best available profile of "
+            "what it does - a driver importing ZwCreateFile and IoCreateDevice "
+            "is doing something very different from one importing only Ke* "
+            "synchronisation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"module": {"type": "string",
+                                      "description": "module name"}},
+            "required": ["module"],
+        },
+        "handler": lambda a: tool_imports(a["module"]),
     },
     {
         "name": "svmhv_read",
@@ -1362,16 +1570,25 @@ TOOLS = [
             "too. A write watch fires TWICE per store, so on a page written in "
             "bulk it is thousands of exits a second; the driver refuses watches "
             "on its own memory and auto-disarms runaways, but prefer watching "
-            "data you expect to be touched rarely.",
+            "data you expect to be touched rarely.\n\n"
+            "Pass in_process to watch a USER-mode address - the only way to "
+            "instrument an .exe, since the address is meaningless without a "
+            "process to translate it in. The watch is on the physical page, so "
+            "a page shared between processes fires for all of them.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target": {"type": "string"},
                 "mode": {"type": "string", "enum": ["write", "access"]},
+                "in_process": {
+                    "type": "integer",
+                    "description": "pid owning a user-mode target; required "
+                                   "for one, omit for a kernel address"},
             },
             "required": ["target"],
         },
-        "handler": lambda a: tool_watch(a["target"], a.get("mode", "write")),
+        "handler": lambda a: tool_watch(a["target"], a.get("mode", "write"),
+                                        in_process=a.get("in_process")),
     },
     {
         "name": "svmhv_unhook",

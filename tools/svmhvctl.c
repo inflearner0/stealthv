@@ -61,6 +61,7 @@
 #define REQ_SPOOFS              216
 #define REQ_BLOCK               280
 #define REQ_BLOCKVALUE          288
+#define REQ_TARGET_PID          132
 #define REQ_SHELLCODE           296
 
 /*
@@ -574,6 +575,15 @@ static int ApplyOptions(unsigned char* request, int argc, char** argv, int index
             strncpy_s((char*)(request + REQ_PROCNAME), SVMHV_PROCESS_NAME_MAX,
                       name, SVMHV_PROCESS_NAME_MAX - 1);
         }
+        else if (_stricmp(option, "--in-process") == 0 && index + 1 < argc)
+        {
+            /* Which address space Target lives in.  Required for a user-mode
+               target and meaningless for a kernel one; --pid is a different
+               thing entirely, and filters *recording* rather than resolving
+               the address. */
+            const unsigned int pid = (unsigned int)strtoul(argv[++index], NULL, 0);
+            memcpy(request + REQ_TARGET_PID, &pid, 4);
+        }
         else if (_stricmp(option, "--pid") == 0 && index + 1 < argc)
         {
             AddFilter(request, SVMHV_SUBJECT_PID, SVMHV_CMP_EQUAL,
@@ -893,6 +903,7 @@ static void Usage(void)
         "  svmhvctl hook-detour <target> <prolog> <detour>\n"
         "  svmhvctl hook-shellcode <target> <prolog> <hexbytes>\n"
         "  svmhvctl modules\n"
+        "  svmhvctl driverobj <name>\n"
         "  svmhvctl read  <address> [length] [pid]\n"
         "  svmhvctl readphys <gpa> [length]\n"
         "  svmhvctl write <address> <hexbytes> [pid]\n"
@@ -901,6 +912,8 @@ static void Usage(void)
         "Hook options, after the positional arguments:\n"
         "  --process NAME        only when NAME is the current process\n"
         "  --pid N               only this process id\n"
+        "  --in-process N        Target is a user address in this process;\n"
+        "                        required for one, ignored for a kernel address\n"
         "  --caller BASE SIZE    only when the caller is inside that range,\n"
         "                        i.e. only when that driver calls it\n"
         "  --filter S:OP:V[:M]   S = 0-7 | pid | tid | ret | irql,\n"
@@ -1013,6 +1026,43 @@ int main(int argc, char** argv)
     if (_stricmp(argv[1], "modules") == 0)
     {
         return PrintModules() ? 0 : 2;
+    }
+
+    if (_stricmp(argv[1], "driverobj") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX] = { 0 };
+        unsigned int returned = 0;
+        const size_t length = strlen(argv[2]);
+
+        if (length == 0 || length >= 64)
+        {
+            fprintf(stderr, "driver name must be 1-63 characters\n");
+            return 1;
+        }
+        memcpy(data, argv[2], length);
+
+        /*
+         * 64, not the name length.  SubmitMemory uses one length for both
+         * directions, and what comes back here is an eight-byte pointer rather
+         * than an echo of what went in - passing the name's length would clamp
+         * the answer away.
+         */
+        if (!SubmitMemory(SVMHV_CMD_DRIVER_OBJECT, 0, 64,
+                          0, data, data, &returned))
+        {
+            return 2;
+        }
+        if (returned < 8)
+        {
+            fprintf(stderr, "no driver object came back\n");
+            return 2;
+        }
+        {
+            unsigned __int64 address;
+            memcpy(&address, data, 8);
+            printf("driver_object=0x%llx\n", address);
+        }
+        return 0;
     }
 
     if ((_stricmp(argv[1], "read") == 0 ||
