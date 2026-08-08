@@ -129,6 +129,18 @@ static VOID SvHookProcessNotify(_In_ HANDLE ParentId, _In_ HANDLE ProcessId,
     }
 }
 
+/*
+ * Whether the notification above is actually registered.
+ *
+ * Both directions of this matter.  Unregistering one that was never registered
+ * asks the kernel to take a callback out of a list it is not in; registering
+ * and then failing initialisation leaves a callback pointing into a driver that
+ * is about to be unloaded, which is a call into freed code the next time any
+ * process on the machine exits.  The second of those is not hypothetical - the
+ * early-return below used to do exactly that.
+ */
+static BOOLEAN g_ProcessNotifyRegistered;
+
 NTSTATUS SvHookInitialize(VOID)
 {
     NTSTATUS status;
@@ -147,10 +159,14 @@ NTSTATUS SvHookInitialize(VOID)
                  "will not be safe\n", status);
         return status;
     }
+    g_ProcessNotifyRegistered = TRUE;
 
     g_TrampolinePage = (UINT8*)SvHookAllocateExecutable(PAGE_SIZE);
     if (g_TrampolinePage == NULL)
     {
+        /* Every failure from here on has to take the callback back out first. */
+        (VOID)PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, TRUE);
+        g_ProcessNotifyRegistered = FALSE;
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -170,8 +186,13 @@ VOID SvHookCleanup(VOID)
 {
     ULONG i;
 
-    /* Before anything is freed: the callback reaches into g_Hooks. */
-    (VOID)PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, TRUE);
+    /* Before anything is freed: the callback reaches into g_Hooks.  Only if it
+       is actually registered - see g_ProcessNotifyRegistered. */
+    if (g_ProcessNotifyRegistered)
+    {
+        (VOID)PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, TRUE);
+        g_ProcessNotifyRegistered = FALSE;
+    }
 
     for (i = 0; i < SVMHV_MAX_HOOKS; i++)
     {
