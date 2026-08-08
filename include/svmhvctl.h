@@ -165,6 +165,9 @@ typedef struct _SVMHV_SPOOF
 
 #define SVMHV_MAX_SHELLCODE     1024
 
+/* One page per memory transfer; see MemoryData below. */
+#define SVMHV_MEMORY_MAX        4096
+
 #define SVMHV_PROCESS_NAME_MAX  16
 
 typedef struct _SVMHV_HOOK_REQUEST
@@ -209,6 +212,27 @@ typedef struct _SVMHV_HOOK_REQUEST
     UINT64 BlockValue;
 
     UINT8  Shellcode[SVMHV_MAX_SHELLCODE];
+
+    /*
+     * Memory access, serviced by the worker thread at PASSIVE_LEVEL.
+     *
+     * It shares the request block rather than getting a channel of its own, so
+     * the existing WRITE_REQUEST and READ_REQUEST windows reach it with no new
+     * plumbing - the bounds check in both is against the size of this whole
+     * structure.  Appended at the end for the same reason: every offset above
+     * is hardcoded by clients that have no compiler to compute them.
+     *
+     * A page at a time.  That is the natural unit for reading code or a
+     * structure, and at 48 bytes per window it is 86 hypercalls - microseconds,
+     * and far cheaper than the alternative of a client that cannot read memory
+     * at all.
+     */
+    UINT64 MemoryAddress;               /* virtual, or GPA for READ_PHYSICAL */
+    UINT32 MemoryLength;                /* in: wanted, clamped to the buffer */
+    UINT32 MemoryProcessId;             /* 0 = whatever context we are in    */
+    UINT32 MemoryReturned;              /* out: bytes actually transferred   */
+    UINT32 MemoryReserved;
+    UINT8  MemoryData[SVMHV_MEMORY_MAX];
 } SVMHV_HOOK_REQUEST;
 
 /*
@@ -361,6 +385,17 @@ typedef struct _SVMHV_SNAPSHOT
 #define SVMHV_CMD_SELFTEST      3
 #define SVMHV_CMD_TRACE_RESET   4
 
+/*
+ * Memory access.  All three read the parameters out of the request block and
+ * leave the result in MemoryData/MemoryReturned; see SVMHV_HOOK_REQUEST.
+ * Serviced by the worker thread, which runs at PASSIVE_LEVEL and can therefore
+ * attach to another process and survive a page fault, neither of which is legal
+ * in the exit handler.
+ */
+#define SVMHV_CMD_READ_MEMORY   5
+#define SVMHV_CMD_WRITE_MEMORY  6
+#define SVMHV_CMD_READ_PHYSICAL 7
+
 typedef struct _SVMHV_CONTROL
 {
     UINT64 Magic;
@@ -405,7 +440,9 @@ C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
 C_ASSERT(sizeof(SVMHV_HOOK_LIST)       == 4104);
 C_ASSERT(sizeof(SVMHV_SELFTEST)        == 168);
-C_ASSERT(sizeof(SVMHV_HOOK_REQUEST)    == 1320);
+C_ASSERT(sizeof(SVMHV_HOOK_REQUEST)    == 1320 + 24 + SVMHV_MEMORY_MAX);
+C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryAddress) == 1320);
+C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryData)    == 1344);
 
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Stats)     == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram) == 656);

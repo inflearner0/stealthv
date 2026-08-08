@@ -381,24 +381,53 @@ def tool_trace_reset() -> str:
     return "trace ring reset" if status == 0 else f"failed: {status:#010x}"
 
 
-def tool_hook_trace(target: str, prolog_length: int = 14, **options) -> str:
+def hook_target(target: str, prolog: int | None) -> tuple[str, str, str]:
+    """Resolve a target and settle on a prologue length.
+
+    Both halves exist because both are things a caller gets wrong. The target
+    may now be 'nt!NtCreateFile' instead of an address nobody can verify by
+    eye, and the length - the parameter the driver's own documentation warns
+    will corrupt the function - is decoded from the bytes rather than defaulted
+    to 14 and hoped for. An explicit length is still honoured; a caller who has
+    disassembled the function themselves outranks this.
+    """
+    address = resolve(target)
+    note = ""
+
+    if prolog is None:
+        try:
+            computed = safe_prolog_length(read_bytes(address, 64))
+        except (CtlError, DecodeError) as error:
+            raise CtlError(
+                f"could not work out a safe prologue for {target}: {error}. "
+                "Pass prolog_length explicitly if you have decoded it yourself."
+            )
+        note = f", prologue {computed} bytes (decoded)"
+        prolog = computed
+
+    return f"{address:x}", str(prolog), note
+
+
+def tool_hook_trace(target: str, prolog_length: int | None = None,
+                    **options) -> str:
+    address, prolog, note = hook_target(target, prolog_length)
     extra = hook_options(**options)
     return hook_result(
-        ctl("hook-trace", hexarg(target), str(prolog_length), *extra),
-        f"tracing {target}" + (f" [{' '.join(extra)}]" if extra else ""))
+        ctl("hook-trace", address, prolog, *extra),
+        f"tracing {target}{note}" + (f" [{' '.join(extra)}]" if extra else ""))
 
 
-def tool_hook_detour(target: str, detour: str, prolog_length: int = 14,
+def tool_hook_detour(target: str, detour: str, prolog_length: int | None = None,
                      **options) -> str:
+    address, prolog, note = hook_target(target, prolog_length)
     extra = hook_options(**options)
     return hook_result(
-        ctl("hook-detour", hexarg(target), str(prolog_length), hexarg(detour),
-            *extra),
-        f"detoured {target} -> {detour}")
+        ctl("hook-detour", address, prolog, f"{resolve(detour):x}", *extra),
+        f"detoured {target} -> {detour}{note}")
 
 
 def tool_hook_shellcode(target: str, shellcode_hex: str,
-                        prolog_length: int = 14, **options) -> str:
+                        prolog_length: int | None = None, **options) -> str:
     cleaned = shellcode_hex.replace(" ", "").replace("0x", "").replace(",", "")
     if not cleaned or len(cleaned) % 2:
         return "shellcode_hex must be an even number of hex digits"
@@ -422,6 +451,552 @@ def tool_unhook(target: str) -> str:
     status = as_int(pairs(ctl("unhook", hexarg(target))), "status", -1)
     return (f"removed the hook on {target}" if status == 0
             else f"remove failed: {status & 0xFFFFFFFF:#010x}")
+
+
+# ------------------------------------------------- x86-64 instruction lengths
+
+# Instructions whose length depends only on the opcode, for the one-byte map.
+# The value is (has_modrm, immediate_bytes); an immediate of -1 means it follows
+# the operand size, which is 4 unless a 0x66 prefix made it 2.
+_ONE_BYTE = {}
+
+
+def _fill_one_byte():
+    for base in (0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38):
+        for offset in range(6):
+            # add/or/adc/sbb/and/sub/xor/cmp: 4 modrm forms then AL/eAX,imm
+            _ONE_BYTE[base + offset] = (offset < 4, 0 if offset < 4
+                                        else (1 if offset == 4 else -1))
+    for opcode in range(0x50, 0x60):            # push/pop r64
+        _ONE_BYTE[opcode] = (False, 0)
+    for opcode in range(0x70, 0x80):            # jcc rel8
+        _ONE_BYTE[opcode] = (False, 1)
+    for opcode in range(0xB0, 0xB8):            # mov r8, imm8
+        _ONE_BYTE[opcode] = (False, 1)
+    for opcode in range(0xB8, 0xC0):            # mov r32/64, imm32/imm64
+        _ONE_BYTE[opcode] = (False, -1)
+    _ONE_BYTE.update({
+        0x63: (True, 0),                        # movsxd
+        0x68: (False, -1), 0x6A: (False, 1),    # push imm
+        0x69: (True, -1),  0x6B: (True, 1),     # imul
+        0x80: (True, 1),   0x81: (True, -1), 0x83: (True, 1),
+        0x84: (True, 0),   0x85: (True, 0),
+        0x86: (True, 0),   0x87: (True, 0),
+        0x88: (True, 0),   0x89: (True, 0), 0x8A: (True, 0), 0x8B: (True, 0),
+        0x8D: (True, 0),                        # lea
+        0x8F: (True, 0),                        # pop r/m
+        0x90: (False, 0),                       # nop
+        0x98: (False, 0),  0x99: (False, 0),
+        0x9C: (False, 0),  0x9D: (False, 0),    # pushfq/popfq
+        0xC0: (True, 1),   0xC1: (True, 1),     # shifts by imm8
+        0xC2: (False, 2),  0xC3: (False, 0),    # ret
+        0xC6: (True, 1),   0xC7: (True, -1),    # mov r/m, imm
+        0xC9: (False, 0),                       # leave
+        0xCC: (False, 0),
+        0xD0: (True, 0),   0xD1: (True, 0), 0xD2: (True, 0), 0xD3: (True, 0),
+        0xE8: (False, 4),  0xE9: (False, 4),    # call/jmp rel32
+        0xEB: (False, 1),                       # jmp rel8
+        0xF6: (True, 1),   0xF7: (True, -1),    # test/not/neg/mul/div
+        0xF8: (False, 0),  0xF9: (False, 0),
+        0xFE: (True, 0),   0xFF: (True, 0),     # inc/dec/call/jmp/push
+    })
+
+
+_fill_one_byte()
+
+# Two-byte opcodes (0F xx) that appear in real prologues and thunks.
+_TWO_BYTE = {
+    0x05: (False, 0),                           # syscall
+    0x0B: (False, 0),                           # ud2
+    0x10: (True, 0), 0x11: (True, 0),           # movups/movsd
+    0x1E: (True, 0),                            # endbr64
+    0x1F: (True, 0),                            # multi-byte nop
+    0x28: (True, 0), 0x29: (True, 0),           # movaps
+    0x6E: (True, 0), 0x7E: (True, 0),           # movd/movq
+    0x6F: (True, 0), 0x7F: (True, 0),
+    0xA2: (False, 0),                           # cpuid
+    0xB6: (True, 0), 0xB7: (True, 0),           # movzx
+    0xBE: (True, 0), 0xBF: (True, 0),           # movsx
+    0xAF: (True, 0),                            # imul
+    0xD6: (True, 0),
+}
+for _op in range(0x80, 0x90):                   # jcc rel32
+    _TWO_BYTE[_op] = (False, 4)
+for _op in range(0x90, 0xA0):                   # setcc
+    _TWO_BYTE[_op] = (True, 0)
+for _op in range(0x40, 0x50):                   # cmovcc
+    _TWO_BYTE[_op] = (True, 0)
+
+
+class DecodeError(ValueError):
+    pass
+
+
+def instruction_length(code: bytes, at: int = 0) -> int:
+    """Length of the x86-64 instruction at `at`.
+
+    A length decoder, not a disassembler: it answers "where does the next
+    instruction start", which is the only question that has to be right to
+    place a hook. It covers the ordinary integer and SSE encodings a compiler
+    emits for a function prologue and raises on anything it does not recognise,
+    which is the safe direction to be wrong in - refusing to hook is a nuisance,
+    guessing a boundary corrupts the function.
+    """
+    i = at
+    operand = 4
+    rex_w = False
+
+    while i < len(code):                        # prefixes
+        byte = code[i]
+        if byte in (0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65):
+            i += 1
+        elif byte == 0x66:
+            operand = 2
+            i += 1
+        elif byte == 0x67:
+            i += 1
+        else:
+            break
+
+    if i < len(code) and 0x40 <= code[i] <= 0x4F:   # REX
+        rex_w = bool(code[i] & 0x08)
+        i += 1
+
+    if i >= len(code):
+        raise DecodeError("ran off the end in the prefixes")
+
+    opcode = code[i]
+    i += 1
+    if opcode == 0x0F:
+        if i >= len(code):
+            raise DecodeError("truncated two-byte opcode")
+        entry = _TWO_BYTE.get(code[i])
+        if entry is None:
+            raise DecodeError(f"unknown opcode 0f {code[i]:02x}")
+        i += 1
+    else:
+        entry = _ONE_BYTE.get(opcode)
+        if entry is None:
+            raise DecodeError(f"unknown opcode {opcode:02x}")
+
+    has_modrm, immediate = entry
+    if rex_w:
+        operand = 8 if opcode in range(0xB8, 0xC0) else 4
+
+    if has_modrm:
+        if i >= len(code):
+            raise DecodeError("truncated modrm")
+        modrm = code[i]
+        i += 1
+        mod = modrm >> 6
+        rm = modrm & 7
+
+        if mod != 3 and rm == 4:                # SIB
+            if i >= len(code):
+                raise DecodeError("truncated sib")
+            sib = code[i]
+            i += 1
+            if mod == 0 and (sib & 7) == 5:
+                i += 4                          # disp32, no base
+        if mod == 1:
+            i += 1
+        elif mod == 2:
+            i += 4
+        elif mod == 0 and rm == 5:
+            i += 4                              # RIP-relative
+
+        # Group 1/3 opcodes where /digit selects a form with no immediate.
+        if opcode in (0xF6, 0xF7) and ((modrm >> 3) & 7) not in (0, 1):
+            immediate = 0
+
+    if immediate == -1:
+        immediate = operand
+    i += immediate
+
+    if i > len(code):
+        raise DecodeError("instruction runs past the bytes provided")
+    return i - at
+
+
+def safe_prolog_length(code: bytes, minimum: int = 14) -> int:
+    """Smallest instruction boundary at or after `minimum` bytes.
+
+    This is the number the driver wants and the one a human most often gets
+    wrong: overwriting 14 bytes that end in the middle of an instruction leaves
+    the tail of it as the first thing the trampoline executes.
+    """
+    total = 0
+    while total < minimum:
+        total += instruction_length(code, total)
+    return total
+
+
+def instruction_offsets(code: bytes, limit: int = 32) -> list[int]:
+    offsets = []
+    at = 0
+    while at < len(code) and len(offsets) < limit:
+        offsets.append(at)
+        try:
+            at += instruction_length(code, at)
+        except DecodeError:
+            break
+    return offsets
+
+
+# ------------------------------------------------------------------- memory
+
+
+def dump_bytes(text: str) -> bytes:
+    """Recover the raw bytes from svmhvctl's hex dump.
+
+    The dump is laid out for a human - address, sixteen hex pairs, an ASCII
+    column - and a model reading it back needs the bytes, not the picture. Both
+    are worth returning: the picture is what makes a structure legible, the
+    bytes are what a follow-up question is asked about.
+    """
+    out = bytearray()
+    for line in text.splitlines():
+        parts = line.split("  ")
+        if len(parts) < 2 or len(parts[0]) != 16:
+            continue
+        try:
+            int(parts[0], 16)
+        except ValueError:
+            continue
+        for token in parts[1].split():
+            if len(token) == 2:
+                out.append(int(token, 16))
+    return bytes(out)
+
+
+def memory_result(text: str, what: str) -> str:
+    values = pairs(text)
+    status = as_int(values, "status", -1)
+    if status != 0:
+        # A short read is reported as a success with fewer bytes; only a
+        # transfer of nothing at all comes back as a failure, and the usual
+        # reason is that nothing is mapped there.
+        return (f"{what} failed: {status & 0xFFFFFFFF:#010x}"
+                + (" (nothing readable at that address)"
+                   if status & 0xFFFFFFFF == 0x8000000D else ""))
+    raw = dump_bytes(text)
+    return f"{what}: {len(raw)} bytes\n\n{text.strip()}\n\nhex: {raw.hex()}"
+
+
+def tool_read(address: str, length: int = 64, pid: int = 0) -> str:
+    length = max(1, min(int(length), 4096))
+    arguments = ["read", hexarg(address), str(length)]
+    if pid:
+        arguments.append(str(int(pid)))
+    where = f"process {pid}" if pid else "kernel space"
+    return memory_result(ctl(*arguments), f"read {length} bytes at {address} in {where}")
+
+
+def tool_read_physical(gpa: str, length: int = 64) -> str:
+    length = max(1, min(int(length), 4096))
+    return memory_result(ctl("readphys", hexarg(gpa), str(length)),
+                         f"read {length} bytes at guest physical {gpa}")
+
+
+def tool_write(address: str, hex_bytes: str, pid: int = 0) -> str:
+    cleaned = "".join(hex_bytes.split()).removeprefix("0x").lower()
+    if not cleaned or len(cleaned) % 2 or any(c not in "0123456789abcdef"
+                                              for c in cleaned):
+        return "hex_bytes must be an even number of hex digits"
+    if len(cleaned) // 2 > 4096:
+        return "at most 4096 bytes per write"
+
+    arguments = ["write", hexarg(address), cleaned]
+    if pid:
+        arguments.append(str(int(pid)))
+    text = ctl(*arguments)
+    values = pairs(text)
+    status = as_int(values, "status", -1)
+    if status != 0:
+        return f"write failed: {status & 0xFFFFFFFF:#010x}"
+    return (f"wrote {as_int(values, 'written')} of {len(cleaned) // 2} bytes "
+            f"at {address}" + (f" in process {pid}" if pid else ""))
+
+
+# ------------------------------------------------------- modules and symbols
+
+_modules_cache: list[dict] = []
+_exports_cache: dict[int, list[tuple[int, str]]] = {}
+
+
+def read_bytes(address: int, length: int, pid: int = 0) -> bytes:
+    """Raw read, for the parsers below. Raises rather than returning a report."""
+    arguments = ["read", f"{address:x}", str(length)]
+    if pid:
+        arguments.append(str(int(pid)))
+    text = ctl(*arguments)
+    if as_int(pairs(text), "status", -1) != 0:
+        raise CtlError(f"nothing readable at {address:#x}")
+    return dump_bytes(text)
+
+
+def modules(refresh: bool = False) -> list[dict]:
+    global _modules_cache
+    if _modules_cache and not refresh:
+        return _modules_cache
+
+    found = []
+    for record in records(ctl("modules"), "module"):
+        try:
+            found.append({
+                "base": int(record["base"], 0),
+                "size": int(record["size"], 0),
+                "name": record.get("name", "?"),
+                "path": record.get("path", ""),
+            })
+        except (KeyError, ValueError):
+            continue
+    _modules_cache = found
+    return found
+
+
+def module_for(address: int) -> dict | None:
+    for module in modules():
+        if module["base"] <= address < module["base"] + module["size"]:
+            return module
+    return None
+
+
+def module_by_name(name: str) -> dict | None:
+    wanted = name.lower()
+    for module in modules():
+        if module["name"].lower() == wanted:
+            return module
+    # "nt" is what everybody calls the kernel, and it is not what it is called.
+    if wanted in ("nt", "ntoskrnl", "kernel"):
+        for module in modules():
+            if module["name"].lower().startswith("ntoskrnl"):
+                return module
+    return None
+
+
+def exports(base: int) -> list[tuple[int, str]]:
+    """Every exported name in the image at `base`, as (address, name).
+
+    Parsed straight out of the mapped image with the memory read primitive, so
+    it needs no symbol server, no PDB and no network - which matters because the
+    machine being reverse engineered is usually a lab VM with none of the three.
+    It only sees exports, not private symbols; for the kernel that is still
+    several thousand functions and every Nt* entry point.
+    """
+    if base in _exports_cache:
+        return _exports_cache[base]
+
+    header = read_bytes(base, 0x400)
+    if header[:2] != b"MZ":
+        raise CtlError(f"no MZ header at {base:#x}")
+
+    pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+    if pe_offset + 0x200 > len(header) or header[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise CtlError(f"no PE header at {base:#x}")
+
+    # Optional header: magic 0x20B is PE32+, where the data directory starts at
+    # 0x70 from the optional header rather than 0x60.
+    optional = pe_offset + 0x18
+    magic = int.from_bytes(header[optional:optional + 2], "little")
+    directory = optional + (0x70 if magic == 0x20B else 0x60)
+    export_rva = int.from_bytes(header[directory:directory + 4], "little")
+    export_size = int.from_bytes(header[directory + 4:directory + 8], "little")
+    if export_rva == 0 or export_size == 0:
+        _exports_cache[base] = []
+        return []
+
+    # The export directory and its three arrays are contiguous and usually well
+    # under a page; read it in page-sized pieces because that is the transfer
+    # unit the driver offers.
+    blob = bytearray()
+    for offset in range(0, min(export_size, 0x20000), 0x1000):
+        blob += read_bytes(base + export_rva + offset,
+                           min(0x1000, export_size - offset))
+
+    def dword(at):
+        return int.from_bytes(blob[at:at + 4], "little")
+
+    count_names = dword(0x18)
+    functions_rva = dword(0x1C)
+    names_rva = dword(0x20)
+    ordinals_rva = dword(0x24)
+
+    def table(rva, entries, width):
+        """Read a table that may fall outside the block already fetched."""
+        start = rva - export_rva
+        if 0 <= start and start + entries * width <= len(blob):
+            return bytes(blob[start:start + entries * width])
+        out = bytearray()
+        wanted = entries * width
+        for offset in range(0, wanted, 0x1000):
+            out += read_bytes(base + rva + offset, min(0x1000, wanted - offset))
+        return bytes(out)
+
+    names = table(names_rva, count_names, 4)
+    ordinals = table(ordinals_rva, count_names, 2)
+    functions = table(functions_rva, dword(0x14), 4)
+
+    # Name strings are scattered; fetch the pages they live on once each.
+    pages: dict[int, bytes] = {}
+
+    def string_at(rva):
+        out = bytearray()
+        while len(out) < 256:
+            page = (base + rva) & ~0xFFF
+            if page not in pages:
+                try:
+                    pages[page] = read_bytes(page, 0x1000)
+                except CtlError:
+                    return ""
+            chunk = pages[page][(base + rva) & 0xFFF:]
+            if b"\0" in chunk:
+                return bytes(out + chunk[:chunk.index(b"\0")]).decode(
+                    "ascii", "replace")
+            out += chunk
+            rva += len(chunk)
+        return bytes(out).decode("ascii", "replace")
+
+    found = []
+    for i in range(count_names):
+        name_rva = int.from_bytes(names[i * 4:i * 4 + 4], "little")
+        ordinal = int.from_bytes(ordinals[i * 2:i * 2 + 2], "little")
+        if (ordinal + 1) * 4 > len(functions):
+            continue
+        function_rva = int.from_bytes(
+            functions[ordinal * 4:ordinal * 4 + 4], "little")
+        if function_rva == 0:
+            continue
+        name = string_at(name_rva)
+        if name:
+            found.append((base + function_rva, name))
+
+    found.sort()
+    _exports_cache[base] = found
+    return found
+
+
+def resolve(name: str) -> int:
+    """'nt!NtCreateFile', 'ntoskrnl.exe!ZwClose' or a bare hex address."""
+    text = name.strip()
+    if "!" not in text:
+        return int(hexarg(text), 16)
+
+    module_name, symbol = text.split("!", 1)
+    module = module_by_name(module_name)
+    if module is None:
+        raise CtlError(f"no loaded module called {module_name!r}")
+
+    offset = 0
+    if "+" in symbol:
+        symbol, _, plus = symbol.partition("+")
+        offset = int(plus, 0)
+
+    for address, export in exports(module["base"]):
+        if export.lower() == symbol.lower():
+            return address + offset
+    raise CtlError(f"{module['name']} exports no symbol called {symbol!r}")
+
+
+def symbolize(address: int) -> str:
+    """The inverse: an address as module!symbol+offset, as far as it can."""
+    if address == 0:
+        return "0"
+    module = module_for(address)
+    if module is None:
+        return f"{address:#x}"
+
+    best = None
+    try:
+        for export_address, name in exports(module["base"]):
+            if export_address <= address and (best is None
+                                              or export_address > best[0]):
+                best = (export_address, name)
+    except CtlError:
+        best = None
+
+    if best is None:
+        return f"{module['name']}+{address - module['base']:#x}"
+    delta = address - best[0]
+    return (f"{module['name']}!{best[1]}"
+            + (f"+{delta:#x}" if delta else ""))
+
+
+def tool_modules(filter_text: str = "") -> str:
+    wanted = filter_text.lower().strip()
+    found = [m for m in modules(refresh=True)
+             if not wanted or wanted in m["name"].lower()]
+    if not found:
+        return f"no loaded module matches {filter_text!r}"
+    lines = [f"{len(found)} module(s)", ""]
+    for module in sorted(found, key=lambda m: m["base"]):
+        lines.append(f"{module['base']:#018x}  {module['size']:>9,}  "
+                     f"{module['name']}")
+    return "\n".join(lines)
+
+
+def tool_symbol(name: str) -> str:
+    address = resolve(name)
+    return f"{name} = {address:#x}"
+
+
+def tool_exports(module_name: str, contains: str = "") -> str:
+    module = module_by_name(module_name)
+    if module is None:
+        return f"no loaded module called {module_name!r}"
+    wanted = contains.lower()
+    found = [(a, n) for a, n in exports(module["base"])
+             if not wanted or wanted in n.lower()]
+    if not found:
+        return f"{module['name']} exports nothing matching {contains!r}"
+
+    lines = [f"{len(found)} export(s) in {module['name']} "
+             f"(base {module['base']:#x})", ""]
+    for address, name in found[:400]:
+        lines.append(f"{address:#018x}  {name}")
+    if len(found) > 400:
+        lines.append(f"... and {len(found) - 400} more; narrow it with 'contains'")
+    return "\n".join(lines)
+
+
+def tool_explain(target: str) -> str:
+    """Everything known about one address, in a single call."""
+    address = resolve(target)
+    lines = [f"{target} = {address:#x}", f"symbol   : {symbolize(address)}"]
+
+    module = module_for(address)
+    if module is None:
+        lines.append("module   : not inside any loaded module")
+    else:
+        lines.append(f"module   : {module['name']} at {module['base']:#x} "
+                     f"+{address - module['base']:#x}")
+        lines.append(f"path     : {module['path']}")
+
+    try:
+        code = read_bytes(address, 64)
+        lines += ["", f"bytes    : {code[:16].hex()}"]
+        offsets = instruction_offsets(code, limit=8)
+        lines.append("boundaries: " + ", ".join(str(o) for o in offsets))
+        try:
+            lines.append(f"prolog   : {safe_prolog_length(code)} bytes is the "
+                         "smallest safe hook prologue")
+        except DecodeError as error:
+            lines.append(f"prolog   : cannot be computed here ({error}) - "
+                         "do not guess one")
+    except CtlError as error:
+        lines.append(f"bytes    : unreadable ({error})")
+
+    for hook in records(ctl("hooks"), "hook"):
+        try:
+            if int(hook.get("target", "0"), 0) == address:
+                lines.append("")
+                lines.append(f"hooked   : id {hook.get('id')} "
+                             f"active={hook.get('active')} "
+                             f"hits={hook.get('hits')}")
+        except ValueError:
+            pass
+
+    return "\n".join(lines)
 
 
 def tool_selftest() -> str:
@@ -493,6 +1068,135 @@ TOOLS = [
         "handler": lambda a: tool_trace(int(a.get("count", 40))),
     },
     {
+        "name": "svmhv_modules",
+        "description":
+            "Every loaded kernel module with its base and size. The starting "
+            "point for anything else: with a base, svmhv_exports turns names "
+            "into addresses and svmhv_explain makes an address legible.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"filter": {
+                "type": "string",
+                "description": "substring of the module name, e.g. 'ndis'"}},
+        },
+        "handler": lambda a: tool_modules(a.get("filter", "")),
+    },
+    {
+        "name": "svmhv_exports",
+        "description":
+            "Exported symbols of a loaded module, parsed out of its PE headers "
+            "in memory - no PDB, no symbol server and no network needed. For "
+            "the kernel that is several thousand functions including every Nt* "
+            "entry point. Narrow it with 'contains'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string",
+                           "description": "module name; 'nt' means the kernel"},
+                "contains": {"type": "string",
+                             "description": "only names containing this"},
+            },
+            "required": ["module"],
+        },
+        "handler": lambda a: tool_exports(a["module"], a.get("contains", "")),
+    },
+    {
+        "name": "svmhv_symbol",
+        "description":
+            "Resolve 'nt!NtCreateFile' or 'module!Export+0x20' to an address. "
+            "Every tool that takes a target accepts this form directly, so this "
+            "is mostly for checking what one resolves to.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string",
+                                    "description": "module!symbol[+offset]"}},
+            "required": ["name"],
+        },
+        "handler": lambda a: tool_symbol(a["name"]),
+    },
+    {
+        "name": "svmhv_explain",
+        "description":
+            "Everything known about one address in a single call: which module "
+            "it is in, the nearest exported symbol, the first bytes, where the "
+            "instruction boundaries fall, the smallest safe hook prologue, and "
+            "whether it is already hooked. The right first call for any address "
+            "you do not recognise.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"target": {
+                "type": "string",
+                "description": "hex address or module!symbol"}},
+            "required": ["target"],
+        },
+        "handler": lambda a: tool_explain(a["target"]),
+    },
+    {
+        "name": "svmhv_read",
+        "description":
+            "Read guest memory and get back a hex dump and the raw bytes. With "
+            "no pid this is kernel space; with a pid the driver attaches to that "
+            "process from below, so it reaches memory no handle would open and "
+            "the target sees nothing. A short read is normal and successful - the "
+            "byte count says how far it got before hitting an unmapped page.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string",
+                            "description": "hex virtual address"},
+                "length": {"type": "integer",
+                           "description": "bytes to read, 1-4096 (default 64)"},
+                "pid": {"type": "integer",
+                        "description": "read in this process; omit for kernel"},
+            },
+            "required": ["address"],
+        },
+        "handler": lambda a: tool_read(a["address"], a.get("length", 64),
+                                       a.get("pid", 0)),
+    },
+    {
+        "name": "svmhv_read_physical",
+        "description":
+            "Read guest physical memory directly, consulting no page tables. "
+            "Sees pages that no virtual address currently describes, and is the "
+            "only way to observe what the nested page tables actually present - "
+            "a hooked page read this way shows the original bytes, not the patch. "
+            "One page maximum per call, and it may not cross a page boundary.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gpa": {"type": "string",
+                        "description": "hex guest physical address"},
+                "length": {"type": "integer",
+                           "description": "bytes to read, 1-4096 (default 64)"},
+            },
+            "required": ["gpa"],
+        },
+        "handler": lambda a: tool_read_physical(a["gpa"], a.get("length", 64)),
+    },
+    {
+        "name": "svmhv_write",
+        "description":
+            "Write guest memory, in kernel space or in a named process. The "
+            "counterpart to svmhv_read and the cheapest way to test what a byte "
+            "controls; unlike a hook it leaves no trampoline and no shadow page. "
+            "Take a checkpoint first - there is no undo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string",
+                            "description": "hex virtual address"},
+                "hex_bytes": {"type": "string",
+                              "description": "bytes to write, as hex"},
+                "pid": {"type": "integer",
+                        "description": "write in this process; omit for kernel"},
+            },
+            "required": ["address", "hex_bytes"],
+        },
+        "handler": lambda a: tool_write(a["address"], a["hex_bytes"],
+                                        a.get("pid", 0)),
+    },
+    {
         "name": "svmhv_trace_reset",
         "description": "Empty the trace ring and zero its counters.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -547,7 +1251,7 @@ TOOLS = [
             "required": ["target"],
         },
         "handler": lambda a: tool_hook_trace(
-            a["target"], int(a.get("prolog_length", 14)),
+            a["target"], (int(a["prolog_length"]) if a.get("prolog_length") else None),
             **{k: a[k] for k in (
                 "process", "pid", "caller_base", "caller_size", "filter_expr",
                 "capture", "capture2", "spoof", "spoof2", "block") if k in a}),
@@ -594,7 +1298,7 @@ TOOLS = [
             "required": ["target", "detour"],
         },
         "handler": lambda a: tool_hook_detour(
-            a["target"], a["detour"], int(a.get("prolog_length", 14)),
+            a["target"], a["detour"], (int(a["prolog_length"]) if a.get("prolog_length") else None),
             **{k: a[k] for k in (
                 "process", "pid", "caller_base", "caller_size", "filter_expr",
                 "capture", "capture2", "spoof", "spoof2", "block") if k in a}),
@@ -644,7 +1348,7 @@ TOOLS = [
             "required": ["target", "shellcode_hex"],
         },
         "handler": lambda a: tool_hook_shellcode(
-            a["target"], a["shellcode_hex"], int(a.get("prolog_length", 14)),
+            a["target"], a["shellcode_hex"], (int(a["prolog_length"]) if a.get("prolog_length") else None),
             **{k: a[k] for k in (
                 "process", "pid", "caller_base", "caller_size", "filter_expr",
                 "capture", "capture2", "spoof", "spoof2", "block") if k in a}),

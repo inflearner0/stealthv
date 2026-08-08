@@ -62,7 +62,21 @@
 #define REQ_BLOCK               280
 #define REQ_BLOCKVALUE          288
 #define REQ_SHELLCODE           296
+
+/*
+ * The hook half of the request block.  The memory fields sit above it and are
+ * not read by any hook command, so a hook submit still only has to push these
+ * 1320 bytes across the channel a qword at a time.
+ */
 #define REQ_SIZE                1320
+
+/* The memory half; see SVMHV_HOOK_REQUEST. */
+#define REQ_MEM_ADDRESS         1320
+#define REQ_MEM_LENGTH          1328
+#define REQ_MEM_PID             1332
+#define REQ_MEM_RETURNED        1336
+#define REQ_MEM_DATA            1344
+#define REQ_MEM_MAX             4096
 
 typedef struct _HV_REGS
 {
@@ -205,6 +219,227 @@ static int Submit(unsigned int command, const unsigned char* request,
 
     fprintf(stderr, "the control worker never acknowledged the command\n");
     return 0;
+}
+
+/*
+ * Memory commands, which use the same doorbell but touch only the six fields
+ * above REQ_SIZE.  Writing the whole request block for a 16-byte read would be
+ * 680 hypercalls to carry 16 bytes; the driver ignores the hook fields for
+ * these commands, so leaving them alone is both correct and 200 times cheaper.
+ */
+static int SubmitMemory(unsigned int command, unsigned __int64 address,
+                        unsigned int length, unsigned int pid,
+                        const unsigned char* input, unsigned char* out,
+                        unsigned int* returned)
+{
+    HV_REGS regs;
+    unsigned __int64 sequence;
+    unsigned __int64 packed;
+    unsigned int offset;
+    int attempt;
+
+    if (length == 0 || length > REQ_MEM_MAX)
+    {
+        length = REQ_MEM_MAX;
+    }
+
+    if (Call(HV_WRITE_REQUEST, REQ_MEM_ADDRESS, address, NULL) != HV_OK)
+    {
+        fprintf(stderr, "could not write the memory address\n");
+        return 0;
+    }
+
+    /* MemoryLength and MemoryProcessId share one qword. */
+    packed = (unsigned __int64)length | ((unsigned __int64)pid << 32);
+    if (Call(HV_WRITE_REQUEST, REQ_MEM_LENGTH, packed, NULL) != HV_OK)
+    {
+        fprintf(stderr, "could not write the memory length\n");
+        return 0;
+    }
+
+    for (offset = 0; input != NULL && offset < length; offset += 8)
+    {
+        unsigned __int64 value = 0;
+        unsigned int chunk = length - offset;
+
+        memcpy(&value, input + offset, (chunk > 8) ? 8 : chunk);
+        if (Call(HV_WRITE_REQUEST, REQ_MEM_DATA + offset, value, NULL) != HV_OK)
+        {
+            fprintf(stderr, "could not write the payload at %u\n", offset);
+            return 0;
+        }
+    }
+
+    if (Call(HV_SUBMIT, command, 0, &regs) != HV_OK)
+    {
+        fprintf(stderr, "the hypervisor refused the command\n");
+        return 0;
+    }
+    sequence = regs.Rbx;
+
+    for (attempt = 0; attempt < 60; attempt++)
+    {
+        Sleep(50);
+        if (Call(HV_POLL, 0, 0, &regs) != HV_OK || regs.Rbx < sequence)
+        {
+            continue;
+        }
+
+        printf("status=0x%08x\n", (unsigned int)regs.Rdx);
+
+        /* Read the count first: it says how much of the buffer is meaningful,
+           and a short transfer is a normal outcome rather than an error. */
+        {
+            unsigned char header[8];
+
+            if (!ReadBlock(HV_READ_REQUEST, 0, REQ_MEM_RETURNED, header,
+                           sizeof(header)))
+            {
+                return 0;
+            }
+            memcpy(returned, header, 4);
+        }
+
+        if (*returned > length)
+        {
+            *returned = length;
+        }
+        if (out != NULL && *returned != 0 &&
+            !ReadBlock(HV_READ_REQUEST, 0, REQ_MEM_DATA, out, *returned))
+        {
+            return 0;
+        }
+        return 1;
+    }
+
+    fprintf(stderr, "the control worker never acknowledged the command\n");
+    return 0;
+}
+
+/* ---------------------------------------------------------------- modules */
+
+/*
+ * The loaded kernel module list, with bases, from user mode.
+ *
+ * This deliberately does not go through the driver.  NtQuerySystemInformation
+ * already answers it for anyone running elevated, and a client that can be
+ * given the answer without adding a kernel code path should be.  The bases are
+ * what make everything else addressable: with one, the PE headers can be read
+ * with "svmhvctl read" and every export walked out of them, which is how a
+ * caller turns a name into an address without a symbol server.
+ */
+#define SYSTEM_MODULE_INFORMATION   11
+
+typedef struct _RTL_PROCESS_MODULE_INFORMATION
+{
+    HANDLE Section;
+    PVOID  MappedBase;
+    PVOID  ImageBase;
+    ULONG  ImageSize;
+    ULONG  Flags;
+    USHORT LoadOrderIndex;
+    USHORT InitOrderIndex;
+    USHORT LoadCount;
+    USHORT OffsetToFileName;
+    UCHAR  FullPathName[256];
+} RTL_PROCESS_MODULE_INFORMATION;
+
+typedef struct _RTL_PROCESS_MODULES
+{
+    ULONG NumberOfModules;
+    RTL_PROCESS_MODULE_INFORMATION Modules[1];
+} RTL_PROCESS_MODULES;
+
+typedef LONG (__stdcall *PFN_NT_QUERY_SYSTEM_INFORMATION)(
+    ULONG SystemInformationClass, PVOID SystemInformation,
+    ULONG SystemInformationLength, PULONG ReturnLength);
+
+static int PrintModules(void)
+{
+    PFN_NT_QUERY_SYSTEM_INFORMATION query;
+    RTL_PROCESS_MODULES* modules;
+    HMODULE ntdll;
+    ULONG needed = 0;
+    ULONG i;
+    LONG status;
+
+    ntdll = GetModuleHandleA("ntdll.dll");
+    query = (ntdll != NULL)
+          ? (PFN_NT_QUERY_SYSTEM_INFORMATION)(void*)
+                GetProcAddress(ntdll, "NtQuerySystemInformation")
+          : NULL;
+    if (query == NULL)
+    {
+        fprintf(stderr, "NtQuerySystemInformation is not available\n");
+        return 0;
+    }
+
+    /* Ask for the size, then allow for the list growing between the two calls. */
+    query(SYSTEM_MODULE_INFORMATION, NULL, 0, &needed);
+    if (needed == 0)
+    {
+        fprintf(stderr, "the module list reported no size\n");
+        return 0;
+    }
+    needed += 16 * sizeof(RTL_PROCESS_MODULE_INFORMATION);
+
+    modules = (RTL_PROCESS_MODULES*)malloc(needed);
+    if (modules == NULL)
+    {
+        fprintf(stderr, "out of memory for the module list\n");
+        return 0;
+    }
+
+    status = query(SYSTEM_MODULE_INFORMATION, modules, needed, &needed);
+    if (status < 0)
+    {
+        fprintf(stderr, "NtQuerySystemInformation failed: 0x%08lx\n",
+                (unsigned long)status);
+        free(modules);
+        return 0;
+    }
+
+    printf("modules=%lu\n", (unsigned long)modules->NumberOfModules);
+    for (i = 0; i < modules->NumberOfModules; i++)
+    {
+        const RTL_PROCESS_MODULE_INFORMATION* m = &modules->Modules[i];
+        const char* name = (const char*)m->FullPathName + m->OffsetToFileName;
+
+        printf("module base=0x%llx size=0x%lx name=%s path=%s\n",
+               (unsigned long long)(ULONG_PTR)m->ImageBase,
+               (unsigned long)m->ImageSize, name, (const char*)m->FullPathName);
+    }
+
+    free(modules);
+    return 1;
+}
+
+/* A hex dump with the ASCII column, which is what makes a dump readable. */
+static void PrintDump(unsigned __int64 base, const unsigned char* data,
+                      unsigned int length)
+{
+    unsigned int i;
+
+    printf("bytes=%u\n", length);
+    for (i = 0; i < length; i += 16)
+    {
+        unsigned int j;
+        unsigned int run = (length - i > 16) ? 16 : length - i;
+
+        printf("%016llx  ", base + i);
+        for (j = 0; j < 16; j++)
+        {
+            if (j < run) { printf("%02x ", data[i + j]); }
+            else         { printf("   "); }
+        }
+        printf(" ");
+        for (j = 0; j < run; j++)
+        {
+            unsigned char c = data[i + j];
+            printf("%c", (c >= 0x20 && c < 0x7F) ? c : '.');
+        }
+        printf("\n");
+    }
 }
 
 static void BuildRequest(unsigned char* request, unsigned __int64 target,
@@ -657,6 +892,10 @@ static void Usage(void)
         "  svmhvctl hook-trace  <target> <prolog>\n"
         "  svmhvctl hook-detour <target> <prolog> <detour>\n"
         "  svmhvctl hook-shellcode <target> <prolog> <hexbytes>\n"
+        "  svmhvctl modules\n"
+        "  svmhvctl read  <address> [length] [pid]\n"
+        "  svmhvctl readphys <gpa> [length]\n"
+        "  svmhvctl write <address> <hexbytes> [pid]\n"
         "  svmhvctl watch <target> write|access\n"
         "  svmhvctl unhook <target>\n\n"
         "Hook options, after the positional arguments:\n"
@@ -768,6 +1007,56 @@ int main(int argc, char** argv)
         if (!ApplyOptions(request, argc, argv, 5)) { return 1; }
         if (!Submit(SVMHV_CMD_HOOK_INSTALL, request, REQ_SIZE, result)) { return 2; }
         ReportHook(result);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "modules") == 0)
+    {
+        return PrintModules() ? 0 : 2;
+    }
+
+    if ((_stricmp(argv[1], "read") == 0 ||
+         _stricmp(argv[1], "readphys") == 0) && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned int returned = 0;
+        const unsigned __int64 address = strtoull(argv[2], NULL, 16);
+        const unsigned int length = (argc >= 4)
+                                  ? (unsigned int)strtoul(argv[3], NULL, 0) : 64;
+        const unsigned int pid = (argc >= 5)
+                               ? (unsigned int)strtoul(argv[4], NULL, 0) : 0;
+        const unsigned int command = (_stricmp(argv[1], "readphys") == 0)
+                                   ? SVMHV_CMD_READ_PHYSICAL
+                                   : SVMHV_CMD_READ_MEMORY;
+
+        if (!SubmitMemory(command, address, length, pid, NULL, data, &returned))
+        {
+            return 2;
+        }
+        PrintDump(address, data, returned);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "write") == 0 && argc >= 4)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned int returned = 0;
+        const unsigned __int64 address = strtoull(argv[2], NULL, 16);
+        const int size = ParseHex(argv[3], data, sizeof(data));
+        const unsigned int pid = (argc >= 5)
+                               ? (unsigned int)strtoul(argv[4], NULL, 0) : 0;
+
+        if (size <= 0)
+        {
+            fprintf(stderr, "could not parse the bytes to write\n");
+            return 1;
+        }
+        if (!SubmitMemory(SVMHV_CMD_WRITE_MEMORY, address, (unsigned int)size,
+                          pid, data, NULL, &returned))
+        {
+            return 2;
+        }
+        printf("written=%u\n", returned);
         return 0;
     }
 

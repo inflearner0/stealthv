@@ -126,7 +126,8 @@ $kmDefs = @(
     "/DNTDDI_VERSION=0x0A00000C", "/D_WIN32_WINNT=0x0A00", "/DWINVER=0x0A00"
 )
 
-$kmSources = @("svmhv.c", "npt.c", "hook.c", "trace.c", "control.c", "hvcall.c")
+$kmSources = @("svmhv.c", "npt.c", "hook.c", "trace.c", "control.c", "hvcall.c",
+               "memory.c")
 
 foreach ($src in $kmSources) {
     $obj = [IO.Path]::ChangeExtension($src, ".obj")
@@ -152,7 +153,7 @@ Invoke-Tool $link @(
     "ntoskrnl.lib", "hal.lib",
     "/PDB:$out\svmhv.pdb", "/OUT:$out\svmhv.sys",
     "$out\svmhv.obj", "$out\npt.obj", "$out\hook.obj", "$out\trace.obj",
-    "$out\control.obj", "$out\hvcall.obj", "$out\svmasm.obj"
+    "$out\control.obj", "$out\hvcall.obj", "$out\memory.obj", "$out\svmasm.obj"
 ) "link svmhv.sys"
 
 # --------------------------------------------------------------- test app

@@ -53,7 +53,8 @@ check("ping answers", "result" in rpc("ping"))
 check("an unknown method is an error", "error" in rpc("nosuchmethod"))
 
 tools = rpc("tools/list")["result"]["tools"]
-check("tools/list returns every tool", len(tools) == 11, f"got {len(tools)}")
+check("tools/list returns every tool", len(tools) == len(agent.TOOLS),
+      f"got {len(tools)}, TOOLS has {len(agent.TOOLS)}")
 check("no handler leaked into a schema",
       all("handler" not in tool for tool in tools))
 check("every tool is described",
@@ -130,6 +131,12 @@ def fake_ctl(*arguments):
     if arguments[0] == "hooks":
         return "hooks=1\nhook id=0 active=1 kind=0 action=0 target=0xffff1000 " \
                "gpa=0x1000 detour=0x0 trampoline=0x0 prolog=14 hits=5 filters=0\n"
+    if arguments[0] in ("read", "readphys"):
+        return ("status=0x00000000\nbytes=16\n"
+                "fffff78000000000  4d 5a 90 00 03 00 00 00 04 00 00 00 ff ff 00 00"
+                "  MZ..............\n")
+    if arguments[0] == "write":
+        return "status=0x00000000\nwritten=4\n"
     return "status=0x00000000\nhookid=1\ngpa=0x1000\ntrampoline=0x2000\n"
 
 
@@ -154,6 +161,22 @@ check("hook_trace passes the options through",
       calls[-1] == ("hook-trace", "ffff1000", "14", "--process", "notepad.exe",
                     "--capture", "1:objattr", "--spoof", "2:0"), calls[-1])
 
+# The prologue length is the parameter the driver warns will corrupt the
+# function, so check both that it is decoded when absent and that an explicit
+# one still wins.
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_hook_trace", "arguments": {
+    "target": "0xffff1000"}})["result"]["content"][0]["text"]
+check("an absent prologue is decoded from the bytes",
+      "(decoded)" in text and calls[-1][2] == "14", (text, calls[-1]))
+
+calls.clear()
+rpc("tools/call", {"name": "svmhv_hook_trace", "arguments": {
+    "target": "0xffff1000", "prolog_length": 21}})
+check("an explicit prologue outranks the decoder",
+      calls[-1][2] == "21", calls[-1])
+
+
 text = rpc("tools/call", {"name": "svmhv_hooks", "arguments": {}})["result"]["content"][0]["text"]
 # the renderer zero-pads addresses to 16 digits, so match the digits only
 check("hooks renders a record",
@@ -162,6 +185,131 @@ check("hooks renders a record",
 text = rpc("tools/call", {"name": "svmhv_watch",
                           "arguments": {"target": "0xffff1000", "mode": "sideways"}})["result"]["content"][0]["text"]
 check("watch rejects an unknown mode", "must be" in text)
+
+# ------------------------------------------------------- lengths and symbols
+
+print("instruction lengths")
+for encoding, want, what in (
+        ("4889c8", 3, "mov rax,rcx"),
+        ("48b81122334455667788", 10, "mov rax,imm64"),
+        ("488b0d12345678", 7, "mov rcx,[rip+disp32]"),
+        ("ff2500000000", 6, "jmp qword [rip+0]"),
+        ("f30f1efa", 4, "endbr64"),
+        ("0f1f440000", 5, "nop dword [rax+rax]"),
+        ("48895c2408", 5, "mov [rsp+8],rbx"),
+        ("f7c101000000", 6, "test ecx,imm32"),
+        ("660f1f440000", 6, "66-prefixed nop"),
+):
+    got = agent.instruction_length(bytes.fromhex(encoding))
+    check(f"decodes {what}", got == want, f"want {want}, got {got}")
+
+prologue = bytes.fromhex("48895c2408" "57" "4883ec20" "488bd9" "33c0" "c3")
+check("instruction boundaries are found",
+      agent.instruction_offsets(prologue) == [0, 5, 6, 10, 13, 15],
+      agent.instruction_offsets(prologue))
+check("a prologue is rounded up to a boundary, never down",
+      agent.safe_prolog_length(prologue) == 15,
+      agent.safe_prolog_length(prologue))
+check("the self-test victim needs exactly the 14 it has",
+      agent.safe_prolog_length(bytes.fromhex("b811111111" + "90" * 9 + "c3")) == 14)
+
+for bad, why in (("4889c8", "bytes that run out mid-prologue"),
+                 ("62f27d48", "an opcode it does not know")):
+    try:
+        agent.safe_prolog_length(bytes.fromhex(bad))
+        check(f"refuses {why}", False)
+    except agent.DecodeError:
+        check(f"refuses {why}", True)
+
+print("symbols")
+_fake_modules = [
+    {"base": 0xFFFFF80010000000, "size": 0x900000,
+     "name": "ntoskrnl.exe", "path": r"\SystemRoot\system32\ntoskrnl.exe"},
+    {"base": 0xFFFFF80020000000, "size": 0x10000,
+     "name": "svmhv.sys", "path": r"\??\C:\lab\svmhv.sys"},
+]
+_fake_exports = {
+    0xFFFFF80010000000: [(0xFFFFF80010001000, "NtCreateFile"),
+                         (0xFFFFF80010002000, "NtOpenProcess")],
+    0xFFFFF80020000000: [],
+}
+agent.modules = lambda refresh=False: _fake_modules
+agent.exports = lambda base: _fake_exports.get(base, [])
+
+check("a symbol resolves to its address",
+      agent.resolve("nt!NtCreateFile") == 0xFFFFF80010001000)
+check("'nt' is understood to mean ntoskrnl",
+      agent.resolve("ntoskrnl.exe!NtOpenProcess") == 0xFFFFF80010002000)
+check("an offset is applied",
+      agent.resolve("nt!NtCreateFile+0x20") == 0xFFFFF80010001020)
+check("a bare hex address still works",
+      agent.resolve("0xfffff80010001000") == 0xFFFFF80010001000)
+check("symbol lookup is case insensitive",
+      agent.resolve("nt!ntcreatefile") == 0xFFFFF80010001000)
+check("an address inside a function is named with its offset",
+      agent.symbolize(0xFFFFF80010001004) == "ntoskrnl.exe!NtCreateFile+0x4",
+      agent.symbolize(0xFFFFF80010001004))
+check("an address in a module with no exports still names the module",
+      agent.symbolize(0xFFFFF80020000100) == "svmhv.sys+0x100",
+      agent.symbolize(0xFFFFF80020000100))
+check("an address in no module is left as an address",
+      agent.symbolize(0x1234) == "0x1234")
+
+for bad, why in (("nosuch.sys!Foo", "an unloaded module"),
+                 ("nt!NoSuchExport", "a symbol the module does not export")):
+    try:
+        agent.resolve(bad)
+        check(f"rejects {why}", False)
+    except agent.CtlError:
+        check(f"rejects {why}", True)
+
+# Now that symbols resolve, a hook can be asked for by name - which is the
+# whole point: an address nobody can verify by eye becomes one that is checked.
+calls.clear()
+rpc("tools/call", {"name": "svmhv_hook_trace",
+                   "arguments": {"target": "nt!NtCreateFile"}})
+check("a hook target may be a symbol",
+      calls and calls[-1][1] == "fffff80010001000", calls)
+
+# ------------------------------------------------------------------- memory
+
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_read", "arguments": {
+    "address": "0xfffff78000000000", "length": 16}})["result"]["content"][0]["text"]
+check("read returns the dump and the raw bytes",
+      "hex: 4d5a90000300000004000000ffff0000" in text, text)
+check("read passes the address without its 0x",
+      calls[-1] == ("read", "fffff78000000000", "16"), calls[-1])
+
+calls.clear()
+rpc("tools/call", {"name": "svmhv_read", "arguments": {
+    "address": "0x7ff600000000", "length": 32, "pid": 4321}})
+check("read passes the pid through",
+      calls[-1] == ("read", "7ff600000000", "32", "4321"), calls[-1])
+
+calls.clear()
+rpc("tools/call", {"name": "svmhv_read", "arguments": {
+    "address": "0xffff1000", "length": 999999}})
+check("read clamps the length to one page",
+      calls[-1][2] == "4096", calls[-1])
+
+text = rpc("tools/call", {"name": "svmhv_read_physical", "arguments": {
+    "gpa": "0x1000"}})["result"]["content"][0]["text"]
+check("a physical read reports guest physical", "guest physical" in text, text)
+
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_write", "arguments": {
+    "address": "0xffff1000", "hex_bytes": "90 90 90 90"}})["result"]["content"][0]["text"]
+check("write reports what it wrote", "wrote 4 of 4 bytes" in text, text)
+check("write strips the spaces out of the payload",
+      calls[-1] == ("write", "ffff1000", "90909090"), calls[-1])
+
+for bad, why in (("909", "an odd number of digits"),
+                 ("zz", "a non-hex digit"),
+                 ("", "an empty payload")):
+    text = rpc("tools/call", {"name": "svmhv_write", "arguments": {
+        "address": "0xffff1000", "hex_bytes": bad}})["result"]["content"][0]["text"]
+    check(f"write rejects {why}", "even number of hex digits" in text, text)
 
 
 # a CtlError from the helper must come back as an isError result, not a crash

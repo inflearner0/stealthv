@@ -6,6 +6,7 @@
 #include "svmhv.h"
 #include "hook.h"
 #include "trace.h"
+#include "memory.h"
 
 /*
  * Both are ordinary driver globals on purpose: a client resolves svmhv!g_Control
@@ -136,6 +137,16 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
     case SVMHV_CMD_TRACE_RESET:
         SvTraceReset();
         return STATUS_SUCCESS;
+
+    /* All three run here rather than in the exit handler: see memory.h. */
+    case SVMHV_CMD_READ_MEMORY:
+        return SvMemoryRead(&g_Control.Request);
+
+    case SVMHV_CMD_WRITE_MEMORY:
+        return SvMemoryWrite(&g_Control.Request);
+
+    case SVMHV_CMD_READ_PHYSICAL:
+        return SvMemoryReadPhysical(&g_Control.Request);
 
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
