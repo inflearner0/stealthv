@@ -35,6 +35,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CTL = r"C:\lab\svmhvctl.exe"
@@ -1003,6 +1004,82 @@ def tool_explain(target: str) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------- service control
+
+SERVICE = "svmhv"
+
+
+def service_command(*arguments: str) -> str:
+    """Run sc.exe. Deliberately not routed through ctl(): this is the one thing
+    that has to work when the hypervisor is *not* answering."""
+    try:
+        done = subprocess.run(["sc.exe", *arguments],
+                              capture_output=True, text=True, timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        raise CtlError(f"sc.exe: {error}")
+    return (done.stdout or "") + (done.stderr or "")
+
+
+def service_state() -> str:
+    text = service_command("query", SERVICE)
+    for line in text.splitlines():
+        if "STATE" in line:
+            parts = line.split(":", 1)[1].split()
+            return parts[1] if len(parts) > 1 else parts[0]
+    if "1060" in text or "does not exist" in text:
+        return "ABSENT"
+    return "UNKNOWN"
+
+
+def tool_service(action: str = "status") -> str:
+    """Load, unload or reload the hypervisor.
+
+    This exists because the transport that would otherwise do it does not
+    survive the thing being controlled: PowerShell Direct drops its session
+    while the hypervisor is loaded and does not come back until the guest
+    reboots. Without this, reloading a rebuilt driver means rebooting the
+    machine, which throws away every piece of state an investigation has built
+    up. Here the agent is inside the guest and outlives the driver.
+    """
+    action = action.lower()
+    if action not in ("status", "load", "unload", "reload"):
+        return "action must be status, load, unload or reload"
+
+    if action == "status":
+        return f"{SERVICE} is {service_state()}"
+
+    lines = []
+    if action in ("unload", "reload"):
+        before = service_state()
+        if before == "RUNNING":
+            service_command("stop", SERVICE)
+            for _ in range(40):
+                if service_state() != "RUNNING":
+                    break
+                time.sleep(0.25)
+            lines.append(f"stopped (was {before}, now {service_state()})")
+        else:
+            lines.append(f"not running (state {before}), nothing to stop")
+
+    if action in ("load", "reload"):
+        if service_state() == "ABSENT":
+            return "\n".join(lines + [
+                f"the {SERVICE} service does not exist; create it with "
+                f"'sc create {SERVICE} type= kernel binPath= <path>' first"])
+        service_command("start", SERVICE)
+        for _ in range(40):
+            if service_state() == "RUNNING":
+                break
+            time.sleep(0.25)
+        state = service_state()
+        lines.append(f"started (now {state})")
+        if state != "RUNNING":
+            lines.append("check the System event log: a driver that refuses to "
+                         "load usually says why there")
+
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------- driver objects
 
 # DRIVER_OBJECT on x64. Stable across every Windows 10/11 build; the dispatch
@@ -1203,6 +1280,23 @@ def tool_selftest() -> str:
 
 
 TOOLS = [
+    {
+        "name": "svmhv_service",
+        "description":
+            "Load, unload or reload the hypervisor driver, or report its state. "
+            "The only way to put a rebuilt driver into service without "
+            "rebooting the guest - PowerShell Direct drops while the "
+            "hypervisor is loaded and does not recover until reboot, which "
+            "throws away all the state an investigation has built up. Use "
+            "reload after replacing svmhv.sys on disk.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"action": {
+                "type": "string", "enum": ["status", "load", "unload", "reload"],
+                "description": "default status"}},
+        },
+        "handler": lambda a: tool_service(a.get("action", "status")),
+    },
     {
         "name": "svmhv_status",
         "description":
