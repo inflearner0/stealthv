@@ -1950,7 +1950,11 @@ def resolve(name: str) -> int:
     for address, export in known_symbols(module["base"]):
         if export.lower() == symbol.lower():
             return address + offset
-    raise CtlError(f"{module['name']} exports no symbol called {symbol!r}")
+    raise CtlError(
+        f"{module['name']} has no symbol called {symbol!r} "
+        + ("(private symbols are loaded, so it is genuinely absent)"
+           if module["base"] in _pdb_symbols else
+           "(only exports are known here; load a PDB for the rest)"))
 
 
 def symbolize(address: int) -> str:
@@ -2731,6 +2735,66 @@ def _relocation_targets(base: int, disk: bytes, header: bytes, pe: int,
                 targets.add(page_rva + (entry & 0xFFF))
         at += block_size
     return targets
+
+
+# ------------------------------------------------------------ system calls
+
+def tool_syscalls(contains: str = "", limit: int = 60) -> str:
+    """The system service table, as index -> function.
+
+    A syscall number is how a great deal of code reaches the kernel without
+    going near a named import, so being able to say what index 0x55 is on this
+    build is often the whole question. The table is an array of 32-bit values;
+    each is the offset from the table base, shifted right by four.
+    """
+    kernel = module_by_name("nt")
+    if kernel is None:
+        return "the kernel is not in the module list"
+
+    # KiServiceTable is the table itself and KiServiceLimit its length.  The
+    # descriptor that points at them - KeServiceDescriptorTable - is exported
+    # on x86 and neither exported nor public on x64, so going through it works
+    # on the wrong architecture. Both of these are private symbols, which is
+    # why this needs a PDB and says so if it cannot get one.
+    try:
+        base = resolve("nt!KiServiceTable")
+    except CtlError:
+        return ("nt!KiServiceTable is not available. It is a private symbol, "
+                "so this needs the kernel's PDB - svmhv_pdb_info on nt will "
+                "say whether one has been loaded.")
+
+    count = 0
+    try:
+        count = int.from_bytes(read_bytes(resolve("nt!KiServiceLimit"), 4),
+                               "little")
+    except CtlError:
+        pass
+    if not (0 < count < 4096):
+        return (f"nt!KiServiceLimit reports {count} services, which is not "
+                "plausible - refusing to walk a table of unknown length")
+
+    entries = bytearray()
+    for offset in range(0, count * 4, 0x1000):
+        entries += read_bytes(base + offset, min(0x1000, count * 4 - offset))
+
+    wanted = contains.lower()
+    found = []
+    for index in range(count):
+        value = int.from_bytes(entries[index * 4:index * 4 + 4], "little",
+                               signed=True)
+        address = base + (value >> 4)
+        name = symbolize(address)
+        if wanted and wanted not in name.lower():
+            continue
+        found.append((index, address, name))
+
+    lines = [f"{count} services; showing {min(len(found), limit)}"
+             + (f" matching {contains!r}" if contains else ""), ""]
+    for index, address, name in found[:limit]:
+        lines.append(f"  {index:>4}  0x{index:03x}  {address:#018x}  {name}")
+    if len(found) > limit:
+        lines.append(f"  ... and {len(found) - limit} more")
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------- processes
@@ -3619,6 +3683,24 @@ TOOLS = [
             "required": ["module"],
         },
         "handler": lambda a: tool_verify(a["module"], a.get("limit", 24)),
+    },
+    {
+        "name": "svmhv_syscalls",
+        "description":
+            "The system service table as index -> function, symbolized. A "
+            "syscall number is how a lot of code reaches the kernel without "
+            "touching a named import, so knowing what index 0x55 is on this "
+            "build is often the whole question. Filter with 'contains'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contains": {"type": "string",
+                             "description": "only services whose name matches"},
+                "limit": {"type": "integer"},
+            },
+        },
+        "handler": lambda a: tool_syscalls(a.get("contains", ""),
+                                           a.get("limit", 60)),
     },
     {
         "name": "svmhv_note",
