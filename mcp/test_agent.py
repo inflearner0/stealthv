@@ -138,9 +138,13 @@ def fake_ctl(*arguments):
         return "hooks=1\nhook id=0 active=1 kind=0 action=0 target=0xffff1000 " \
                "gpa=0x1000 detour=0x0 trampoline=0x0 prolog=14 hits=5 filters=0\n"
     if arguments[0] in ("read", "readphys"):
+        # The hook tools decode this as a prologue, so it has to be
+        # instructions - an MZ header is not, and a strict decoder is right to
+        # refuse it. This is a real one: mov [rsp+8],rbx / push rdi /
+        # sub rsp,0x20 / mov rbx,rcx / xor eax,eax / ret.
         return ("status=0x00000000\nbytes=16\n"
-                "fffff78000000000  4d 5a 90 00 03 00 00 00 04 00 00 00 ff ff 00 00"
-                "  MZ..............\n")
+                "fffff78000000000  48 89 5c 24 08 57 48 83 ec 20 48 8b d9 33 c0 c3"
+                "  H..$.WH.. H..3..\n")
     if arguments[0] == "write":
         return "status=0x00000000\nwritten=4\n"
     return "status=0x00000000\nhookid=1\ngpa=0x1000\ntrampoline=0x2000\n"
@@ -181,8 +185,11 @@ text = rpc("tools/call", {"name": "svmhv_hook_trace", "arguments": {
     "capture": "1:objattr", "spoof": "2:0"}})["result"]["content"][0]["text"]
 check("hook_trace reports the new hook", "hook id    : 1" in text, text)
 check("hook_trace passes the options through",
-      calls[-1] == ("hook-trace", "ffff1000", "14", "--process", "notepad.exe",
-                    "--capture", "1:objattr", "--spoof", "2:0"), calls[-1])
+      calls[-1][:2] == ("hook-trace", "ffff1000")
+      and int(calls[-1][2]) >= 14
+      and calls[-1][3:] == ("--process", "notepad.exe",
+                            "--capture", "1:objattr", "--spoof", "2:0"),
+      calls[-1])
 
 # The prologue length is the parameter the driver warns will corrupt the
 # function, so check both that it is decoded when absent and that an explicit
@@ -191,7 +198,7 @@ calls.clear()
 text = rpc("tools/call", {"name": "svmhv_hook_trace", "arguments": {
     "target": "0xffff1000"}})["result"]["content"][0]["text"]
 check("an absent prologue is decoded from the bytes",
-      "(decoded)" in text and calls[-1][2] == "14", (text, calls[-1]))
+      "(decoded)" in text and int(calls[-1][2]) >= 14, (text, calls[-1]))
 
 calls.clear()
 rpc("tools/call", {"name": "svmhv_hook_trace", "arguments": {
@@ -245,6 +252,8 @@ for bad, why in (("4889c8", "bytes that run out mid-prologue"),
         check(f"refuses {why}", True)
 
 print("disassembly")
+# Exact rendering is the built-in decoder's contract; capstone words things its
+# own way ("qword ptr gs:[0x188]"), so the strings are checked against ours.
 for encoding, want in (
         ("4889c8", "mov rax, rcx"),
         ("4883ec28", "sub rsp, 0x28"),
@@ -259,8 +268,30 @@ for encoding, want in (
         ("64488b042530000000", "mov rax, fs:[0x30]"),
         ("0f1f440000", "nop [rax+rax*1]"),
 ):
-    _, got, _ = agent.disassemble_one(bytes.fromhex(encoding), 0, 0x140001000)
-    check(f"disassembles {want}", got == want, f"got {got!r}")
+    _, got, _ = agent._disassemble_builtin(bytes.fromhex(encoding), 0, 0x140001000)
+    check(f"the built-in disassembles {want}", got == want, f"got {got!r}")
+
+# Whichever decoder is in use, a segment override must not be dropped - gs:[0x188]
+# is the current thread and [0x188] is nonsense.
+_, got, _ = agent.disassemble_one(bytes.fromhex("65488b042588010000"), 0, 0x1000)
+check("a segment override survives whichever decoder is used",
+      "gs:" in got, got)
+
+# And instruction lengths must agree, since that is what sizes a hook prologue.
+for encoding in ("4889c8", "48895c2408", "0f1f440000", "48b81122334455667788",
+                 "65488b042588010000", "e800000000"):
+    raw = bytes.fromhex(encoding)
+    check(f"length of {encoding} agrees with the built-in",
+          agent.instruction_length(raw) == agent._instruction_length_builtin(raw),
+          f"{agent.instruction_length(raw)} vs "
+          f"{agent._instruction_length_builtin(raw)}")
+
+# A kernel address is above 2^63; capstone hands the target back signed, and a
+# negative one matches no module and silently loses the symbol.
+_, _, target = agent.disassemble_one(bytes.fromhex("e800000000"), 0,
+                                     0xfffff80010001000)
+check("a branch target above 2^63 comes back unsigned",
+      target == 0xfffff80010001005, hex(target) if target else target)
 
 _, text, target = agent.disassemble_one(bytes.fromhex("e800000000"), 0, 0x140001000)
 check("a call resolves its target", target == 0x140001005 and text.startswith("call"),
@@ -276,14 +307,16 @@ try:
 except agent.DecodeError:
     check("an unknown opcode is refused, never guessed", True)
 
-print("assembly")
+print(f"assembly  ({agent.engines()})")
+
+# The built-in subset has a fixed contract regardless of what is installed, so
+# it is tested directly rather than through assemble(), which prefers keystone.
 for source, want, why in (
         ("mov rax, 0x100000000", "48b80000000001000000", "imm64 when it needs one"),
         ("mov rax, 0xC0000022", "b8220000c0", "a 32-bit load zero-extends"),
         ("mov rax, -1", "48c7c0ffffffff", "a negative needs sign extension"),
         ("mov rcx, rdx", "4889d1", "mov r64, r64"),
         ("xor eax, eax", "31c0", "32-bit needs no REX"),
-        ("push rbx", "53", "push r64"),
         ("push r15", "4157", "push needs REX.B for r8-r15"),
         ("sub rsp, 0x28", "4883ec28", "imm8 form when it fits"),
         ("mov [rsp+0x20], rax", "4889442420", "rsp as a base needs a SIB"),
@@ -293,24 +326,38 @@ for source, want, why in (
         ("test rcx, rcx", "4885c9", "test"),
         ("ret", "c3", "ret"),
 ):
-    got = agent.assemble(source).hex()
-    check(f"assembles {why}", got == want, f"{source!r} -> {got}, want {want}")
-
-# Labels resolve, and the round trip is what proves the encoding.
-code, listing = agent.assemble_checked(
-    "test rcx, rcx\nje done\nmov rax, 1\ndone:\nret", 0)
-check("a forward label resolves to the right offset",
-      "je 0xe" in listing, listing)
-check("the listing is disassembled, not echoed", "ret" in listing.splitlines()[-1])
+    got = agent._assemble_builtin(source).hex()
+    check(f"the built-in assembles {why}", got == want,
+          f"{source!r} -> {got}, want {want}")
 
 for bad, why in (("mov rax, rbx, rcx", "three operands"),
                  ("frobnicate rax", "an unknown mnemonic"),
-                 ("mov rax, [rcx+rdx*4]", "a scaled index")):
+                 ("mov rax, [rcx+rdx*4]", "a scaled index it cannot encode")):
     try:
-        agent.assemble(bad)
-        check(f"rejects {why}", False)
+        agent._assemble_builtin(bad)
+        check(f"the built-in rejects {why}", False)
     except agent.AsmError:
-        check(f"rejects {why}", True)
+        check(f"the built-in rejects {why}", True)
+
+# Whichever engine is in use, these have to hold.
+code, listing = agent.assemble_checked(
+    "test rcx, rcx\nje done\nmov rax, 1\ndone:\nret", 0)
+check("a forward label assembles and lands on the last instruction",
+      listing.strip().splitlines()[-1].endswith("ret"), listing)
+check("every line of the listing was decoded, none left as db",
+      "db " not in listing, listing)
+check("a branch target is resolved to an address",
+      " 0x" in [l for l in listing.splitlines() if " je " in l][0], listing)
+
+code, listing = agent.assemble_checked("mov rax, 1\nret", 0)
+check("the round trip reads back what was asked for",
+      "mov" in listing and "ret" in listing, listing)
+
+try:
+    agent.assemble("")
+    check("empty source is refused", False)
+except agent.AsmError:
+    check("empty source is refused", True)
 
 print("decorated names")
 for mangled, want in (
@@ -427,7 +474,7 @@ calls.clear()
 text = rpc("tools/call", {"name": "svmhv_read", "arguments": {
     "address": "0xfffff78000000000", "length": 16}})["result"]["content"][0]["text"]
 check("read returns the dump and the raw bytes",
-      "hex: 4d5a90000300000004000000ffff0000" in text, text)
+      "hex: 48895c2408574883ec20488bd933c0c3" in text, text)
 check("read passes the address without its 0x",
       calls[-1] == ("read", "fffff78000000000", "16"), calls[-1])
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -544,7 +545,8 @@ def tool_assemble(source: str, base: str = "0") -> str:
     except AsmError as error:
         return f"assembly failed: {error}"
     return "\n".join([
-        f"{len(code)} bytes", "", listing, "", f"hex: {code.hex()}",
+        f"{len(code)} bytes  ({engines()})", "", listing, "",
+        f"hex: {code.hex()}",
         "",
         "That listing is the disassembler reading back what the assembler "
         "produced, not a repeat of your input - if they disagreed this would "
@@ -793,6 +795,19 @@ class DecodeError(ValueError):
 
 
 def instruction_length(code: bytes, at: int = 0) -> int:
+    """Length of the instruction at `at`.
+
+    This is what decides a hook's prologue, so it is the one place where being
+    wrong corrupts a function.  Capstone answers it when present.
+    """
+    if _CS is not None:
+        for insn in _CS.disasm(code[at:at + 16], 0, count=1):
+            return insn.size
+        raise DecodeError(f"capstone cannot decode {code[at:at + 8].hex()}")
+    return _instruction_length_builtin(code, at)
+
+
+def _instruction_length_builtin(code: bytes, at: int = 0) -> int:
     """Length of the x86-64 instruction at `at`.
 
     A length decoder, not a disassembler: it answers "where does the next
@@ -979,6 +994,52 @@ def _decode_modrm(code, i, size, rex_b, rex_x, rex_r):
 
 
 def disassemble_one(code: bytes, at: int, address: int) -> tuple[int, str, int | None]:
+    """One instruction: (length, text, branch target).
+
+    Capstone when available, the built-in decoder otherwise.  The branch target
+    is what makes a listing useful - the caller resolves it to a symbol - so it
+    is extracted from the decoded operands rather than by parsing the text.
+    """
+    if _CS is not None:
+        return _disassemble_capstone(code, at, address)
+    return _disassemble_builtin(code, at, address)
+
+
+def _disassemble_capstone(code: bytes, at: int, address: int):
+    for insn in _CS.disasm(code[at:at + 16], address, count=1):
+        text = f"{insn.mnemonic} {insn.op_str}".strip()
+        target = None
+
+        try:
+            groups = insn.groups
+            is_branch = (_capstone.CS_GRP_JUMP in groups or
+                         _capstone.CS_GRP_CALL in groups)
+            for operand in insn.operands:
+                if is_branch and operand.type == _capstone.x86.X86_OP_IMM:
+                    # Capstone resolves a relative branch to its destination,
+                    # but hands it back signed. Every kernel address is above
+                    # 2^63, so it arrives negative - and a negative address
+                    # matches no module, which silently drops the symbol from
+                    # the listing rather than failing.
+                    target = operand.imm & 0xFFFFFFFFFFFFFFFF
+                elif (operand.type == _capstone.x86.X86_OP_MEM and
+                      operand.mem.base == _capstone.x86.X86_REG_RIP):
+                    # Render RIP-relative against the real address: "[rip +
+                    # 0xff0]" is only actionable once it is an address.
+                    absolute = insn.address + insn.size + operand.mem.disp
+                    text = re.sub(r"\[rip \+ 0x[0-9a-f]+\]", f"[{absolute:#x}]",
+                                  text)
+                    text = re.sub(r"\[rip - 0x[0-9a-f]+\]", f"[{absolute:#x}]",
+                                  text)
+        except (AttributeError, _capstone.CsError):
+            pass                                    # detail unavailable
+
+        return insn.size, text, target
+
+    raise DecodeError(f"capstone cannot decode {code[at:at + 8].hex()}")
+
+
+def _disassemble_builtin(code: bytes, at: int, address: int) -> tuple[int, str, int | None]:
     """Decode one instruction.
 
     Returns (length, text, branch_target). Not a complete disassembler - it
@@ -1188,6 +1249,47 @@ def disassemble_one(code: bytes, at: int, address: int) -> tuple[int, str, int |
                 target = None      # a data reference, not a branch
 
     return length, text, target
+
+
+# ------------------------------------------------------- assembly engines
+
+"""
+Keystone assembles and Capstone disassembles when they are installed; the
+hand-written pair below takes over when they are not.
+
+Both are used, rather than one, and the pairing is the point.  The check that
+matters here is that bytes about to run in kernel mode are disassembled back
+and shown before they are installed - and that check is only worth something
+when the two sides are independent.  Assembling and disassembling with code
+written by the same author from the same reading of the encoding tables lets a
+shared misconception pass unnoticed: both sides get ModRM wrong the same way
+and agree.  Keystone against Capstone are separate implementations, so a
+disagreement is real information.
+
+The fallback stays because the agent is otherwise stdlib-only and a guest with
+no pip should still be able to write a simple stub.  It is a smaller language -
+no RIP-relative, no indirect call, no scaled index - and it says so.
+"""
+
+try:
+    import keystone as _keystone
+    _KS = _keystone.Ks(_keystone.KS_ARCH_X86, _keystone.KS_MODE_64)
+except Exception:                                   # not installed, or broken
+    _keystone = None
+    _KS = None
+
+try:
+    import capstone as _capstone
+    _CS = _capstone.Cs(_capstone.CS_ARCH_X86, _capstone.CS_MODE_64)
+    _CS.detail = True
+except Exception:
+    _capstone = None
+    _CS = None
+
+
+def engines() -> str:
+    return (f"assembler: {'keystone' if _KS else 'built-in subset'}, "
+            f"disassembler: {'capstone' if _CS else 'built-in subset'}")
 
 
 # --------------------------------------------------------------- assembly
@@ -1454,7 +1556,27 @@ def assemble_line(text: str, address: int, labels: dict[str, int]) -> bytes:
 
 
 def assemble(source: str, base_address: int = 0) -> bytes:
-    """Assemble Intel-syntax source, resolving labels in a second pass."""
+    """Assemble Intel-syntax source.
+
+    Keystone when available - it knows the whole instruction set, including the
+    RIP-relative loads the shellcode contract is designed around and the
+    indirect calls a stub needs to reach the trampoline. The built-in below
+    covers a much smaller language and is only reached when keystone is not
+    installed.
+    """
+    if _KS is not None:
+        try:
+            encoded, _ = _KS.asm(source, addr=base_address)
+        except Exception as error:
+            raise AsmError(f"keystone: {error}")
+        if encoded is None:
+            raise AsmError("keystone produced nothing; check the syntax")
+        return bytes(encoded)
+    return _assemble_builtin(source, base_address)
+
+
+def _assemble_builtin(source: str, base_address: int = 0) -> bytes:
+    """The fallback assembler: Intel syntax, labels resolved in a second pass."""
     lines = []
     # ';' introduces a comment, which assemble_line strips - it is not a
     # separator, or "mov rax, 1 ; set the result" becomes two instructions.
@@ -1673,6 +1795,22 @@ def known_symbols(base: int) -> list[tuple[int, str]]:
     """
     if base in _pdb_symbols:
         return _pdb_symbols[base]
+
+    # Fetch and load once per module, at the moment something first wants a
+    # name. Attempted at most once either way: a module with no PDB on the
+    # server must not turn every later lookup into another round trip.
+    if SYMBOLS_AUTO and base not in _symbol_attempts:
+        with _symbol_lock:
+            if base not in _symbol_attempts:
+                _symbol_attempts.add(base)
+                try:
+                    path = fetch_pdb(base)
+                    _attach_pdb(base, path)
+                except Exception:
+                    pass                # exports still work; see svmhv_pdb_info
+        if base in _pdb_symbols:
+            return _pdb_symbols[base]
+
     return exports(base)
 
 
@@ -2082,7 +2220,148 @@ def pdb_public_symbols(path: str) -> list[tuple[int, str, int]]:
     return found
 
 
+def pdb_identity(path: str) -> tuple[str, int]:
+    """The GUID and age recorded inside a PDB, from stream 1.
+
+    This is what makes an automatic download safe.  The server is content
+    addressed by GUID, but nothing stops a cache hit on a file that was put
+    there for a different build, and a mismatched PDB does not fail - it names
+    functions confidently and wrongly, which is worse than having no names.
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+
+    if not data.startswith(b"Microsoft C/C++ MSF 7.00"):
+        raise PdbError("not an MSF 7.00 file")
+
+    block_size = int.from_bytes(data[0x20:0x24], "little")
+    directory_bytes = int.from_bytes(data[0x2C:0x30], "little")
+    block_map = int.from_bytes(data[0x34:0x38], "little")
+
+    def block(index):
+        return data[index * block_size:(index + 1) * block_size]
+
+    needed = (directory_bytes + block_size - 1) // block_size
+    map_bytes = block(block_map)
+    directory = b"".join(
+        block(int.from_bytes(map_bytes[i * 4:i * 4 + 4], "little"))
+        for i in range(needed))[:directory_bytes]
+
+    count = int.from_bytes(directory[0:4], "little")
+    sizes = [int.from_bytes(directory[4 + i * 4:8 + i * 4], "little")
+             for i in range(count)]
+    at = 4 + count * 4
+    streams = []
+    for size in sizes:
+        blocks_needed = 0 if size == 0xFFFFFFFF else \
+            (size + block_size - 1) // block_size
+        blocks = [int.from_bytes(directory[at + i * 4:at + i * 4 + 4], "little")
+                  for i in range(blocks_needed)]
+        at += blocks_needed * 4
+        streams.append((blocks, 0 if size == 0xFFFFFFFF else size))
+
+    if len(streams) < 2:
+        raise PdbError("no PDB info stream")
+
+    blocks, size = streams[1]
+    info = b"".join(block(i) for i in blocks)[:size]
+    if len(info) < 28:
+        raise PdbError("the PDB info stream is too short")
+
+    # version(4) signature(4) age(4) guid(16)
+    age = int.from_bytes(info[8:12], "little")
+    guid = info[12:28]
+    text = "%08X%04X%04X%s" % (
+        int.from_bytes(guid[0:4], "little"),
+        int.from_bytes(guid[4:6], "little"),
+        int.from_bytes(guid[6:8], "little"),
+        guid[8:16].hex().upper())
+    return text, age
+
+
+SYMBOL_SERVER = "https://msdl.microsoft.com/download/symbols"
+SYMBOL_CACHE = r"C:\lab\symbols"
+SYMBOLS_AUTO = True                     # fetch on demand unless turned off
+
+_symbol_attempts: set[int] = set()      # modules already tried, to not retry
+_symbol_lock = threading.Lock()
+
+
+def fetch_pdb(base: int) -> str:
+    """Download the PDB a module was built with, into the local cache.
+
+    Only from the Microsoft symbol server, only over the path the module's own
+    debug directory names, and only kept if the GUID inside the file matches
+    the one asked for.  That last check is the point: the identity is the
+    whole reason to download rather than guess by name.
+    """
+    import urllib.request
+
+    info = pdb_info(base)
+    name = os.path.basename(info["name"])
+    if not name.lower().endswith(".pdb") or "/" in name or "\\" in name:
+        raise CtlError(f"refusing an implausible pdb name {info['name']!r}")
+
+    directory = os.path.join(SYMBOL_CACHE, name, info["guid"])
+    path = os.path.join(directory, name)
+    if os.path.exists(path):
+        return path
+
+    url = f"{SYMBOL_SERVER}/{name}/{info['guid']}/{name}"
+    os.makedirs(directory, exist_ok=True)
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Microsoft-Symbol-Server/10.0"})
+
+    partial = path + ".part"
+    with urllib.request.urlopen(request, timeout=60) as response, \
+            open(partial, "wb") as out:
+        out.write(response.read())
+
+    try:
+        guid, age = pdb_identity(partial)
+    except PdbError as error:
+        os.remove(partial)
+        raise CtlError(f"{url} did not return a usable PDB: {error}")
+
+    # The GUID, and only the GUID.
+    #
+    # The image's debug directory and the PDB's own header both carry an age,
+    # and they routinely disagree - the server path is built from the image's,
+    # while the PDB counts its own revisions and is often one ahead. Comparing
+    # the two ages rejects correct files: CLFS on this machine asks for age 1
+    # and its PDB says 2. The 128-bit GUID is what identifies the build; the
+    # age is a tiebreaker with nothing to break.
+    wanted = info["guid"][:32]
+    if guid.upper() != wanted.upper():
+        os.remove(partial)
+        raise CtlError(
+            f"the file at {url} identifies as GUID {guid}, not {wanted} - "
+            "it is for a different build and would name things wrongly")
+
+    os.replace(partial, path)
+    return path
+
+
 _pdb_symbols: dict[int, list[tuple[int, str]]] = {}
+
+
+def _attach_pdb(base: int, path: str) -> int:
+    """Parse a PDB and attach its symbols to the module loaded at `base`."""
+    sections = pe_sections(base)
+    publics = pdb_public_symbols(path)
+
+    attached = []
+    for segment, name, offset in publics:
+        if 1 <= segment <= len(sections):
+            attached.append((base + sections[segment - 1]["rva"] + offset,
+                             readable_name(name)))
+    if not attached:
+        raise PdbError("no symbol landed in a section this module has")
+
+    attached.sort()
+    _pdb_symbols[base] = attached
+    _exports_cache.pop(base, None)
+    return len(attached)
 
 
 def load_pdb_symbols(module_name: str, path: str) -> int:
@@ -2116,7 +2395,20 @@ def tool_pdb_info(module: str) -> str:
     if resolved is None:
         return f"no loaded module called {module!r}"
     info = pdb_info(resolved["base"])
+    base = resolved["base"]
+
+    if base in _pdb_symbols:
+        state = f"symbols: {len(_pdb_symbols[base])} loaded"
+    elif base in _symbol_failures:
+        # Worth saying out loud. A silent failure looks exactly like a module
+        # that has no private symbols, and the two call for different responses.
+        state = f"symbols: not loaded - {_symbol_failures[base]}"
+    else:
+        state = "symbols: not loaded yet"
+
     return "\n".join([
+        state,
+        "",
         f"{resolved['name']} was built with:",
         f"  pdb  : {info['name']}",
         f"  path : {info['full']}",
@@ -2132,7 +2424,20 @@ def tool_pdb_info(module: str) -> str:
     ])
 
 
-def tool_symbols_load(module: str, path: str) -> str:
+def tool_symbols_load(module: str, path: str = "") -> str:
+    resolved = module_by_name(module)
+    if resolved is None:
+        return f"no loaded module called {module!r}"
+
+    if not path:
+        # No path given: fetch it, the same way the automatic path does.
+        try:
+            path = fetch_pdb(resolved["base"])
+        except Exception as error:
+            return (f"could not fetch symbols for {module}: {error}\n"
+                    "svmhv_pdb_info reports the identity if you would rather "
+                    "fetch it yourself and pass a path.")
+
     try:
         count = load_pdb_symbols(module, path)
     except (PdbError, OSError) as error:
@@ -2140,6 +2445,18 @@ def tool_symbols_load(module: str, path: str) -> str:
     return (f"{count} symbol(s) loaded for {module} from {path}.\n"
             "These now take precedence over exported names everywhere an "
             "address is rendered.")
+
+
+def tool_symbols_auto(enabled: bool = True) -> str:
+    """Turn the automatic fetch on or off for this session."""
+    global SYMBOLS_AUTO
+    SYMBOLS_AUTO = bool(enabled)
+    if not SYMBOLS_AUTO:
+        return ("automatic symbol download is off; svmhv_symbols_load still "
+                "fetches on demand")
+    _symbol_attempts.clear()
+    return (f"automatic symbol download is on, from {SYMBOL_SERVER}, cached in "
+            f"{SYMBOL_CACHE}. Modules already tried will be retried.")
 
 
 # ------------------------------------------------------------- processes
@@ -2955,11 +3272,27 @@ TOOLS = [
             "properties": {
                 "module": {"type": "string"},
                 "path": {"type": "string",
-                         "description": "path to the .pdb inside the guest"},
+                         "description": "path to a .pdb in the guest; omit to "
+                                        "fetch it from the symbol server"},
             },
-            "required": ["module", "path"],
+            "required": ["module"],
         },
-        "handler": lambda a: tool_symbols_load(a["module"], a["path"]),
+        "handler": lambda a: tool_symbols_load(a["module"], a.get("path", "")),
+    },
+    {
+        "name": "svmhv_symbols_auto",
+        "description":
+            "Turn automatic symbol download on or off. On by default: the "
+            "first time anything needs a name in a module, its PDB is fetched "
+            "from the Microsoft symbol server and cached, once per module per "
+            "session. Turn it off to keep the guest from making outbound "
+            "connections, or when working offline - exports still work either "
+            "way.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+        },
+        "handler": lambda a: tool_symbols_auto(a.get("enabled", True)),
     },
     {
         "name": "svmhv_exports",
