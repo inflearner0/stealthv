@@ -3,12 +3,6 @@
 **A minimal AMD-V (SVM) hypervisor for Windows x64, with nested-paging code
 hooks that are invisible to anything reading memory.**
 
-*stealth + `hv`.* Read a hooked page and you get the original instructions;
-execute it and you get a substitution. Time a `CPUID` and it costs exactly what
-the bare processor costs, because it never left it.
-Read the driver's own pages and they are zeroes. Not being seen is not a feature
-here, it is the design — the same trick applied in four places.
-
 [![ci](https://github.com/inflearner0/stealthv/actions/workflows/ci.yml/badge.svg)](https://github.com/inflearner0/stealthv/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/inflearner0/stealthv?include_prereleases)](https://github.com/inflearner0/stealthv/releases)
 [![license](https://img.shields.io/github/license/inflearner0/stealthv)](LICENSE)
@@ -33,13 +27,6 @@ to itself: the point of an identity map is not isolation but control over
 permissions, and a page that is non-executable in one hierarchy and
 executable-but-substituted in another is enough to hold a code hook nothing can
 find by reading memory.
-
-| Intercept | Why |
-|---|---|
-| `RDMSR`/`WRMSR` of `EFER` | keep `EFER.SVME` set and hide it from the guest |
-| `VMMCALL` | the control channel and the unload doorbell, on the magic in RAX; forwarded to the hypervisor above us otherwise |
-| `VMRUN`, `VMLOAD`, `VMSAVE`, `STGI`, `CLGI`, `SKINIT`, `INVLPGA` | inject `#UD` — what a CPU with `EFER.SVME` clear does |
-| `#NPF` | the hook engine: the guest crossed between code and data on a hooked page |
 
 ## Build
 
