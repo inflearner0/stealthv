@@ -1263,6 +1263,102 @@ def tool_exports(module_name: str, contains: str = "") -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------- processes
+
+def processes(name_filter: str = "") -> list[dict]:
+    arguments = ["processes"] + ([name_filter] if name_filter else [])
+    found = []
+    for record in records(ctl(*arguments), "process"):
+        try:
+            found.append({"pid": int(record["pid"], 0),
+                          "threads": int(record.get("threads", "0"), 0),
+                          "name": record.get("name", "?"),
+                          "peb": int(record.get("peb", "0"), 0)})
+        except (KeyError, ValueError):
+            continue
+    return found
+
+
+def tool_processes(name: str = "") -> str:
+    found = processes(name)
+    if not found:
+        return f"no process matches {name!r}" if name else "no processes listed"
+    lines = [f"{len(found)} process(es)", ""]
+    for process in sorted(found, key=lambda p: p["pid"]):
+        peb = f"{process['peb']:#x}" if process["peb"] else "(not readable)"
+        lines.append(f"  {process['pid']:>6}  {process['name']:<32} "
+                     f"threads {process['threads']:<4} peb {peb}")
+    return "\n".join(lines)
+
+
+def process_modules(pid: int) -> list[dict]:
+    """Walk PEB -> Ldr -> InLoadOrderModuleList with cross-process reads.
+
+    Every step is an ordinary read in the target's address space, which is why
+    this needed no kernel code: the hypervisor already reaches into a process
+    without opening a handle to it, so the loader's own bookkeeping is just
+    more memory.
+    """
+    matching = [p for p in processes() if p["pid"] == int(pid)]
+    if not matching:
+        raise CtlError(f"no process with pid {pid}")
+    peb = matching[0]["peb"]
+    if peb == 0:
+        raise CtlError(f"pid {pid} did not give up its PEB (protected?)")
+
+    def qword(address):
+        return int.from_bytes(read_bytes(address, 8, pid), "little")
+
+    # PEB.Ldr is at +0x18 on x64; PEB_LDR_DATA.InLoadOrderModuleList at +0x10.
+    ldr = qword(peb + 0x18)
+    if ldr == 0:
+        raise CtlError("the loader data is not mapped yet")
+    head = ldr + 0x10
+    entry = qword(head)
+
+    found = []
+    for _ in range(256):
+        if entry == 0 or entry == head:
+            break
+        # LDR_DATA_TABLE_ENTRY: DllBase +0x30, SizeOfImage +0x40,
+        # FullDllName +0x48, BaseDllName +0x58 (UNICODE_STRING: len, max, ptr)
+        blob = read_bytes(entry, 0x70, pid)
+        if len(blob) < 0x68:
+            break
+
+        def field(at, width=8):
+            return int.from_bytes(blob[at:at + width], "little")
+
+        base = field(0x30)
+        size = field(0x40, 4)
+        name_length = field(0x58, 2)
+        name_buffer = field(0x60)
+        name = ""
+        if name_buffer and 0 < name_length <= 512:
+            try:
+                name = read_bytes(name_buffer, name_length, pid).decode(
+                    "utf-16-le", "replace")
+            except CtlError:
+                name = ""
+        if base:
+            found.append({"base": base, "size": size, "name": name or "?"})
+        entry = field(0)                       # InLoadOrderLinks.Flink
+    return found
+
+
+def tool_process_modules(pid: int) -> str:
+    found = process_modules(int(pid))
+    if not found:
+        return f"pid {pid} has no readable module list"
+    lines = [f"{len(found)} module(s) in pid {pid}", ""]
+    for module in found:
+        lines.append(f"  {module['base']:#018x}  {module['size']:>9,}  "
+                     f"{module['name']}")
+    lines += ["", "The first entry is the executable itself. Its base is what "
+              "svmhv_read, svmhv_disassemble and svmhv_watch want as 'pid'."]
+    return "\n".join(lines)
+
+
 def tool_disassemble(target: str, count: int = 24, pid: int = 0) -> str:
     """A listing with branch targets named.
 
@@ -1731,6 +1827,34 @@ TOOLS = [
             "required": ["name"],
         },
         "handler": lambda a: tool_symbol(a["name"]),
+    },
+    {
+        "name": "svmhv_processes",
+        "description":
+            "Every running process with its pid, thread count and PEB address. "
+            "The starting point for reverse engineering an .exe: pick the "
+            "process here, then svmhv_process_modules for where its image is "
+            "loaded, then read, disassemble or watch inside it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string",
+                                    "description": "exact image name filter"}},
+        },
+        "handler": lambda a: tool_processes(a.get("name", "")),
+    },
+    {
+        "name": "svmhv_process_modules",
+        "description":
+            "The modules loaded in one process, walked out of its PEB with "
+            "cross-process reads - the executable first, then its DLLs, each "
+            "with base and size. This is how you find where an .exe actually "
+            "landed under ASLR.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"pid": {"type": "integer"}},
+            "required": ["pid"],
+        },
+        "handler": lambda a: tool_process_modules(a["pid"]),
     },
     {
         "name": "svmhv_disassemble",

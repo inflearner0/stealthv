@@ -415,6 +415,161 @@ static int PrintModules(void)
     return 1;
 }
 
+/* -------------------------------------------------------------- processes */
+
+/*
+ * Every process, with the address of its PEB.
+ *
+ * The PEB is what makes the rest reachable: from it a client walks Ldr and the
+ * module list with ordinary cross-process reads, so "which modules are loaded
+ * in this .exe, and where" needs no new kernel code at all - only the read that
+ * already exists.  Without it, a user-mode address has no context and there is
+ * nothing to point svmhv_read at.
+ */
+#define SYSTEM_PROCESS_INFORMATION  5
+
+typedef struct _SVMHV_UNICODE_STRING
+{
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} SVMHV_UNICODE_STRING;
+
+typedef struct _SYSTEM_PROCESS_INFORMATION_PARTIAL
+{
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER Reserved[3];
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    SVMHV_UNICODE_STRING ImageName;
+    LONG  BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+    ULONG HandleCount;
+} SYSTEM_PROCESS_INFORMATION_PARTIAL;
+
+typedef struct _SVMHV_PROCESS_BASIC_INFORMATION
+{
+    LONG  ExitStatus;
+    PVOID PebBaseAddress;
+    ULONG_PTR AffinityMask;
+    LONG  BasePriority;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+} SVMHV_PROCESS_BASIC_INFORMATION;
+
+typedef LONG (__stdcall *PFN_NT_QUERY_INFORMATION_PROCESS)(
+    HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+static unsigned __int64 PebOf(unsigned int pid)
+{
+    static PFN_NT_QUERY_INFORMATION_PROCESS query;
+    SVMHV_PROCESS_BASIC_INFORMATION basic;
+    unsigned __int64 peb = 0;
+    HANDLE process;
+
+    if (query == NULL)
+    {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (ntdll == NULL) { return 0; }
+        query = (PFN_NT_QUERY_INFORMATION_PROCESS)(void*)
+                    GetProcAddress(ntdll, "NtQueryInformationProcess");
+        if (query == NULL) { return 0; }
+    }
+
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == NULL)
+    {
+        return 0;               /* protected, or gone since we listed it */
+    }
+
+    memset(&basic, 0, sizeof(basic));
+    if (query(process, 0 /* ProcessBasicInformation */, &basic,
+              sizeof(basic), NULL) >= 0)
+    {
+        peb = (unsigned __int64)(ULONG_PTR)basic.PebBaseAddress;
+    }
+    CloseHandle(process);
+    return peb;
+}
+
+static int PrintProcesses(const char* filter)
+{
+    PFN_NT_QUERY_SYSTEM_INFORMATION query;
+    unsigned char* buffer;
+    HMODULE ntdll;
+    ULONG needed = 0;
+    ULONG offset = 0;
+    unsigned int count = 0;
+    LONG status;
+
+    ntdll = GetModuleHandleA("ntdll.dll");
+    query = (ntdll != NULL)
+          ? (PFN_NT_QUERY_SYSTEM_INFORMATION)(void*)
+                GetProcAddress(ntdll, "NtQuerySystemInformation")
+          : NULL;
+    if (query == NULL)
+    {
+        fprintf(stderr, "NtQuerySystemInformation is not available\n");
+        return 0;
+    }
+
+    query(SYSTEM_PROCESS_INFORMATION, NULL, 0, &needed);
+    if (needed == 0) { needed = 1 << 20; }
+    needed *= 2;                /* the list grows between the two calls */
+
+    buffer = (unsigned char*)malloc(needed);
+    if (buffer == NULL)
+    {
+        fprintf(stderr, "out of memory for the process list\n");
+        return 0;
+    }
+
+    status = query(SYSTEM_PROCESS_INFORMATION, buffer, needed, &needed);
+    if (status < 0)
+    {
+        fprintf(stderr, "NtQuerySystemInformation failed: 0x%08lx\n",
+                (unsigned long)status);
+        free(buffer);
+        return 0;
+    }
+
+    printf("processes\n");
+    for (;;)
+    {
+        const SYSTEM_PROCESS_INFORMATION_PARTIAL* entry =
+            (const SYSTEM_PROCESS_INFORMATION_PARTIAL*)(buffer + offset);
+        char name[64] = "System Idle";
+        unsigned int pid = (unsigned int)(ULONG_PTR)entry->UniqueProcessId;
+
+        if (entry->ImageName.Buffer != NULL && entry->ImageName.Length != 0)
+        {
+            int written = WideCharToMultiByte(
+                CP_UTF8, 0, entry->ImageName.Buffer,
+                entry->ImageName.Length / (int)sizeof(WCHAR),
+                name, (int)sizeof(name) - 1, NULL, NULL);
+            name[(written > 0) ? written : 0] = '\0';
+        }
+
+        if (filter == NULL || _stricmp(filter, name) == 0)
+        {
+            printf("process pid=%u threads=%lu name=%s peb=0x%llx\n",
+                   pid, (unsigned long)entry->NumberOfThreads, name,
+                   pid ? PebOf(pid) : 0);
+            count++;
+        }
+
+        if (entry->NextEntryOffset == 0) { break; }
+        offset += entry->NextEntryOffset;
+    }
+
+    printf("count=%u\n", count);
+    free(buffer);
+    return 1;
+}
+
 /* A hex dump with the ASCII column, which is what makes a dump readable. */
 static void PrintDump(unsigned __int64 base, const unsigned char* data,
                       unsigned int length)
@@ -1026,6 +1181,11 @@ int main(int argc, char** argv)
     if (_stricmp(argv[1], "modules") == 0)
     {
         return PrintModules() ? 0 : 2;
+    }
+
+    if (_stricmp(argv[1], "processes") == 0)
+    {
+        return PrintProcesses((argc >= 3) ? argv[2] : NULL) ? 0 : 2;
     }
 
     if (_stricmp(argv[1], "driverobj") == 0 && argc >= 3)
