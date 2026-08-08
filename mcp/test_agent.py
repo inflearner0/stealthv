@@ -284,6 +284,9 @@ check("an address inside a function is named with its offset",
 check("an address in a module with no exports still names the module",
       agent.symbolize(0xFFFFF80020000100) == "svmhv.sys+0x100",
       agent.symbolize(0xFFFFF80020000100))
+check("an address far past the nearest export is not given its name",
+      agent.symbolize(0xFFFFF80010001000 + 0x9000) == "ntoskrnl.exe+0xa000",
+      agent.symbolize(0xFFFFF80010001000 + 0x9000))
 check("an address in no module is left as an address",
       agent.symbolize(0x1234) == "0x1234")
 
@@ -302,6 +305,40 @@ rpc("tools/call", {"name": "svmhv_hook_trace",
                    "arguments": {"target": "nt!NtCreateFile"}})
 check("a hook target may be a symbol",
       calls and calls[-1][1] == "fffff80010001000", calls)
+
+print("trace summary")
+
+
+def busy_ctl(*arguments):
+    calls.append(arguments)
+    if arguments[0] == "trace":
+        rows = []
+        for i in range(6):
+            rows.append(
+                f"trace seq={i} type=0 hook=1 cpu={i % 2} pid=88 tid=9 irql=0 "
+                f"spoofed=0 proc=notepad.exe tsc={i} rip=0xdead rsp=0x1 "
+                f"ret=0xfffff80010001000 gpa=0x3 err=0x0 "
+                f"a0=0x1 a1=0x{i:x} a2=0x3 a3=0x4 s0=0x0 s1=0x0 "
+                f"cap0=48656c6c6f2e74787400")
+        return ("produced=6000\nring_records=4096\nrecord_size=432\n"
+                + "\n".join(rows) + "\n")
+    return "status=0x00000000\n"
+
+
+agent.ctl = busy_ctl
+text = rpc("tools/call", {"name": "svmhv_trace_summary",
+                          "arguments": {"count": 6}})["result"]["content"][0]["text"]
+check("the summary reports how many were produced", "6,000 records produced" in text,
+      text)
+check("it groups by hook", "hook 1" in text, text)
+check("it tallies the process", "notepad.exe x6" in text, text)
+check("it symbolizes the caller",
+      "ntoskrnl.exe!NtCreateFile" in text, text)
+check("a constant argument is shown with its count", "0x1 x6" in text, text)
+check("an all-distinct argument is described, not listed",
+      "6 distinct value(s)" in text, text)
+check("captures are deduplicated", 'captured  : 1 distinct' in text, text)
+agent.ctl = fake_ctl
 
 # ------------------------------------------------------------------- memory
 

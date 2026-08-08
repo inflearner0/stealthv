@@ -381,6 +381,88 @@ def tool_trace(count: int = 40) -> str:
     return "\n".join(lines)
 
 
+def tool_trace_summary(count: int = 200) -> str:
+    """What the ring says, collapsed instead of transcribed.
+
+    A hot hook produces thousands of near-identical records, and rendering them
+    one by one buries the answer in the evidence - a model reading 200 full
+    records has spent most of its attention before reaching the interesting
+    one. The questions a summary actually answers are which processes hit this,
+    who called it, and which argument values are distinct; the samples are there
+    to drill into afterwards with svmhv_trace.
+    """
+    count = max(1, min(int(count), 200))
+    text = ctl("trace", str(count))
+    header = pairs(text)
+    rows = records(text, "trace")
+    produced = as_int(header, "produced")
+    if not rows:
+        return f"no trace records yet ({produced:,} produced)"
+
+    by_hook: dict[str, list[dict]] = {}
+    for row in rows:
+        by_hook.setdefault(row.get("hook", "?"), []).append(row)
+
+    lines = [f"{produced:,} records produced; summarising the newest {len(rows)}",
+             ""]
+
+    for hook_id, group in sorted(by_hook.items()):
+        kinds = {int(r.get("type", "0"), 0) for r in group}
+        kind = ("exec" if kinds == {0} else
+                "watch" if 0 not in kinds else "mixed")
+        lines.append(f"hook {hook_id}  ({kind})  {len(group)} record(s)")
+
+        def tally(key, render=lambda v: v):
+            counts: dict[str, int] = {}
+            for row in group:
+                value = row.get(key)
+                if value is not None:
+                    counts[render(value)] = counts.get(render(value), 0) + 1
+            return sorted(counts.items(), key=lambda kv: -kv[1])
+
+        processes_seen = tally("proc")
+        if processes_seen:
+            lines.append("  processes : " + ", ".join(
+                f"{name} x{n}" for name, n in processes_seen[:6]))
+
+        callers = tally("ret", lambda v: symbolize(int(v, 0)) if v else "?")
+        if callers:
+            lines.append("  callers   : " + ", ".join(
+                f"{name} x{n}" for name, n in callers[:5]))
+
+        cpus = tally("cpu")
+        if cpus:
+            lines.append("  processors: " + ", ".join(
+                f"cpu{c} x{n}" for c, n in cpus[:8]))
+
+        for index in range(4):
+            values = tally(f"a{index}")
+            if not values or len(values) > len(group) * 0.9:
+                # All distinct means it is a pointer or a handle; saying "many
+                # distinct" is more honest than listing them.
+                if values:
+                    lines.append(f"  arg{index}      : {len(values)} distinct value(s)")
+                continue
+            lines.append(f"  arg{index}      : " + ", ".join(
+                f"{v} x{n}" for v, n in values[:4]))
+
+        captures = [decode_capture(r[f"cap{i}"])
+                    for r in group for i in range(2) if r.get(f"cap{i}")]
+        if captures:
+            unique = sorted(set(captures))
+            lines.append(f"  captured  : {len(unique)} distinct; " +
+                         ", ".join(f'"{c}"' for c in unique[:5]))
+
+        newest = group[-1]
+        lines.append(f"  newest    : seq {newest.get('seq')} "
+                     f"{newest.get('proc', '-')} args {newest.get('a0')} "
+                     f"{newest.get('a1')} {newest.get('a2')} {newest.get('a3')}")
+        lines.append("")
+
+    lines.append("Use svmhv_trace for the full records behind any of this.")
+    return "\n".join(lines)
+
+
 def tool_trace_reset() -> str:
     status = as_int(pairs(ctl("trace-reset")), "status", -1)
     return "trace ring reset" if status == 0 else f"failed: {status:#010x}"
@@ -1024,6 +1106,13 @@ def tool_write(address: str, hex_bytes: str, pid: int = 0) -> str:
 
 # ------------------------------------------------------- modules and symbols
 
+# How far past an exported symbol an address may be before the name stops
+# meaning anything. Functions in ntoskrnl are rarely larger than this, so
+# beyond it the nearest export is almost certainly not the one containing the
+# address. Private symbols would remove the guesswork; without a PDB this is
+# the honest boundary.
+SYMBOL_MAX_OFFSET = 0x2000
+
 _modules_cache: list[dict] = []
 _exports_cache: dict[int, list[tuple[int, str]]] = {}
 
@@ -1221,7 +1310,19 @@ def symbolize(address: int) -> str:
 
     if best is None:
         return f"{module['name']}+{address - module['base']:#x}"
+
     delta = address - best[0]
+
+    # Only exports are known, so "nearest export" is only the containing
+    # function when the address is close to it. Deep inside a module the
+    # nearest export is usually thousands of bytes away and belongs to some
+    # unrelated function - naming it would be a confident wrong answer, and a
+    # caller acting on "ntoskrnl!_setjmpex+0x9138" would be misled about what
+    # called what. Past the threshold, say where it is and stop claiming to
+    # know what it is.
+    if delta > SYMBOL_MAX_OFFSET:
+        return f"{module['name']}+{address - module['base']:#x}"
+
     return (f"{module['name']}!{best[1]}"
             + (f"+{delta:#x}" if delta else ""))
 
@@ -1995,6 +2096,24 @@ TOOLS = [
         },
         "handler": lambda a: tool_write(a["address"], a["hex_bytes"],
                                         a.get("pid", 0)),
+    },
+    {
+        "name": "svmhv_trace_summary",
+        "description":
+            "The trace ring collapsed instead of transcribed: which processes "
+            "hit each hook, who called it with the return addresses "
+            "symbolized, which processors, and which argument values are "
+            "distinct. A hot hook produces thousands of near-identical records "
+            "and reading them one by one buries the answer in the evidence - "
+            "start here, then use svmhv_trace for the records behind anything "
+            "that looks interesting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"count": {
+                "type": "integer",
+                "description": "how many newest records to summarise, 1-200"}},
+        },
+        "handler": lambda a: tool_trace_summary(int(a.get("count", 200))),
     },
     {
         "name": "svmhv_trace_reset",
