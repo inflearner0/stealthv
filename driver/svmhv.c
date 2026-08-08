@@ -746,7 +746,25 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
      * instruction pair, so paying for those as well would only drag this
      * processor's clock away from the others for no benefit.
      */
-    Cpu->Layout->TscHide = (STEALTHV_TSC_OFFSET && timeable) ? g_TscHidePerExit : 0;
+    /*
+     * The compensation is subtracted from a per-processor running total that
+     * only ever decreases, so left alone it walks this processor's clock
+     * backwards without bound and away from every other processor's.  Windows
+     * needs the TSC invariant and synchronised across processors; it tolerates
+     * a small skew and then, some minutes in, it does not - which is the whole
+     * "resets a few minutes after load, no bugcheck" symptom.
+     *
+     * Stop hiding once the accumulated drift reaches the cap.  A detector times
+     * one rdtsc-cpuid-rdtsc pair, so what it can observe is the compensation
+     * for the exit it just caused - a bounded budget covers any realistic burst
+     * of measurements, while the total can never grow into something the guest
+     * notices.  The cap is roughly a third of a millisecond at 3 GHz: far more
+     * than any timing loop needs, far less than Windows cares about.
+     */
+    Cpu->Layout->TscHide =
+        (STEALTHV_TSC_OFFSET && timeable &&
+         Cpu->Layout->TscOffset > -(INT64)SVMHV_MAX_TSC_DRIFT)
+            ? g_TscHidePerExit : 0;
     Cpu->TscOverhead = (INT64)Cpu->Layout->TscTotal;
     Cpu->TscHidden   = Cpu->Layout->TscOffset;
 
@@ -758,6 +776,34 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
     vmcb->Control.TlbControl = (STEALTHV_ALWAYS_FLUSH_TLB || Cpu->PendingFlush)
                              ? g_TlbControl : SVM_TLB_CONTROL_NOTHING;
     Cpu->PendingFlush = FALSE;
+
+    /*
+     * Re-inject an event the exit interrupted.
+     *
+     * If a #VMEXIT happens while the processor is *delivering* an interrupt or
+     * an exception - reading the IDT, walking a descriptor, pushing the frame -
+     * the delivery is abandoned and what was being delivered is recorded in
+     * EXITINTINFO.  Nothing redelivers it on its own.  Put it in EVENTINJ and
+     * the next VMRUN starts the delivery again from the beginning.
+     *
+     * Nested paging is what makes this reachable: hidden pages and hooked pages
+     * are deliberately not present, so a #NPF taken part-way through delivering
+     * a timer interrupt is an ordinary event here, not an exotic one.  Dropping
+     * it loses the interrupt silently, and the failure lands arbitrarily far
+     * away from the cause - which is exactly the shape of a guest that dies with
+     * no bugcheck minutes after load.
+     *
+     * EXITINTINFO and EVENTINJ share a layout (vector, type, error-code-valid,
+     * valid, error code in the top half), so this is a straight copy.  An event
+     * the handler has just injected itself wins: that one is about the
+     * instruction we are returning to, and it has not been delivered yet.
+     */
+    if ((vmcb->Control.ExitIntInfo & SVM_EVENTINJ_VALID) != 0 &&
+        (vmcb->Control.EventInj & SVM_EVENTINJ_VALID) == 0)
+    {
+        vmcb->Control.EventInj = vmcb->Control.ExitIntInfo;
+        Cpu->EventsReinjected++;
+    }
 
     /* We never claim any part of the VMCB is unchanged. */
     vmcb->Control.VmcbClean = 0;

@@ -13,6 +13,14 @@
 #define SVMHV_GUEST_ASID        1
 
 /*
+ * How far behind real time a processor's clock is allowed to fall through TSC
+ * compensation, in cycles.  Bounds both the backwards drift and the divergence
+ * between processors; see the cap in SvHandleVmExit for why an unbounded total
+ * is fatal rather than untidy.
+ */
+#define SVMHV_MAX_TSC_DRIFT     1000000ULL
+
+/*
  * Guest GPRs as pushed by the PUSHAQ macro in svmasm.asm.  Lowest address
  * first, i.e. reverse push order.  'Rsp' is a dummy slot pushed only to keep
  * the frame 16-byte aligned; the real guest RSP lives in the VMCB.
@@ -107,6 +115,10 @@ typedef struct DECLSPEC_ALIGN(PAGE_SIZE) _VIRTUAL_CPU
        counted in NpfExits instead. */
     UINT64  ExitCodeCounts[256];
     UINT64  InvalidExits;
+
+    /* Interrupts and exceptions this exit interrupted mid-delivery and put back.
+       Zero here on a busy guest would mean the re-injection is not working. */
+    UINT64  EventsReinjected;
 
     /* Too big for a DPC stack, and it must survive the VMRUN round trip. */
     DECLSPEC_ALIGN(16) CONTEXT ContextRecord;
