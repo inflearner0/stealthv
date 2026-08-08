@@ -59,6 +59,15 @@ observed. If you get this onto bare metal, that is the first thing to try.
 
 - Long-duration stability under concurrent load is unverified; `soak.ps1` has
   not been re-run since the CPUID interception was removed.
+- **The guest still resets, and it is not the workload.** Three triple faults in
+  one afternoon (host events 18560), at intervals of about three hours, three
+  minutes and ten minutes after load. The ten-minute one happened with the guest
+  *idle*: a scheduled task loaded the driver, slept in thirty-second steps
+  logging the boot time, and nothing touched the control channel at all. So the
+  soak notes below, which reason about the guest failing to keep up with exit
+  load, do not explain this — whatever it is happens with no load to keep up
+  with. The reset is silent as always: no bugcheck, no dump, only Kernel-Power
+  41 in the guest, and the boot time is the only honest instrument.
 - The resume-from-sleep path has never run; see above.
 - A processor that comes online *after* load has no per-processor slot and stays
   unvirtualised. It is no longer an out-of-bounds array index, but it is still a
