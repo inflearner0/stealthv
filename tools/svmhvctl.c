@@ -228,10 +228,10 @@ static int Submit(unsigned int command, const unsigned char* request,
  * 680 hypercalls to carry 16 bytes; the driver ignores the hook fields for
  * these commands, so leaving them alone is both correct and 200 times cheaper.
  */
-static int SubmitMemory(unsigned int command, unsigned __int64 address,
-                        unsigned int length, unsigned int pid,
-                        const unsigned char* input, unsigned char* out,
-                        unsigned int* returned)
+static int SubmitMemoryEx(unsigned int command, unsigned __int64 address,
+                          unsigned int length, unsigned int pid,
+                          const unsigned char* input, unsigned char* out,
+                          unsigned int* returned, int quiet)
 {
     HV_REGS regs;
     unsigned __int64 sequence;
@@ -286,7 +286,11 @@ static int SubmitMemory(unsigned int command, unsigned __int64 address,
             continue;
         }
 
-        printf("status=0x%08x\n", (unsigned int)regs.Rdx);
+        /* Noise when sweeping hundreds of pages, so the bulk path silences it. */
+        if (!quiet)
+        {
+            printf("status=0x%08x\n", (unsigned int)regs.Rdx);
+        }
 
         /* Read the count first: it says how much of the buffer is meaningful,
            and a short transfer is a normal outcome rather than an error. */
@@ -568,6 +572,22 @@ static int PrintProcesses(const char* filter)
     printf("count=%u\n", count);
     free(buffer);
     return 1;
+}
+
+static int SubmitMemory(unsigned int command, unsigned __int64 address,
+                        unsigned int length, unsigned int pid,
+                        const unsigned char* input, unsigned char* out,
+                        unsigned int* returned)
+{
+    return SubmitMemoryEx(command, address, length, pid, input, out, returned, 0);
+}
+
+static int SubmitMemoryQuiet(unsigned int command, unsigned __int64 address,
+                             unsigned int length, unsigned int pid,
+                             const unsigned char* input, unsigned char* out,
+                             unsigned int* returned)
+{
+    return SubmitMemoryEx(command, address, length, pid, input, out, returned, 1);
 }
 
 /* A hex dump with the ASCII column, which is what makes a dump readable. */
@@ -1060,6 +1080,7 @@ static void Usage(void)
         "  svmhvctl modules\n"
         "  svmhvctl driverobj <name>\n"
         "  svmhvctl read  <address> [length] [pid]\n"
+        "  svmhvctl dump  <address> <length> [pid]\n"
         "  svmhvctl readphys <gpa> [length]\n"
         "  svmhvctl write <address> <hexbytes> [pid]\n"
         "  svmhvctl watch <target> write|access\n"
@@ -1244,6 +1265,65 @@ int main(int argc, char** argv)
             return 2;
         }
         PrintDump(address, data, returned);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "dump") == 0 && argc >= 4)
+    {
+        /*
+         * Bulk read, one page per doorbell but all of it in one process.
+         *
+         * Scanning a module for strings or a byte pattern means reading
+         * hundreds of pages, and doing that as hundreds of separate runs of
+         * this program spends far more time creating processes than moving
+         * memory.  Output is one unbroken hex string per page, prefixed by the
+         * address, so a client can reassemble it without parsing a dump.
+         */
+        unsigned char data[REQ_MEM_MAX];
+        const unsigned __int64 address = strtoull(argv[2], NULL, 16);
+        unsigned __int64 total = strtoull(argv[3], NULL, 0);
+        const unsigned int pid = (argc >= 5)
+                               ? (unsigned int)strtoul(argv[4], NULL, 0) : 0;
+        unsigned __int64 done = 0;
+        unsigned int pages = 0;
+
+        if (total == 0 || total > (16u << 20))
+        {
+            fprintf(stderr, "length must be 1..16777216\n");
+            return 1;
+        }
+
+        while (done < total)
+        {
+            unsigned __int64 at = address + done;
+            unsigned int chunk = (unsigned int)(total - done);
+            unsigned int returned = 0;
+            unsigned int i;
+
+            /* Never span a page: the driver reads one mapping at a time. */
+            unsigned int toPageEnd = 0x1000 - (unsigned int)(at & 0xFFF);
+            if (chunk > toPageEnd) { chunk = toPageEnd; }
+            if (chunk > REQ_MEM_MAX) { chunk = REQ_MEM_MAX; }
+
+            if (!SubmitMemoryQuiet(SVMHV_CMD_READ_MEMORY, at, chunk, pid,
+                                   NULL, data, &returned) || returned == 0)
+            {
+                /* A hole is normal when sweeping; say so and keep going. */
+                printf("gap at=0x%llx\n", at);
+                done += chunk;
+                continue;
+            }
+
+            printf("page at=0x%llx bytes=%u data=", at, returned);
+            for (i = 0; i < returned; i++) { printf("%02x", data[i]); }
+            printf("\n");
+
+            done += returned;
+            pages++;
+            if (returned < chunk) { break; }
+        }
+
+        printf("pages=%u\n", pages);
         return 0;
     }
 

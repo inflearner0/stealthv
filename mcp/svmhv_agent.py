@@ -1578,6 +1578,193 @@ def tool_process_modules(pid: int) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------- bulk scanning
+
+def dump_range(address: int, length: int, pid: int = 0) -> dict[int, bytes]:
+    """Read a span in one svmhvctl run, as {page address: bytes}.
+
+    Returned as a map rather than one buffer because a sweep runs into holes -
+    a module has unmapped or discarded sections - and pretending those are
+    zeroes would invent content that a search then reports finding.
+    """
+    arguments = ["dump", f"{address:x}", str(int(length))]
+    if pid:
+        arguments.append(str(int(pid)))
+
+    out: dict[int, bytes] = {}
+    for record in records(ctl(*arguments), "page"):
+        try:
+            out[int(record["at"], 0)] = bytes.fromhex(record["data"])
+        except (KeyError, ValueError):
+            continue
+    return out
+
+
+def pe_sections(base: int, pid: int = 0) -> list[dict]:
+    header = read_bytes(base, 0x400, pid)
+    if header[:2] != b"MZ":
+        raise CtlError(f"no MZ header at {base:#x}")
+    pe = int.from_bytes(header[0x3C:0x40], "little")
+    count = int.from_bytes(header[pe + 6:pe + 8], "little")
+    optional_size = int.from_bytes(header[pe + 20:pe + 22], "little")
+    table = pe + 24 + optional_size
+
+    found = []
+    for i in range(min(count, 32)):
+        entry = header[table + i * 40:table + i * 40 + 40]
+        if len(entry) < 40:
+            break
+        found.append({
+            "name": entry[:8].rstrip(b"\0").decode("ascii", "replace"),
+            "rva": int.from_bytes(entry[12:16], "little"),
+            "size": int.from_bytes(entry[8:12], "little"),
+            "characteristics": int.from_bytes(entry[36:40], "little"),
+        })
+    return found
+
+
+def tool_sections(module: str) -> str:
+    resolved = module_by_name(module)
+    if resolved is None:
+        return f"no loaded module called {module!r}"
+    found = pe_sections(resolved["base"])
+    lines = [f"{resolved['name']} at {resolved['base']:#x}", ""]
+    for section in found:
+        flags = section["characteristics"]
+        marks = ("r" if flags & 0x40000000 else "-") + \
+                ("w" if flags & 0x80000000 else "-") + \
+                ("x" if flags & 0x20000000 else "-")
+        lines.append(f"  {section['name']:<10} {resolved['base'] + section['rva']:#018x}  "
+                     f"{section['size']:>9,}  {marks}")
+    return "\n".join(lines)
+
+
+def extract_strings(blob: bytes, base: int, minimum: int) -> list[tuple[int, str]]:
+    found = []
+    # ASCII
+    run_start, run = None, bytearray()
+    for index, byte in enumerate(blob + b"\0"):
+        if 0x20 <= byte < 0x7F:
+            if run_start is None:
+                run_start = index
+            run.append(byte)
+        else:
+            if len(run) >= minimum:
+                found.append((base + run_start, run.decode("ascii")))
+            run_start, run = None, bytearray()
+
+    # UTF-16LE: the same run with a zero after every character
+    index = 0
+    while index + 1 < len(blob):
+        if 0x20 <= blob[index] < 0x7F and blob[index + 1] == 0:
+            start = index
+            text = []
+            while (index + 1 < len(blob) and 0x20 <= blob[index] < 0x7F
+                   and blob[index + 1] == 0):
+                text.append(chr(blob[index]))
+                index += 2
+            if len(text) >= minimum:
+                found.append((base + start, "".join(text)))
+        else:
+            index += 1
+    return found
+
+
+def tool_strings(module: str, minimum: int = 6, limit: int = 200,
+                 contains: str = "") -> str:
+    """The classic first look at a binary.
+
+    For a driver that exports nothing and whose functions have no names, the
+    strings are frequently the only thing that says what it is for - registry
+    paths, device names, the text of its own error messages.
+    """
+    resolved = module_by_name(module)
+    if resolved is None:
+        return f"no loaded module called {module!r}"
+    minimum = max(4, min(int(minimum), 64))
+    limit = max(1, min(int(limit), 1000))
+
+    sections = [s for s in pe_sections(resolved["base"])
+                if not (s["characteristics"] & 0x20000000)]   # skip code
+    if not sections:
+        sections = pe_sections(resolved["base"])
+
+    found: list[tuple[int, str]] = []
+    scanned = 0
+    for section in sections:
+        if len(found) >= limit * 4 or scanned > (4 << 20):
+            break
+        start = resolved["base"] + section["rva"]
+        size = min(section["size"], 2 << 20)
+        scanned += size
+        for page, blob in sorted(dump_range(start, size).items()):
+            found += extract_strings(blob, page, minimum)
+
+    wanted = contains.lower()
+    if wanted:
+        found = [(a, t) for a, t in found if wanted in t.lower()]
+
+    lines = [f"{len(found)} string(s) in {resolved['name']}"
+             + (f" matching {contains!r}" if contains else "")
+             + (f"; showing {limit}" if len(found) > limit else ""), ""]
+    for address, text in found[:limit]:
+        lines.append(f"  {address:#018x}  {text}")
+    return "\n".join(lines)
+
+
+def tool_search(pattern: str, module: str = "", start: str = "",
+                size: int = 0, pid: int = 0, limit: int = 40) -> str:
+    """Find a byte pattern. '??' matches any byte.
+
+    Either give a module to sweep, or a start and a size. Wildcards are what
+    make this useful on code, where immediates and relative offsets differ
+    between builds but the surrounding instructions do not.
+    """
+    cleaned = "".join(pattern.split()).lower()
+    if len(cleaned) % 2 or not cleaned:
+        return "pattern must be an even number of hex digits, '??' for any byte"
+
+    needle: list[int | None] = []
+    for i in range(0, len(cleaned), 2):
+        pair = cleaned[i:i + 2]
+        if pair == "??":
+            needle.append(None)
+        elif all(c in "0123456789abcdef" for c in pair):
+            needle.append(int(pair, 16))
+        else:
+            return f"{pair!r} is neither a hex byte nor '??'"
+
+    if module:
+        resolved = module_by_name(module)
+        if resolved is None:
+            return f"no loaded module called {module!r}"
+        begin, span = resolved["base"], min(resolved["size"], 4 << 20)
+        where = resolved["name"]
+    elif start and size:
+        begin, span = resolve(start), min(int(size), 4 << 20)
+        where = start
+    else:
+        return "give either a module, or a start and a size"
+
+    hits = []
+    for page, blob in sorted(dump_range(begin, span, pid).items()):
+        for offset in range(0, len(blob) - len(needle) + 1):
+            if all(want is None or blob[offset + i] == want
+                   for i, want in enumerate(needle)):
+                hits.append(page + offset)
+                if len(hits) >= limit:
+                    break
+        if len(hits) >= limit:
+            break
+
+    if not hits:
+        return f"no match for {pattern!r} in {where}"
+    lines = [f"{len(hits)} match(es) for {pattern!r} in {where}", ""]
+    for address in hits:
+        lines.append(f"  {address:#018x}  {symbolize(address)}")
+    return "\n".join(lines)
+
+
 def tool_disassemble(target: str, count: int = 24, pid: int = 0) -> str:
     """A listing with branch targets named.
 
@@ -2133,6 +2320,68 @@ TOOLS = [
             "required": ["name"],
         },
         "handler": lambda a: tool_driver(a["name"]),
+    },
+    {
+        "name": "svmhv_sections",
+        "description":
+            "A module's PE sections with addresses, sizes and rwx flags. Tells "
+            "you where the code is, where the data is, and what is writable - "
+            "which is where to point a watch.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"module": {"type": "string"}},
+            "required": ["module"],
+        },
+        "handler": lambda a: tool_sections(a["module"]),
+    },
+    {
+        "name": "svmhv_strings",
+        "description":
+            "ASCII and UTF-16 strings from a module's data sections. The "
+            "classic first look at a binary: for a driver that exports nothing "
+            "and whose functions have no names, the registry paths, device "
+            "names and error text are often the only thing that says what it "
+            "is for. Filter with 'contains'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string"},
+                "minimum": {"type": "integer",
+                            "description": "shortest string to report (default 6)"},
+                "contains": {"type": "string",
+                             "description": "only strings containing this"},
+                "limit": {"type": "integer", "description": "default 200"},
+            },
+            "required": ["module"],
+        },
+        "handler": lambda a: tool_strings(a["module"], a.get("minimum", 6),
+                                          a.get("limit", 200),
+                                          a.get("contains", "")),
+    },
+    {
+        "name": "svmhv_search",
+        "description":
+            "Find a byte pattern, with '??' matching any byte. Sweep a module, "
+            "or a start and size - and in another process with pid. The "
+            "wildcards are what make it usable on code, where immediates and "
+            "relative offsets move between builds but the surrounding "
+            "instructions do not. Matches are reported with the nearest symbol.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string",
+                            "description": "hex bytes, e.g. '48 8b ?? ?? c3'"},
+                "module": {"type": "string", "description": "module to sweep"},
+                "start": {"type": "string", "description": "or an address"},
+                "size": {"type": "integer", "description": "with a length"},
+                "pid": {"type": "integer", "description": "search this process"},
+                "limit": {"type": "integer", "description": "default 40"},
+            },
+            "required": ["pattern"],
+        },
+        "handler": lambda a: tool_search(a["pattern"], a.get("module", ""),
+                                         a.get("start", ""), a.get("size", 0),
+                                         a.get("pid", 0), a.get("limit", 40)),
     },
     {
         "name": "svmhv_imports",
