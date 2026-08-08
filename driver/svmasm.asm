@@ -44,6 +44,7 @@ EFER_SVME_MASK  equ     0FFFFEFFFh              ; ~(1 << 12)
 
 EXTERN SvHandleVmExit : PROC
 EXTERN SvTraceExecEntry : PROC
+EXTERN SvTraceReturnEntry : PROC
 
 PUSHAQ MACRO
         push    rax
@@ -353,6 +354,75 @@ AsmTraceEntry PROC
         xchg    rax, [rsp]                      ; RAX restored, target on the stack
         ret                                     ; -> trampoline, RSP as at entry
 AsmTraceEntry ENDP
+
+;
+; VOID AsmTraceReturn(VOID)
+;
+; Where a traced function returns to, because SvTracePushReturn put this
+; address on the stack in place of the one its caller pushed.
+;
+; On entry RSP is already past that slot - the ret popped it - so the stack is
+; exactly as the caller expects it, and RAX holds the result.  The job is to
+; find out where the function was really supposed to return, record the value,
+; and go there.
+;
+; Everything that can carry a return value has to survive: RAX for integers,
+; RDX for the high half of a 128-bit one, and XMM0 for anything floating point.
+; The remaining volatiles are saved because the recorder is ordinary C and the
+; compiler may use any of them.
+;
+; The destination arrives in RAX from the recorder, so it goes on the stack and
+; RET jumps to it - the same trick AsmTraceEntry uses, and for the same reason:
+; there is no register left that is safe to hold it while RAX is restored.
+;
+AsmTraceReturn PROC
+        push    rax                             ; the return value
+        push    rcx
+        push    rdx                             ; high half of a 128-bit result
+        push    r8
+        push    r9
+        push    r10
+        push    r11
+        push    rax                             ; scratch, for the destination
+
+        ; 0x60, not 0x68.  AsmTraceEntry is entered at a function's first
+        ; instruction, where RSP is 8 mod 16; this is entered after a RET has
+        ; popped, so RSP is 0 mod 16 and eight pushes leave it there.  Taking
+        ; another eight off would misalign movaps and fault.
+        sub     rsp, 60h
+        movaps  xmmword ptr [rsp + 000h], xmm0  ; a floating point result
+        movaps  xmmword ptr [rsp + 010h], xmm1
+        movaps  xmmword ptr [rsp + 020h], xmm2
+        movaps  xmmword ptr [rsp + 030h], xmm3
+        movaps  xmmword ptr [rsp + 040h], xmm4
+        movaps  xmmword ptr [rsp + 050h], xmm5
+
+        mov     rcx, [rsp + 60h + 38h]          ; arg1: the saved RAX
+        lea     rdx, [rsp + 60h + 40h]          ; arg2: RSP as the caller sees it
+        sub     rsp, 20h
+        call    SvTraceReturnEntry
+        add     rsp, 20h
+        mov     [rsp + 60h + 00h], rax          ; stash the real return address
+
+        movaps  xmm0, xmmword ptr [rsp + 000h]
+        movaps  xmm1, xmmword ptr [rsp + 010h]
+        movaps  xmm2, xmmword ptr [rsp + 020h]
+        movaps  xmm3, xmmword ptr [rsp + 030h]
+        movaps  xmm4, xmmword ptr [rsp + 040h]
+        movaps  xmm5, xmmword ptr [rsp + 050h]
+        add     rsp, 60h
+
+        mov     rax, [rsp]                      ; the destination
+        add     rsp, 8
+        pop     r11
+        pop     r10
+        pop     r9
+        pop     r8
+        pop     rdx
+        pop     rcx
+        xchg    rax, [rsp]                      ; RAX restored, target on top
+        ret                                     ; -> the caller, none the wiser
+AsmTraceReturn ENDP
 
 AsmReadGdtr PROC
         sgdt    fword ptr [rcx]

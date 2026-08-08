@@ -86,6 +86,12 @@ for bad, why in (({"capture": "1:nope"}, "unknown capture type"),
     except agent.CtlError:
         check(f"rejects {why}", True)
 
+check("capture_return becomes a flag with no value",
+      agent.hook_options(capture_return=True) == ["--capture-return"],
+      agent.hook_options(capture_return=True))
+check("capture_return off adds nothing",
+      agent.hook_options(capture_return=False) == [])
+
 check("the sanitiser passes the option strings it has to",
       all(agent.SAFE_ARGUMENT.match(a) for a in
           ("notepad.exe", "1:objattr", "--process", "0xC0000022", "ffff8000")))
@@ -151,6 +157,23 @@ text = rpc("tools/call", {"name": "svmhv_trace", "arguments": {"count": 1}})["re
 check("trace shows the image name", "notepad.exe" in text)
 check("trace reports spoofed arguments", "1 argument(s) replaced" in text)
 check("trace decodes the capture", 'arg capture 0: "Hello.txt"' in text, text)
+
+def return_ctl(*arguments):
+    calls.append(arguments)
+    if arguments[0] == "trace":
+        return ("produced=2\nring_records=4096\nrecord_size=432\n"
+                "trace seq=1 type=3 hook=0 cpu=3 pid=88 tid=9 irql=0 spoofed=0 "
+                "proc=- tsc=9 rip=0x1 rsp=0x2 ret=0xfffff80010001000 gpa=0x0 "
+                "err=0x0 a0=0xc0000022 a1=0x1e240 a2=0x0 a3=0x0 s0=0x0 s1=0x0\n")
+    return "status=0x00000000\n"
+
+
+agent.ctl = return_ctl
+text = rpc("tools/call", {"name": "svmhv_trace",
+                          "arguments": {"count": 1}})["result"]["content"][0]["text"]
+check("a return record shows the value and the cycles",
+      "RETURNED 0xc0000022 after 123,456 cycles" in text, text)
+agent.ctl = fake_ctl
 
 calls.clear()
 text = rpc("tools/call", {"name": "svmhv_hook_trace", "arguments": {

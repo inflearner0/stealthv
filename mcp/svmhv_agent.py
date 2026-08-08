@@ -128,7 +128,8 @@ CAPTURE_TYPES = ("ansi", "wide", "unicode", "objattr", "bytes")
 
 def hook_options(process=None, pid=None, caller_base=None, caller_size=None,
                  filter_expr=None, capture=None, capture2=None,
-                 spoof=None, spoof2=None, block=None, in_process=None) -> list[str]:
+                 spoof=None, spoof2=None, block=None, in_process=None,
+                 capture_return=None) -> list[str]:
     """
     Turn the tool parameters into svmhvctl's named options.
 
@@ -171,6 +172,8 @@ def hook_options(process=None, pid=None, caller_base=None, caller_size=None,
 
     if block is not None:
         options += ["--block", str(block)]
+    if capture_return:
+        options += ["--capture-return"]
     if in_process is not None:
         # Which address space the *target* is in, as opposed to --pid, which
         # narrows what gets recorded once the hook is already placed.
@@ -212,7 +215,7 @@ OPTION_BITS = [
 ]
 KIND_NAMES = {0: "exec", 1: "write-watch", 2: "access-watch"}
 ACTION_NAMES = {0: "trace", 1: "detour", 2: "shellcode"}
-TRACE_TYPES = {0: "exec", 1: "write", 2: "access"}
+TRACE_TYPES = {0: "exec", 1: "write", 2: "access", 3: "return"}
 EXIT_NAMES = {
     0x072: "CPUID", 0x07A: "INVLPGA", 0x07C: "MSR", 0x080: "VMRUN",
     0x081: "VMMCALL", 0x082: "VMLOAD", 0x083: "VMSAVE", 0x084: "STGI",
@@ -226,6 +229,7 @@ SELFTEST_BITS = [
     (0x0040, "SVM hidden from cpuid"), (0x0080, "SVM feature leaf hidden"),
     (0x0100, "nested paging active"), (0x0200, "hooked on every processor"),
     (0x0400, "trace captured the arguments"),
+    (0x0800, "trace captured the return value"),
 ]
 STATUS_NAMES = {
     0xC000000D: "STATUS_INVALID_PARAMETER",
@@ -368,6 +372,15 @@ def tool_trace(count: int = 40) -> str:
                     entry.append(f'      arg capture {index}: '
                                  f'"{decode_capture(captured)}"')
             lines.append("\n".join(entry))
+        elif kind == 3:
+            # A return record: the value is in the first argument slot and the
+            # cycles the call took in the second. Rendering it as a watch would
+            # show a guest physical address that means nothing here.
+            cycles = int(row.get("a1", "0"), 0)
+            lines.append(
+                f"[{row.get('seq')}] hook {row.get('hook')} cpu{row.get('cpu')} "
+                f"RETURNED {row.get('a0')} after {cycles:,} cycles, "
+                f"to {symbolize(int(row.get('ret', '0'), 0))}")
         else:
             error = int(row.get("err", "0"), 0)
             decoded = [n for b, n in ((1, "present"), (2, "write"),
@@ -2183,6 +2196,7 @@ def tool_selftest() -> str:
             values.get(f"traced_arg{i}", "?") for i in range(4)),
         f"arg victim result : {values.get('arg_result', '?')} "
         f"(expect 0xaaaaaaaaaaaaaaaa)",
+        f"captured return   : {values.get('traced_return', '?')}",
         f"EFER seen by guest: {values.get('efer', '?')}",
         f"cpuid in kernel   : {as_int(values, 'cpuid_cycles'):,} cycles "
         f"(baseline {as_int(values, 'baseline_cycles'):,})",
@@ -2628,7 +2642,8 @@ TOOLS = [
             a["target"], (int(a["prolog_length"]) if a.get("prolog_length") else None),
             **{k: a[k] for k in (
                 "process", "pid", "caller_base", "caller_size", "filter_expr",
-                "capture", "capture2", "spoof", "spoof2", "block") if k in a}),
+                "capture", "capture2", "spoof", "spoof2", "block",
+                "capture_return") if k in a}),
     },
     {
         "name": "svmhv_hook_detour",

@@ -63,6 +63,7 @@ typedef struct _SVM_HOOK_TRACE_INFO
     SVMHV_FILTER  Filters[SVMHV_MAX_FILTERS];
     SVMHV_CAPTURE Captures[SVMHV_MAX_CAPTURES];
     SVMHV_SPOOF   Spoofs[SVMHV_MAX_SPOOFS];
+    BOOLEAN       CaptureReturn;
     char          ProcessName[SVMHV_PROCESS_NAME_MAX];
 } SVM_HOOK_TRACE_INFO;
 

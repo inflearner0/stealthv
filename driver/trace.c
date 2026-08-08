@@ -47,6 +47,7 @@ static volatile LONG g_InRecorder[TRACE_MAX_CPUS];
 
 /* A snapshot of the last exec trace, for the self-test. */
 static UINT64        g_LastArguments[4];
+static UINT64        g_LastReturn;
 static volatile LONG g_LastExecRecords;
 
 VOID SvTraceLastExec(_Out_writes_(4) UINT64* Arguments, _Out_ UINT32* Records)
@@ -297,6 +298,190 @@ static ULONG SvTraceCapture(_In_ const SVMHV_CAPTURE* Capture,
     }
 }
 
+/* ---------------------------------------------------------- return path */
+
+/*
+ * Catching a function's return value means being on the stack when it
+ * returns, and there is exactly one way to do that without disturbing what
+ * the function sees: replace the return address the caller pushed, and
+ * remember the real one somewhere.
+ *
+ * What is *not* possible is calling the trampoline from a stub and taking
+ * the value when it comes back.  That inserts a frame, and a function's fifth
+ * and later arguments live at fixed offsets from the stack pointer it was
+ * entered with - NtCreateFile has eleven.  Shifting RSP by even eight bytes
+ * makes every one of them read the wrong slot.
+ *
+ * So: per thread, because a thread is what owns a call stack.  Not per
+ * processor - a thread can be rescheduled onto another processor between
+ * being called and returning, and the entry has to travel with it.
+ */
+#define TRACE_RETURN_SLOTS      512     /* threads tracked at once           */
+#define TRACE_RETURN_DEPTH      16      /* nesting per thread                */
+
+typedef struct _TRACE_RETURN_FRAME
+{
+    UINT64 ReturnAddress;               /* what the caller actually pushed   */
+    UINT64 Rsp;                         /* where it was, for validation      */
+    UINT64 HookId;
+    UINT64 Tsc;                         /* to report how long the call took  */
+} TRACE_RETURN_FRAME;
+
+typedef struct _TRACE_RETURN_SLOT
+{
+    volatile LONG64 Thread;             /* 0 when free                       */
+    volatile LONG   Depth;
+    TRACE_RETURN_FRAME Frames[TRACE_RETURN_DEPTH];
+} TRACE_RETURN_SLOT;
+
+static TRACE_RETURN_SLOT g_ReturnSlots[TRACE_RETURN_SLOTS];
+static volatile LONG64   g_ReturnsLost;
+
+static TRACE_RETURN_SLOT* SvTraceReturnSlot(_In_ BOOLEAN Claim)
+{
+    const LONG64 thread = (LONG64)(ULONG_PTR)PsGetCurrentThread();
+    const ULONG start = (ULONG)(((ULONG_PTR)thread >> 4) % TRACE_RETURN_SLOTS);
+    ULONG i;
+
+    /* Linear probing.  A thread keeps its slot for as long as it has frames
+       outstanding, so the table only has to hold concurrently-traced calls. */
+    for (i = 0; i < 32; i++)
+    {
+        TRACE_RETURN_SLOT* slot = &g_ReturnSlots[(start + i) % TRACE_RETURN_SLOTS];
+
+        if (slot->Thread == thread)
+        {
+            return slot;
+        }
+        if (Claim && slot->Thread == 0 &&
+            InterlockedCompareExchange64(&slot->Thread, thread, 0) == 0)
+        {
+            slot->Depth = 0;
+            return slot;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Called from AsmTraceEntry's decision point.  Returns TRUE if the caller's
+ * return address was replaced, in which case AsmTraceReturn will run when the
+ * function finishes.  FALSE means capture was not possible, and the function
+ * returns straight to its caller as if nothing had happened - which is the
+ * only acceptable way to fail here.
+ */
+static BOOLEAN SvTracePushReturn(_In_ UINT64 HookId, _In_ UINT64 OriginalRsp)
+{
+    TRACE_RETURN_SLOT* slot = SvTraceReturnSlot(TRUE);
+    LONG depth;
+
+    if (slot == NULL)
+    {
+        InterlockedIncrement64(&g_ReturnsLost);
+        return FALSE;
+    }
+
+    depth = slot->Depth;
+    if (depth < 0 || depth >= TRACE_RETURN_DEPTH)
+    {
+        InterlockedIncrement64(&g_ReturnsLost);
+        return FALSE;
+    }
+
+    slot->Frames[depth].ReturnAddress = *(UINT64*)OriginalRsp;
+    slot->Frames[depth].Rsp = OriginalRsp;
+    slot->Frames[depth].HookId = HookId;
+    slot->Frames[depth].Tsc = __rdtsc();
+    slot->Depth = depth + 1;
+
+    *(UINT64*)OriginalRsp = (UINT64)(ULONG_PTR)AsmTraceReturn;
+    return TRUE;
+}
+
+/*
+ * The function has returned.  Rax is its result and Rsp is the stack pointer
+ * immediately after the ret popped our address, so the frame we are looking
+ * for is the one whose recorded Rsp is eight less than this.
+ *
+ * The search matters.  A function that never returns normally - one unwound
+ * through by an exception, or one that longjmps - leaves its frame behind, and
+ * taking the top of the stack blindly would hand the next return the wrong
+ * address and put the machine somewhere arbitrary.  Frames above the match are
+ * exactly those abandoned calls, so they are discarded.
+ */
+UINT64 SvTraceReturnEntry(_In_ UINT64 Rax, _In_ UINT64 Rsp)
+{
+    TRACE_RETURN_SLOT* slot = SvTraceReturnSlot(FALSE);
+    const UINT64 wanted = Rsp - sizeof(UINT64);
+    LONG depth;
+
+    if (slot == NULL)
+    {
+        /* Nothing recorded for this thread at all.  There is no address to
+           return to and nothing safe to invent. */
+        KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x52455431ULL /* 'RET1' */,
+                     Rax, Rsp, 0);
+    }
+
+    for (depth = slot->Depth - 1; depth >= 0; depth--)
+    {
+        TRACE_RETURN_FRAME* frame = &slot->Frames[depth];
+
+        if (frame->Rsp != wanted)
+        {
+            continue;                   /* an abandoned call; drop it */
+        }
+
+        {
+            const UINT64 address = frame->ReturnAddress;
+            const UINT64 elapsed = __rdtsc() - frame->Tsc;
+            UINT64 sequence;
+            SVMHV_TRACE_RECORD* record = SvTraceClaim(&sequence);
+
+            slot->Depth = depth;
+            if (depth == 0)
+            {
+                /* Last frame out releases the slot for another thread. */
+                InterlockedExchange64(&slot->Thread, 0);
+            }
+
+            if (record != NULL)
+            {
+                RtlZeroMemory(record, sizeof(*record));
+                record->Sequence = sequence;
+                record->Tsc = __rdtsc();
+                record->Type = SVMHV_TRACE_RETURN;
+                record->HookId = (UINT32)frame->HookId;
+                record->Rip = address;
+                record->Rsp = Rsp;
+                record->ReturnAddress = address;
+                record->Arguments[0] = Rax;         /* the result */
+            g_LastReturn = Rax;
+                record->Arguments[1] = elapsed;     /* cycles in the call */
+                record->Processor = KeGetCurrentProcessorIndex();
+                record->ProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
+                record->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
+            }
+
+            return address;
+        }
+    }
+
+    KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x52455432ULL /* 'RET2' */,
+                 Rax, Rsp, (ULONG_PTR)slot->Depth);
+}
+
+VOID SvTraceReturnCounters(_Out_ UINT64* Lost)
+{
+    *Lost = (UINT64)g_ReturnsLost;
+}
+
+VOID SvTraceLastReturn(_Out_ UINT64* Value)
+{
+    *Value = g_LastReturn;
+}
+
 /* ------------------------------------------------------------ exec path */
 
 PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
@@ -473,6 +658,21 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
     }
 
     SvHookCountHit((UINT32)HookId);
+
+    /*
+     * Arrange to be here again when the function returns.  Done last, after the
+     * arguments are recorded and while still inside the recursion guard, so a
+     * failure to arrange it changes nothing that has already been observed.
+     *
+     * Deliberately not done for a blocked call: the original never runs, so
+     * there is no return to catch, and the block stub returns through the
+     * caller's own address - which we would have just overwritten.
+     */
+    if (info.CaptureReturn && info.BlockStub == NULL)
+    {
+        (VOID)SvTracePushReturn(HookId, OriginalRsp);
+    }
+
     InterlockedExchange(&g_InRecorder[processor], 0);
 
     /*

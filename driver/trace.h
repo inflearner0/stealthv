@@ -72,6 +72,22 @@ VOID     SvTraceReset(VOID);
 VOID     SvTraceSetConsumed(_In_ UINT64 Sequence);
 
 /*
+ * Where a traced function returns to when its hook asked for the result.  Not
+ * called from C: SvTracePushReturn writes this address over the return address
+ * the caller pushed, so the function's own RET lands here.
+ */
+VOID     AsmTraceReturn(VOID);
+
+/* Called by that stub; returns where the function was really going. */
+UINT64   SvTraceReturnEntry(_In_ UINT64 Rax, _In_ UINT64 Rsp);
+
+/* Calls whose result could not be captured, for lack of a slot or depth. */
+VOID     SvTraceReturnCounters(_Out_ UINT64* Lost);
+
+/* The most recently captured return value, for the self-test. */
+VOID     SvTraceLastReturn(_Out_ UINT64* Value);
+
+/*
  * The arguments of the most recent exec trace, and how many there have been.
  * A drain buffer is far too big to put on a stack, and the self-test only needs
  * to know that the last call was captured correctly.

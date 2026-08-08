@@ -1559,6 +1559,7 @@ VOID SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result)
     request.PrologLength = SVMHV_VICTIM_PROLOG;
     request.Action = SVMHV_ACTION_TRACE;
     request.Kind = SVMHV_HOOK_EXEC;
+    request.CaptureReturn = 1;
 
     if (NT_SUCCESS(SvHookInstall(&request)))
     {
@@ -1571,7 +1572,20 @@ VOID SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result)
                                      0x4444444444444444ULL);
 
         SvTraceLastExec(Result->TracedArguments, &Result->TracedRecords);
+        SvTraceLastReturn(&Result->TracedReturn);
         SvHookRemove(g_ArgVictimPage);
+
+        /*
+         * The victim's result is a known constant, so a captured return that
+         * matches it proves the whole path: the return address was replaced,
+         * the function still computed the right answer with its arguments
+         * undisturbed, and control came back through the stub to the real
+         * caller - which is this function, still running.
+         */
+        if (Result->TracedReturn == SVMHV_ARG_VICTIM_SUM)
+        {
+            Result->Passed |= SVMHV_TEST_RETURN_OK;
+        }
 
         if (Result->ArgVictimResult == SVMHV_ARG_VICTIM_SUM &&
             Result->TracedRecords != 0 &&

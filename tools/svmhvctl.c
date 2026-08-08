@@ -41,7 +41,7 @@
 #define SNAP_HISTOGRAM          656
 #define SNAP_HOOKS              2728
 #define SNAP_SELFTEST           19120
-#define SNAP_SIZE               19288
+#define SNAP_SIZE               19296
 
 #define REQ_TARGET              0
 #define REQ_DETOUR              8
@@ -61,6 +61,7 @@
 #define REQ_SPOOFS              216
 #define REQ_BLOCK               280
 #define REQ_BLOCKVALUE          288
+#define REQ_CAPRETURN           284
 #define REQ_TARGET_PID          132
 #define REQ_SHELLCODE           296
 
@@ -759,6 +760,11 @@ static int ApplyOptions(unsigned char* request, int argc, char** argv, int index
             const unsigned int pid = (unsigned int)strtoul(argv[++index], NULL, 0);
             memcpy(request + REQ_TARGET_PID, &pid, 4);
         }
+        else if (_stricmp(option, "--capture-return") == 0)
+        {
+            const unsigned int on = 1;
+            memcpy(request + REQ_CAPRETURN, &on, 4);
+        }
         else if (_stricmp(option, "--pid") == 0 && index + 1 < argc)
         {
             AddFilter(request, SVMHV_SUBJECT_PID, SVMHV_CMP_EQUAL,
@@ -959,6 +965,7 @@ static void PrintSelfTest(void)
     {
         printf("traced_arg%u=0x%llx\n", i, test.TracedArguments[i]);
     }
+    printf("traced_return=0x%llx\n", (unsigned long long)test.TracedReturn);
     printf("original_bytes=");
     for (i = 0; i < 16; i++) { printf("%02x", test.OriginalBytes[i]); }
     printf("\nhooked_bytes=");
@@ -1096,7 +1103,8 @@ static void Usage(void)
         "                        OP = eq|ne|above|below|bits|range\n"
         "  --capture ARG:TYPE    TYPE = ansi|wide|unicode|objattr|bytes[:LEN]\n"
         "  --spoof ARG:VALUE     replace an argument on the way through\n"
-        "  --block VALUE         do not call the original; return VALUE\n\n"
+        "  --block VALUE         do not call the original; return VALUE\n"
+        "  --capture-return      also record the result and the cycles taken\n\n"
         "Addresses are hex, with or without 0x. <prolog> is how many bytes at\n"
         "the target may be overwritten, rounded UP to an instruction boundary,\n"
         "minimum 14 - get it wrong and you corrupt the function.\n");

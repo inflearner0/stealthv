@@ -217,7 +217,13 @@ typedef struct _SVMHV_HOOK_REQUEST
      * through the caller's own return address.
      */
     UINT32 Block;
-    UINT32 Reserved3;
+
+    /*
+     * Capture the return value as well as the arguments.  Opt-in, because it
+     * is the only thing here that rewrites a return address, and a hook that
+     * does not ask for it cannot be affected by that machinery at all.
+     */
+    UINT32 CaptureReturn;
     UINT64 BlockValue;
 
     UINT8  Shellcode[SVMHV_MAX_SHELLCODE];
@@ -298,6 +304,13 @@ typedef struct _SVMHV_HOOK_LIST
 #define SVMHV_TRACE_WRITE       1
 #define SVMHV_TRACE_ACCESS      2
 
+/*
+ * A traced call coming back.  Arguments[0] is the return value and
+ * Arguments[1] the cycles spent inside the call; the entry record for the same
+ * call is the nearest preceding EXEC record with the same hook and thread.
+ */
+#define SVMHV_TRACE_RETURN      3
+
 typedef struct _SVMHV_TRACE_RECORD
 {
     UINT64 Sequence;
@@ -337,6 +350,7 @@ typedef struct _SVMHV_TRACE_RECORD
 #define SVMHV_TEST_NPT_ACTIVE       0x0100
 #define SVMHV_TEST_ALL_CPUS         0x0200  /* hooked on every processor    */
 #define SVMHV_TEST_TRACE_OK         0x0400  /* trace captured the arguments */
+#define SVMHV_TEST_RETURN_OK        0x0800  /* and the value it returned    */
 
 #define SVMHV_VICTIM_PLAIN          0x11111111u
 #define SVMHV_VICTIM_HOOKED         0x22222222u
@@ -363,7 +377,8 @@ typedef struct _SVMHV_SELFTEST
     UINT64 CpuidCycles;                 /* as a detector would measure it  */
     UINT64 BaselineCycles;
     UINT64 NpfExitsOnThisCpu;
-    UINT64 TracedArguments[4];          /* what the trace hook captured    */
+    UINT64 TracedArguments[4];
+    UINT64 TracedReturn;          /* what the trace hook captured    */
     UINT64 ArgVictimResult;             /* expect SVMHV_ARG_VICTIM_SUM     */
     UINT8  OriginalBytes[16];
     UINT8  BytesWhileHooked[16];        /* must equal OriginalBytes        */
@@ -458,7 +473,7 @@ C_ASSERT(sizeof(SVMHV_STATS)           == 640);
 C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
 C_ASSERT(sizeof(SVMHV_HOOK_LIST)       == 8 + 64 * SVMHV_MAX_HOOK_RECORDS);
-C_ASSERT(sizeof(SVMHV_SELFTEST)        == 168);
+C_ASSERT(sizeof(SVMHV_SELFTEST)        == 176);
 C_ASSERT(sizeof(SVMHV_HOOK_REQUEST)    == 1320 + 24 + SVMHV_MEMORY_MAX);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryAddress) == 1320);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryData)    == 1344);
@@ -467,7 +482,7 @@ C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Stats)     == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram) == 656);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Hooks)     == 2728);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest)  == 2728 + sizeof(SVMHV_HOOK_LIST));
-C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 2728 + sizeof(SVMHV_HOOK_LIST) + 168);
+C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 2728 + sizeof(SVMHV_HOOK_LIST) + sizeof(SVMHV_SELFTEST));
 
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Sequence)             == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Completed)            == 24);
