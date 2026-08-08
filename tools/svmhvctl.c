@@ -30,6 +30,7 @@
 #define HV_TRACE_STATE          7
 #define HV_UNLOAD               8
 #define HV_SIGNATURE            9
+#define HV_TRACE_CONSUMED       10
 
 #define HV_OK                   0
 #define HV_ABSENT               0xFFFFFFFFFFFFFFFFULL   /* VMMCALL raised #UD */
@@ -613,6 +614,13 @@ static void PrintTrace(unsigned int count)
         }
         printf("\n");
     }
+
+    /*
+     * Tell the driver how far we got.  Nothing else moves its consumer index,
+     * and until something does it has to assume every record it overwrites was
+     * lost - which makes the dropped count in "status" meaningless.
+     */
+    (void)Call(HV_TRACE_CONSUMED, produced, 0, NULL);
 }
 
 /* ------------------------------------------------------------------ main */

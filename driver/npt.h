@@ -40,12 +40,17 @@ VOID     SvNptFree(VOID);
 UINT64*  SvNptSplitTo4Kb(_Inout_ NPT_HIERARCHY* Npt, _In_ UINT64 Gpa);
 
 /*
- * Points every page of the range at a shared zero page in both hierarchies,
+ * Points every page of the range at a private zero page in both hierarchies,
  * so a guest reading our VMCBs and host stacks out of physical memory sees
  * nothing.  Only safe for memory the driver itself never touches from guest
- * context.
+ * context.  One backing page each rather than one shared between them: see the
+ * comment on g_HidePool.
  */
 NTSTATUS SvNptHideRange(_In_ PVOID Va, _In_ SIZE_T Size);
+
+/* TRUE if the page belongs to the nested page tables, the split pool or the
+   backing for a hidden page.  Nothing there may be watched. */
+BOOLEAN  SvNptOwnsPage(_In_ PVOID Address);
 
 /*
  * Read back the leaf entry that currently describes Gpa, without changing

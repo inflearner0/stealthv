@@ -96,7 +96,20 @@ typedef struct DECLSPEC_ALIGN(PAGE_SIZE) _VIRTUAL_CPU
     INT64   TscOverhead;            /* mirror of Layout->TscTotal           */
     INT64   TscHidden;              /* mirror of Layout->TscOffset          */
     LONG    FlushGeneration;
+
+    /*
+     * Livelock detection for nested page faults that the handler cannot
+     * explain.  It has to be *consecutive repetitions of the same fault*, not a
+     * running total: an unexplained fault is a normal, survivable event (a
+     * translation cached before a hook was installed), and a lifetime counter
+     * turns sixteen of those spread over a week of uptime into a bugcheck.
+     * A genuine livelock is the same instruction faulting on the same page over
+     * and over, which is what these three fields measure.
+     */
+    UINT64  LastNpfGpa;
+    UINT64  LastNpfRip;
     ULONG   SpuriousNpf;
+
     BOOLEAN PendingFlush;
     BOOLEAN ShadowNptActive;
     PVOID   HostStackBase;
@@ -166,6 +179,14 @@ VOID     SvSignalTlbFlush(VOID);
  * instance - has to use this.  IRQL <= DISPATCH_LEVEL.
  */
 VOID     SvSyncTlbFlush(VOID);
+
+/*
+ * TRUE if the page belongs to this driver - its image and therefore all of its
+ * globals, its per-processor state, its host stacks, or its nested page tables.
+ * A watchpoint on any of it fires from inside the code servicing the
+ * watchpoint; see the refusal in SvHookInstall.
+ */
+BOOLEAN  SvOwnsPage(_In_ PVOID Address);
 
 /*
  * Republished into g_Snapshot by the control worker; see control.c.  Both walk

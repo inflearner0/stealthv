@@ -24,7 +24,15 @@ NTKERNELAPI UCHAR* PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 static SVMHV_TRACE_RECORD* g_Ring;
 static volatile LONG64     g_Produced;      /* monotonic; & MASK gives a slot */
-static UINT64              g_Consumed;      /* drained under g_DrainLock      */
+
+/*
+ * How far a client says it has drained.  Nothing in the driver consumes the
+ * ring - clients read it directly - so this only moves when one tells us it
+ * has, through SVMHV_HV_TRACE_CONSUMED.  Without it the drop counter below
+ * compares the producer against zero and calls every record after the first
+ * ring-full "dropped", whether or not anybody missed it.
+ */
+static volatile LONG64     g_Consumed;
 static volatile LONG64     g_Dropped;
 static volatile LONG64     g_Filtered;
 static KSPIN_LOCK          g_DrainLock;
@@ -108,7 +116,11 @@ static SVMHV_TRACE_RECORD* SvTraceClaim(_Out_ UINT64* Sequence)
 
     sequence = InterlockedIncrement64(&g_Produced) - 1;
 
-    if ((UINT64)sequence >= g_Consumed + TRACE_RING_RECORDS)
+    /*
+     * This slot is about to be reused.  If the client has not said it read the
+     * record that was in it, it never will - the write below is what loses it.
+     */
+    if (sequence >= g_Consumed + TRACE_RING_RECORDS)
     {
         InterlockedIncrement64(&g_Dropped);
     }
@@ -512,6 +524,33 @@ VOID SvTraceDescribeRing(_Out_ UINT64* Ring, _Out_ UINT64* Produced,
     *Produced   = (UINT64)&g_Produced;
     *Records    = TRACE_RING_RECORDS;
     *RecordSize = sizeof(SVMHV_TRACE_RECORD);
+}
+
+/*
+ * A client reporting how far it has drained.  Only ever forwards, and never
+ * past what has actually been produced: a client that claimed the future would
+ * silence the drop counter permanently, which is the one thing this counter
+ * exists to avoid.
+ */
+VOID SvTraceSetConsumed(_In_ UINT64 Sequence)
+{
+    LONG64 wanted = (LONG64)Sequence;
+    LONG64 current;
+
+    if (wanted > g_Produced)
+    {
+        wanted = g_Produced;
+    }
+
+    do
+    {
+        current = g_Consumed;
+        if (wanted <= current)
+        {
+            return;
+        }
+    }
+    while (InterlockedCompareExchange64(&g_Consumed, wanted, current) != current);
 }
 
 VOID SvTraceReset(VOID)

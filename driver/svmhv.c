@@ -66,6 +66,8 @@ C_ASSERT(FIELD_OFFSET(CONTEXT, Xmm0) == 0x1A0);
 
 static VIRTUAL_CPU** g_Cpus;
 static ULONG         g_CpuCount;
+static PVOID         g_ImageBase;         /* our own image, for SvOwnsPage  */
+static ULONG         g_ImageSize;
 static PVOID         g_Msrpm;              /* 8 KiB, MSR permission map    */
 static UINT64        g_MsrpmPa;
 static PVOID         g_Iopm;               /* 12 KiB, zeroed, never used   */
@@ -370,22 +372,31 @@ static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* 
      * VMMCALL from anybody else - a Hyper-V enlightenment, or a probe testing
      * whether the instruction faults - takes the paths below untouched.
      */
-    if (STEALTHV_CONTROL_INTERFACE && Context->Rax == SVMHV_HYPERCALL_MAGIC)
+    if (Context->Rax == SVMHV_HYPERCALL_MAGIC)
     {
-        const BOOLEAN unload = (Context->Rbx == SVMHV_HV_UNLOAD) &&
-                               (Cpu->GuestVmcb.StateSave.Cpl == 0);
-
-        if (unload)
+        /*
+         * The unload doorbell is not part of the control interface, and is
+         * deliberately not compiled out with it: it is how the driver takes
+         * itself back out of SVM, and a build with STEALTHV_CONTROL_INTERFACE
+         * at 0 has to be able to unload and to sleep like any other.  Kernel
+         * mode only - user mode must not be able to unload us.
+         */
+        if (Context->Rbx == SVMHV_HV_UNLOAD && Cpu->GuestVmcb.StateSave.Cpl == 0)
         {
-            /* Kernel mode only - user mode must not be able to unload us. */
             Context->Rax = SVMHV_HV_STATUS_OK;
             SvAdvanceRip(&Cpu->GuestVmcb, 3);
             return TRUE;
         }
 
-        SvHandleControlCall(Context);
-        SvAdvanceRip(&Cpu->GuestVmcb, 3);
-        return FALSE;
+        if (STEALTHV_CONTROL_INTERFACE)
+        {
+            SvHandleControlCall(Context);
+            SvAdvanceRip(&Cpu->GuestVmcb, 3);
+            return FALSE;
+        }
+
+        /* No control interface: fall through, so the magic is as ordinary as
+           any other VMMCALL and answers exactly the same way. */
     }
 
     if (!g_ForwardHypercalls)
@@ -437,7 +448,19 @@ static VOID SvSwitchNpt(_Inout_ VIRTUAL_CPU* Cpu, _In_ BOOLEAN Shadow)
     /* Nested translations are ASID-tagged, so changing NCr3 needs a flush. */
     Cpu->PendingFlush = TRUE;
     Cpu->HookSwitches++;
+}
+
+/*
+ * This fault was accounted for, so whatever the previous one was, it was not
+ * the start of a loop.  Every path that resolves a fault calls this - without
+ * it the counter is a lifetime total and eventually reaches its limit on a
+ * perfectly healthy machine.
+ */
+static VOID SvNpfExplained(_Inout_ VIRTUAL_CPU* Cpu)
+{
     Cpu->SpuriousNpf = 0;
+    Cpu->LastNpfGpa = 0;
+    Cpu->LastNpfRip = 0;
 }
 
 /*
@@ -472,6 +495,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
         if ((info & (NPF_EXECUTE | NPF_WRITE)) != 0)
         {
             SvSwitchNpt(Cpu, FALSE);
+            SvNpfExplained(Cpu);
             return;
         }
         goto unexplained;
@@ -487,6 +511,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
             if ((info & NPF_EXECUTE) != 0)
             {
                 SvSwitchNpt(Cpu, TRUE);
+                SvNpfExplained(Cpu);
                 return;
             }
             break;
@@ -498,6 +523,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
                                 Cpu->Index);
                 SvHookCountHit(page.HookId);
                 SvSwitchNpt(Cpu, TRUE);
+                SvNpfExplained(Cpu);
                 return;
             }
             break;
@@ -509,6 +535,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
                             Cpu->Index);
             SvHookCountHit(page.HookId);
             SvSwitchNpt(Cpu, TRUE);
+            SvNpfExplained(Cpu);
             return;
 
         default:
@@ -531,12 +558,28 @@ unexplained:
      * The mapping is already correct, so flush and retry.  If retrying does not
      * help, the tables really are wrong, and a loop here would hang the machine
      * silently - crash instead.
+     *
+     * "Does not help" means this exact instruction faulting on this exact page
+     * again and again.  Counting unexplained faults over the life of the
+     * processor instead would eventually reach any limit on a machine that is
+     * working perfectly, because a single unexplained fault is a normal outcome
+     * of installing a hook.
      */
-    if (++Cpu->SpuriousNpf > 16)
+    if (gpa == Cpu->LastNpfGpa && rip == Cpu->LastNpfRip)
     {
-        KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x4E504601ULL, info, gpa,
-                     (ULONG_PTR)rip);
+        if (++Cpu->SpuriousNpf > 16)
+        {
+            KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x4E504601ULL, info, gpa,
+                         (ULONG_PTR)rip);
+        }
     }
+    else
+    {
+        Cpu->LastNpfGpa = gpa;
+        Cpu->LastNpfRip = rip;
+        Cpu->SpuriousNpf = 1;
+    }
+
     Cpu->PendingFlush = TRUE;
 }
 
@@ -702,6 +745,15 @@ static VOID SvPrepareVmcb(_Inout_ VIRTUAL_CPU* Cpu, _In_ const CONTEXT* Guest)
     AsmReadGdtr(&gdtr);
     AsmReadIdtr(&idtr);
 
+    /*
+     * Start from nothing.  This runs a second time on every resume from sleep,
+     * and a VMCB that has already been used carries state that must not be
+     * inherited - an EVENTINJ left valid by the last exit would be delivered to
+     * the guest the moment it starts, out of any context that made sense.
+     */
+    RtlZeroMemory(vmcb, sizeof(*vmcb));
+    Cpu->ShadowNptActive = FALSE;
+
     __writemsr(MSR_EFER, __readmsr(MSR_EFER) | EFER_SVME);
     __writemsr(MSR_VM_HSAVE_PA,
                (UINT64)MmGetPhysicalAddress(Cpu->HostStateArea).QuadPart);
@@ -814,14 +866,37 @@ static VOID SvVirtualizeProcessor(_Inout_ VIRTUAL_CPU* Cpu)
     __debugbreak();   /* unreachable */
 }
 
+/*
+ * The per-processor state is sized when the driver loads, so a processor that
+ * comes online afterwards - a hot-added virtual processor, most likely - has no
+ * slot.  It runs unvirtualised, which is a gap; indexing past the end of the
+ * array on its behalf would be a good deal worse than a gap.
+ */
+static VIRTUAL_CPU* SvCurrentCpu(VOID)
+{
+    const ULONG index = KeGetCurrentProcessorIndex();
+
+    return (index < g_CpuCount) ? g_Cpus[index] : NULL;
+}
+
 static VOID SvVirtualizeDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Context,
                             _In_opt_ PVOID SystemArgument1,
                             _In_opt_ PVOID SystemArgument2)
 {
+    VIRTUAL_CPU* cpu = SvCurrentCpu();
+
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(Context);
 
-    SvVirtualizeProcessor(g_Cpus[KeGetCurrentProcessorIndex()]);
+    if (cpu != NULL)
+    {
+        SvVirtualizeProcessor(cpu);
+    }
+    else
+    {
+        DbgPrint("svmhv: processor %lu appeared after load; leaving it alone\n",
+                 KeGetCurrentProcessorIndex());
+    }
 
     KeSignalCallDpcSynchronize(SystemArgument2);
     KeSignalCallDpcDone(SystemArgument1);
@@ -831,12 +906,12 @@ static VOID SvDevirtualizeDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Context,
                               _In_opt_ PVOID SystemArgument1,
                               _In_opt_ PVOID SystemArgument2)
 {
-    VIRTUAL_CPU* cpu = g_Cpus[KeGetCurrentProcessorIndex()];
+    VIRTUAL_CPU* cpu = SvCurrentCpu();
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(Context);
 
-    if (cpu->Virtualized != 0)
+    if (cpu != NULL && cpu->Virtualized != 0)
     {
         /* Traps into the hypervisor, which drops SVM and returns here. */
         if (AsmUnloadCall() == SVMHV_HV_STATUS_OK)
@@ -847,6 +922,192 @@ static VOID SvDevirtualizeDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Context,
 
     KeSignalCallDpcSynchronize(SystemArgument2);
     KeSignalCallDpcDone(SystemArgument1);
+}
+
+/* ------------------------------------------------------- owned memory */
+
+static BOOLEAN SvInRange(_In_ const UINT8* Page, _In_opt_ const VOID* Base,
+                         _In_ SIZE_T Size)
+{
+    const UINT8* base = (const UINT8*)Base;
+
+    return (base != NULL) && (Page >= base) && (Page < base + Size);
+}
+
+/*
+ * Everything this driver would be destroyed by a watchpoint on.  The image
+ * itself covers every global in one comparison - the hook table, the control
+ * block, the snapshot - and the rest is what was allocated at load time.
+ *
+ * The point is not tidiness.  A watch fires twice per store, so watching memory
+ * the driver writes to constantly means the worker's own bookkeeping triggers
+ * it, and by the time that is obvious the guest is too busy to answer the tool
+ * that could take the watch off again.
+ */
+BOOLEAN SvOwnsPage(_In_ PVOID Address)
+{
+    const UINT8* page = (const UINT8*)PAGE_ALIGN(Address);
+    ULONG i;
+
+    if (SvInRange(page, g_ImageBase, g_ImageSize) ||
+        SvInRange(page, g_Msrpm, 2 * PAGE_SIZE) ||
+        SvInRange(page, g_Iopm, 3 * PAGE_SIZE) ||
+        SvInRange(page, g_Cpus, sizeof(VIRTUAL_CPU*) * g_CpuCount))
+    {
+        return TRUE;
+    }
+
+    for (i = 0; g_Cpus != NULL && i < g_CpuCount; i++)
+    {
+        if (g_Cpus[i] == NULL)
+        {
+            continue;
+        }
+        if (SvInRange(page, g_Cpus[i], sizeof(VIRTUAL_CPU)) ||
+            SvInRange(page, g_Cpus[i]->HostStackBase, SVMHV_HOST_STACK_SIZE))
+        {
+            return TRUE;
+        }
+    }
+
+    return SvNptOwnsPage((PVOID)page);
+}
+
+/* ------------------------------------------------------------- power */
+
+/*
+ * Sleep and hibernate are not survivable without this.
+ *
+ * EFER.SVME and VM_HSAVE_PA are architectural processor state, and S3 does not
+ * preserve them - every processor comes back out of firmware with SVM disabled
+ * while its VMCB still says it is running a guest, and the host state the next
+ * #VMEXIT would restore no longer exists.  So leave SVM on the way down and
+ * enter it again on the way back up, which is the same pair of DPCs load and
+ * unload already use.
+ *
+ * The nested page tables, the hooks and their shadow pages are all ordinary
+ * memory and survive untouched; only the processors have to be taken back.
+ */
+static PCALLBACK_OBJECT g_PowerCallback;
+static PVOID            g_PowerRegistration;
+
+static VOID SvResumeVirtualization(VOID)
+{
+    ULONG i;
+
+    for (i = 0; i < g_CpuCount; i++)
+    {
+        VIRTUAL_CPU* cpu = g_Cpus[i];
+
+        /*
+         * Start each processor from a clean slate.  LaunchFailed in particular
+         * is sticky - left set from an earlier failure it would keep this
+         * processor out of guest mode for the rest of the driver's life.
+         */
+        cpu->LaunchFailed     = 0;
+        cpu->ShadowNptActive  = FALSE;
+        cpu->PendingFlush     = FALSE;
+        cpu->SpuriousNpf      = 0;
+        cpu->LastNpfGpa       = 0;
+        cpu->LastNpfRip       = 0;
+    }
+
+    KeGenericCallDpc(SvVirtualizeDpc, NULL);
+
+    for (i = 0; i < g_CpuCount; i++)
+    {
+        if (g_Cpus[i]->Virtualized == 0)
+        {
+            DbgPrint("svmhv: CPU %lu did not re-enter guest mode after resume "
+                     "(exitinfo1 %llx)\n", i, g_Cpus[i]->LaunchExitCode);
+        }
+    }
+}
+
+static VOID SvPowerCallback(_In_opt_ PVOID Context, _In_opt_ PVOID Argument1,
+                            _In_opt_ PVOID Argument2)
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    if ((ULONG_PTR)Argument1 != PO_CB_SYSTEM_STATE_LOCK || g_Cpus == NULL)
+    {
+        return;
+    }
+
+    /* Argument2 is 0 on the way out of S0 and 1 on the way back into it. */
+    if (Argument2 == NULL)
+    {
+        ULONG i;
+
+        DbgPrint("svmhv: leaving S0 - devirtualising\n");
+        KeGenericCallDpc(SvDevirtualizeDpc, NULL);
+
+        /*
+         * Worth saying out loud.  A processor that goes into S3 still in guest
+         * mode comes back with EFER.SVME clear and a VMCB describing a guest
+         * that no longer exists, and whatever it does next will be impossible
+         * to account for unless this line is in the log.
+         */
+        for (i = 0; i < g_CpuCount; i++)
+        {
+            if (g_Cpus[i]->Virtualized != 0)
+            {
+                DbgPrint("svmhv: CPU %lu is still virtualised going into "
+                         "suspend\n", i);
+            }
+        }
+    }
+    else
+    {
+        DbgPrint("svmhv: back in S0 - revirtualising\n");
+        SvResumeVirtualization();
+    }
+}
+
+static NTSTATUS SvPowerRegister(VOID)
+{
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES attributes;
+    NTSTATUS status;
+
+    RtlInitUnicodeString(&name, L"\\Callback\\PowerState");
+    InitializeObjectAttributes(&attributes, &name,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+
+    /* Open the kernel's own callback object; do not create one. */
+    status = ExCreateCallback(&g_PowerCallback, &attributes, FALSE, TRUE);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    g_PowerRegistration = ExRegisterCallback(g_PowerCallback, SvPowerCallback,
+                                             NULL);
+    if (g_PowerRegistration == NULL)
+    {
+        ObDereferenceObject(g_PowerCallback);
+        g_PowerCallback = NULL;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static VOID SvPowerUnregister(VOID)
+{
+    /* Returns only once any callback in flight has finished, so nothing can be
+       inside SvResumeVirtualization once this returns. */
+    if (g_PowerRegistration != NULL)
+    {
+        ExUnregisterCallback(g_PowerRegistration);
+        g_PowerRegistration = NULL;
+    }
+    if (g_PowerCallback != NULL)
+    {
+        ObDereferenceObject(g_PowerCallback);
+        g_PowerCallback = NULL;
+    }
 }
 
 /* ------------------------------------------------------ alloc / free */
@@ -939,6 +1200,10 @@ static NTSTATUS SvAllocateResources(VOID)
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         g_Cpus[i] = cpu;
+
+        /* Our own copy of the processor number: KeGetCurrentProcessorIndex is
+           not worth calling with GIF clear when we already know it. */
+        cpu->Index = i;
 
         /*
          * Contiguous rather than pool, purely for the alignment: the host stack
@@ -1154,9 +1419,16 @@ VOID SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result)
         Result->Passed |= SVMHV_TEST_EFER_HIDDEN;
     }
 
+    /*
+     * These two only mean anything when the driver is built to hide SVM, and it
+     * cannot be while CPUID runs natively.  Reported either way - the values are
+     * worth seeing - but only *asserted* when hiding was actually asked for.
+     * Left unconditional, a correctly built driver reports two failures for
+     * doing exactly what it was told to do.
+     */
     __cpuid(regs, CPUID_EXT_FEATURES);
     Result->CpuidSvmBit = (regs[2] & CPUID_EXT_FEATURE_SVM) ? 1 : 0;
-    if (Result->CpuidSvmBit == 0)
+    if (!STEALTHV_HIDE_SVM_CPUID || Result->CpuidSvmBit == 0)
     {
         Result->Passed |= SVMHV_TEST_SVM_CPUID_HIDDEN;
     }
@@ -1166,7 +1438,7 @@ VOID SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result)
     Result->SvmFeatureLeaf[1] = (UINT32)regs[1];
     Result->SvmFeatureLeaf[2] = (UINT32)regs[2];
     Result->SvmFeatureLeaf[3] = (UINT32)regs[3];
-    if ((regs[0] | regs[1] | regs[2] | regs[3]) == 0)
+    if (!STEALTHV_HIDE_SVM_CPUID || (regs[0] | regs[1] | regs[2] | regs[3]) == 0)
     {
         Result->Passed |= SVMHV_TEST_SVM_LEAF_HIDDEN;
     }
@@ -1382,6 +1654,7 @@ static VOID SvDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     UNREFERENCED_PARAMETER(DriverObject);
 
     SvControlStop();
+    SvPowerUnregister();
 
     if (g_Cpus != NULL)
     {
@@ -1399,8 +1672,19 @@ static VOID SvDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
             hidden += g_Cpus[i]->TscHidden;
             if (g_Cpus[i]->Virtualized != 0)
             {
-                DbgPrint("svmhv: CPU %lu failed to devirtualise - leaking state\n", i);
-                return;   /* never free a VMCB the CPU may still be using */
+                /*
+                 * There is no safe way to continue and no safe way to refuse.
+                 * Returning here leaks the VMCB, which is the easy part - but
+                 * the driver image is unloaded regardless of what this routine
+                 * does, and that processor's host RIP points into it.  It would
+                 * execute freed pages at its very next #VMEXIT.  Stopping here,
+                 * with a dump naming the processor, is the only outcome that
+                 * can be diagnosed afterwards.
+                 */
+                DbgPrint("svmhv: CPU %lu failed to devirtualise\n", i);
+                KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x4445564FULL /* 'DEVO' */,
+                             i, (ULONG_PTR)g_Cpus[i],
+                             (ULONG_PTR)g_Cpus[i]->LaunchExitCode);
             }
         }
         DbgPrint("svmhv: devirtualised, %llu exits (cpuid %llu, msr %llu, "
@@ -1439,6 +1723,11 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     UNREFERENCED_PARAMETER(RegistryPath);
 
     DriverObject->DriverUnload = SvDriverUnload;
+
+    /* Remembered so a watchpoint can be refused on any of our own globals;
+       see SvOwnsPage. */
+    g_ImageBase = DriverObject->DriverStart;
+    g_ImageSize = DriverObject->DriverSize;
 
     DbgPrint("svmhv: loading\n");
 
@@ -1530,6 +1819,17 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     }
 
     DbgPrint("svmhv: %lu processors are now guests\n", g_CpuCount);
+
+    /*
+     * Not fatal if it fails - the driver works, it just will not survive a
+     * suspend - but it is worth saying so loudly rather than finding out.
+     */
+    status = SvPowerRegister();
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint("svmhv: no power-state callback (%08X); suspend will not be "
+                 "survivable\n", status);
+    }
 
     /*
      * Self-test: ask ourselves who we are, over the VMMCALL channel.  A correct

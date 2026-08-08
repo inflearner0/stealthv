@@ -39,17 +39,17 @@ BOOLEAN SvIsHypervisorMemory(_In_ PVOID Address)
     UINT64 records;
     UINT64 recordSize;
 
-    if (page >= (const UINT8*)PAGE_ALIGN(&g_Control) &&
-        page < (const UINT8*)&g_Control + sizeof(g_Control))
-    {
-        return TRUE;
-    }
-    if (page >= (const UINT8*)PAGE_ALIGN(&g_Snapshot) &&
-        page < (const UINT8*)&g_Snapshot + sizeof(g_Snapshot))
+    /*
+     * The image covers g_Control and g_Snapshot along with every other global
+     * this driver has - the hook table above all, which the fault handler reads
+     * on every nested page fault and which used not to be covered here at all.
+     */
+    if (SvOwnsPage(Address))
     {
         return TRUE;
     }
 
+    /* The trace ring is pool, so it is not in any of the ranges above. */
     SvTraceDescribeRing(&ring, &produced, &records, &recordSize);
     if (ring != 0)
     {

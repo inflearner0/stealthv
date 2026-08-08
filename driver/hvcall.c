@@ -133,6 +133,11 @@ VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context)
         break;
     }
 
+    case SVMHV_HV_TRACE_CONSUMED:
+        /* "I have read everything below this sequence." */
+        SvTraceSetConsumed(argument);
+        break;
+
     case SVMHV_HV_TRACE_STATE:
     {
         UINT64 ring;

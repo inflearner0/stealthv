@@ -41,9 +41,24 @@ static UINT8*        g_SplitPool;
 static UINT64        g_SplitPoolPa;
 static volatile LONG g_SplitPoolNext;
 
-/* Every hidden guest physical page is redirected here. */
-static PVOID  g_DummyPage;
-static UINT64 g_DummyPagePa;
+/*
+ * Backing for hidden pages: one private zero page for each page that gets
+ * hidden, bump-allocated from a block reserved at load time.
+ *
+ * One shared page for all of them would be cheaper and was what this did
+ * originally, and it was wrong twice over.  A shared page has to be read-only,
+ * or a guest can write a pattern into one hidden page and read it back out of
+ * another - two supposedly distinct physical pages that mirror each other is a
+ * sharper tell than anything their contents would have given away.  And
+ * read-only means a guest write to a hidden page faults forever: the handler
+ * cannot retire the store without decoding it, the mapping can never satisfy
+ * it, and the retry limit turns that into a bugcheck.  A page each is writable,
+ * so the store lands somewhere harmless and the guest simply carries on.
+ */
+static UINT8*        g_HidePool;
+static UINT64        g_HidePoolPa;
+static ULONG         g_HidePoolPages;
+static volatile LONG g_HidePoolNext;
 
 static ULONG   g_Pml4Entries;       /* PML4 slots covered (512 GiB each)    */
 static BOOLEAN g_Use1GbPages;
@@ -209,8 +224,16 @@ NTSTATUS SvNptInitialize(VOID)
         DbgPrint("svmhv: no 1 GiB pages - identity map limited to 512 GiB\n");
     }
 
-    g_DummyPage = SvNptAllocBlock(1, &g_DummyPagePa);
-    if (g_DummyPage == NULL)
+    /*
+     * What actually gets hidden is the MSRPM, the IOPM and, per processor, two
+     * VMCBs, a host save area and a host stack - nine pages a processor plus
+     * five.  Twelve a processor is that with room to spare, and running out is
+     * not fatal: SvNptHideRange fails and the caller carries on with the page
+     * unhidden and a line in the log.
+     */
+    g_HidePoolPages = 16 + 12 * KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    g_HidePool = (UINT8*)SvNptAllocBlock(g_HidePoolPages, &g_HidePoolPa);
+    if (g_HidePool == NULL)
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -256,7 +279,9 @@ VOID SvNptFree(VOID)
     g_BlockCount = 0;
     g_SplitPool = NULL;
     g_SplitPoolNext = 0;
-    g_DummyPage = NULL;
+    g_HidePool = NULL;
+    g_HidePoolPages = 0;
+    g_HidePoolNext = 0;
 }
 
 UINT64 SvNptCoverage(VOID)
@@ -267,6 +292,30 @@ UINT64 SvNptCoverage(VOID)
 ULONG SvNptSplitPagesUsed(VOID)
 {
     return (ULONG)g_SplitPoolNext;
+}
+
+/*
+ * Is this page one of ours?  Every nested page table, the split pool and the
+ * hidden pages' backing all come out of g_Blocks, so one loop covers them.  A
+ * watchpoint on any of it would fire from inside the fault handler that
+ * services the watchpoint.
+ */
+BOOLEAN SvNptOwnsPage(_In_ PVOID Address)
+{
+    const UINT8* page = (const UINT8*)PAGE_ALIGN(Address);
+    ULONG i;
+
+    for (i = 0; i < g_BlockCount; i++)
+    {
+        const UINT8* base = (const UINT8*)g_Blocks[i].Va;
+
+        if (page >= base && page < base + g_Blocks[i].Size)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 /* --------------------------------------------------------------- split */
@@ -413,6 +462,19 @@ VOID SvNptQuery(_In_ const NPT_HIERARCHY* Npt, _In_ UINT64 Gpa,
 
 /* ---------------------------------------------------------------- hide */
 
+/* A private zero page to point one hidden page at. */
+static UINT64 SvNptHideBacking(VOID)
+{
+    LONG index = InterlockedIncrement(&g_HidePoolNext) - 1;
+
+    if (g_HidePool == NULL || index < 0 || (ULONG)index >= g_HidePoolPages)
+    {
+        return 0;
+    }
+
+    return g_HidePoolPa + (UINT64)index * PAGE_SIZE;
+}
+
 NTSTATUS SvNptHideRange(_In_ PVOID Va, _In_ SIZE_T Size)
 {
     UINT8* page = (UINT8*)Va;
@@ -434,24 +496,26 @@ NTSTATUS SvNptHideRange(_In_ PVOID Va, _In_ SIZE_T Size)
         const UINT64 gpa = (UINT64)MmGetPhysicalAddress(page).QuadPart;
         UINT64* primary = SvNptSplitTo4Kb(&g_NptPrimary, gpa);
         UINT64* shadow  = SvNptSplitTo4Kb(&g_NptShadow, gpa);
-        /*
-         * Read-only, deliberately.  Every hidden page points at the same dummy
-         * page, so leaving it writable let a guest write a pattern into one
-         * hidden page and read it back out of another - two supposedly distinct
-         * physical pages that mirror each other, which is a sharper tell than
-         * anything the contents would have given away.  Writes now fault and are
-         * handled like any other nested page fault.
-         */
-        const UINT64 entry = g_DummyPagePa | NPT_PRESENT |
-                             NPT_USER | NPT_NO_EXECUTE;
+        const UINT64 backing = SvNptHideBacking();
 
-        if (primary == NULL || shadow == NULL)
+        if (primary == NULL || shadow == NULL || backing == 0)
         {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        *primary = entry;
-        *shadow  = entry;
+        /*
+         * Writable, and backed by a page of its own - see g_HidePool.  Every
+         * access a guest can make to a hidden page now completes against zeroes
+         * that belong to nobody else, which is what "there is nothing here"
+         * has to look like.
+         *
+         * Executable in the primary hierarchy for the same reason: a fetch that
+         * faults with nothing able to satisfy it is a livelock.  The shadow
+         * hierarchy keeps NX, because there the invariant that only a hooked
+         * page is executable is what drives the switch back out of it.
+         */
+        *primary = backing | NPT_PRESENT | NPT_WRITE | NPT_USER;
+        *shadow  = backing | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NO_EXECUTE;
     }
 
     return STATUS_SUCCESS;

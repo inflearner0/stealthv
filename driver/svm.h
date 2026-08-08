@@ -93,6 +93,7 @@
 #define SVMHV_HV_TRACE_STATE    7   /* -> produced, records, record size    */
 #define SVMHV_HV_UNLOAD         8   /* CPL 0 only -> devirtualise           */
 #define SVMHV_HV_SIGNATURE      9   /* -> rbx/rdx/rsi = "SVMHV-SIMPLE"      */
+#define SVMHV_HV_TRACE_CONSUMED 10  /* rdx = sequence drained up to         */
 
 #define SVMHV_HV_STATUS_OK          0
 #define SVMHV_HV_STATUS_BADCOMMAND  1

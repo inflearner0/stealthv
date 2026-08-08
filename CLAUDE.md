@@ -35,10 +35,37 @@ every entry then forces the layer above to rebuild its shadow structures. The
 guest stops making progress. It was once tried *as a fix* for the resets and
 made a passing test fail.
 
+## Sleep and resume
+
+`EFER.SVME` and `VM_HSAVE_PA` are architectural processor state and S3 does not
+preserve them: every processor would come back out of firmware with SVM disabled
+while its VMCB still described a running guest. So the driver registers on
+`\Callback\PowerState` and devirtualises every processor on the way out of S0,
+then enters guest mode again on the way back in — the same two DPCs load and
+unload already use. The nested page tables, the hooks and their shadow pages are
+ordinary memory and survive untouched; only the processors have to be retaken.
+
+`SvPrepareVmcb` therefore has to be idempotent, which is why it zeroes the VMCB
+before filling it. Running it a second time over a VMCB that has already been
+used would otherwise inherit an `EVENTINJ` left valid by the last exit and
+deliver it to the guest the moment it starts, out of any context that made
+sense.
+
+**This path is not tested.** A Hyper-V guest does not do S3, so nothing in this
+lab can exercise it; it is written from the architecture and reviewed, not
+observed. If you get this onto bare metal, that is the first thing to try.
+
 ## Known open items
 
 - Long-duration stability under concurrent load is unverified; `soak.ps1` has
   not been re-run since the CPUID interception was removed.
+- The resume-from-sleep path has never run; see above.
+- A processor that comes online *after* load has no per-processor slot and stays
+  unvirtualised. It is no longer an out-of-bounds array index, but it is still a
+  gap: closing it means `KeRegisterProcessorChangeCallback`.
+- The control channel answers at CPL 3. That is deliberate — `svmhvctl.exe` is a
+  user-mode binary — but it means the magic constant compiled into the driver is
+  a ring-0 execution primitive for anything that knows it.
 - Duplicate hook records can exist for the same GPA when the kind differs: only
   *active* hooks are checked for GPA collision, so a watch and a retired exec
   record can share PTE pointers.
@@ -182,11 +209,21 @@ processor reaches a VMCB by physical address, and the host stacks are only ever
 touched with SVM's host state loaded, so none of it is affected — but a guest
 reading physical memory now finds nothing there.
 
-That mapping is **read-only**, and the reason is worth recording. It used to be
-writable, and because every hidden page points at the *same* dummy page, a guest
-could write a pattern into one hidden page and read it back out of another. Two
-supposedly distinct physical pages that mirror each other is a sharper tell than
-anything their contents would have given away.
+Each hidden page gets a **backing page of its own**, and is mapped writable.
+Both halves of that matter, and each was got wrong once.
+
+One *shared* dummy page for all of them is the obvious implementation, and it
+leaks: a guest can write a pattern into one hidden page and read it back out of
+another, and two supposedly distinct physical pages that mirror each other is a
+sharper tell than anything their contents would have given away.
+
+Making that shared page **read-only** fixes the mirror and introduces a
+bugcheck. A guest write to a hidden page then faults, the handler cannot retire
+the store without decoding it, and no mapping it can install will ever satisfy
+the retry — so the instruction faults forever and the loop detector eventually
+crashes the machine. A page each, writable, has neither problem: the store lands
+on zeroes belonging to nobody else and the guest carries on. It costs one page
+per hidden page, about 300 KiB on eight processors.
 
 Not hidden: the nested page tables themselves and the hooks' shadow pages. Both
 are edited from guest context, so hiding them would mean the driver writing to

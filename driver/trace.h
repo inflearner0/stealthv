@@ -64,6 +64,14 @@ VOID     SvTraceDescribeRing(_Out_ UINT64* Ring, _Out_ UINT64* Produced,
 VOID     SvTraceReset(VOID);
 
 /*
+ * A client publishing how far it has drained the ring.  Nothing else moves the
+ * consumer index - clients read the ring directly - so without this the driver
+ * cannot tell a record that was overwritten unread from one that was read the
+ * instant it appeared, and the drop counter says everything was lost.
+ */
+VOID     SvTraceSetConsumed(_In_ UINT64 Sequence);
+
+/*
  * The arguments of the most recent exec trace, and how many there have been.
  * A drain buffer is far too big to put on a stack, and the self-test only needs
  * to know that the last call was captured correctly.
