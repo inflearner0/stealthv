@@ -13,11 +13,11 @@ here, it is the design — the same trick applied in four places.
 [![release](https://img.shields.io/github/v/release/inflearner0/stealthv?include_prereleases)](https://github.com/inflearner0/stealthv/releases)
 [![license](https://img.shields.io/github/license/inflearner0/stealthv)](LICENSE)
 
-A **blue pill hypervisor** / **hyperjacking** research tool: an AMD SVM type-2
-hypervisor that virtualises the running Windows kernel, installs **EPT-style
+A **blue pill** / **hyperjacking** research tool: a kernel driver that puts the
+**already running** Windows kernel into an SVM guest, installs **EPT-style
 hypervisor hooks** through **nested page tables (NPT)**, and studies **hypervisor
-detection** from inside the guest. Comparable in spirit to Intel VT-x/EPT
-projects, on the AMD side.
+detection** from inside the guest. The AMD counterpart to the Intel VT-x/EPT
+projects.
 
 > **A lab instrument.** This is a type-2 hypervisor that hides itself from the
 > guest, installs invisible kernel hooks, and runs caller-supplied shellcode in
@@ -26,22 +26,13 @@ projects, on the AMD side.
 > machines you own, on an isolated network, and read the *What is and is not
 > tested* section before trusting it with anything.
 
-
-A "blue pill": a kernel driver that puts the **already running** Windows kernel
-into an SVM guest. Every logical processor captures its own state, executes
-`VMRUN`, and carries on running the exact instruction it was about to run — one
-privilege level further down.
-
-The guest runs under **nested page tables** that map every guest physical page to
-itself. The point of an identity map is not isolation — it is control over
-permissions. A page can be non-executable in one hierarchy and
-executable-but-substituted in another, and that is enough to hold a code hook
-that nothing can find by reading memory.
-
-The other half of the driver is about not being noticed. SVM is erased from
-the guest's view of `EFER`, every SVM instruction faults exactly as it would on
-a machine without SVM, and the driver's own pages read as zeroes. `CPUID` is
-left unintercepted, so timing it proves nothing.
+Every logical processor captures its own state, executes `VMRUN`, and carries on
+running the exact instruction it was about to run — one privilege level further
+down. The guest runs under nested page tables that map every guest physical page
+to itself: the point of an identity map is not isolation but control over
+permissions, and a page that is non-executable in one hierarchy and
+executable-but-substituted in another is enough to hold a code hook nothing can
+find by reading memory.
 
 | Intercept | Why |
 |---|---|
@@ -97,9 +88,11 @@ not, so the worker republishes every counter, the hook table and the last
 self-test into `g_Snapshot`, and a client just reads it. A kernel debugger can do
 all of that with `eq` and `dq`.
 
-`mcp\svmhv_mcp.py` is an MCP server that does exactly this over KDNET. See
-`mcp\README.md`. The cost of having no user-mode surface is that every call
-briefly halts the guest, so the server keeps its debugger sessions short.
+Two clients ship with it. `svmhvctl.exe` is a ring-3 tool that talks over the
+`VMMCALL` channel directly. `mcp/svmhv_agent.py` is an MCP server that runs
+**inside the guest** and drives `svmhvctl` over HTTP, so an assistant on another
+machine can install hooks and read traces without a debugger attached. See
+`mcp/README.md`.
 
 ## Hooks, traces and watchpoints
 
@@ -154,11 +147,9 @@ detour can always call through to the real thing.
 ### Watchpoints will starve the guest if you point them at the wrong page
 
 A write watch fires **twice per store** — once to reach the permissive view, once
-to leave it. On a page written in bulk that is thousands of exits a second. During
-development a write watch was put on the driver's own snapshot page, which the
-worker rewrites ten times a second; it produced 53000 events in eight seconds,
-starved the guest until KDNET stopped answering, and since the debugger is the
-only way to remove a watch, the VM had to be power-cycled.
+to leave it. On a page written in bulk that is thousands of exits a second. A
+watch put on the driver's own snapshot page during development produced 53 000
+events in eight seconds and starved the guest badly enough to cost the VM.
 
 Two guards exist because of that, and neither makes it a good idea:
 
@@ -191,41 +182,15 @@ to change any of this is to rebuild.
 | `STEALTHV_ALWAYS_FLUSH_TLB` | 0 | flush the ASID every entry — **leave this off** |
 | `STEALTHV_CONTROL_INTERFACE` | 1 | answer the control leaf and run its worker |
 
-Everything defaults to the most concealed setting it can. Two of them are worth
-understanding before you change anything.
+Everything defaults to the most concealed setting it can. Two are worth knowing
+about before you change them: `STEALTHV_HIDE_EFER` costs about 200 000 exits per
+second under a parent hypervisor (Hyper-V's synthetic MSRs sit outside every
+MSRPM range), and `STEALTHV_CONTROL_INTERFACE 0` removes the interface entirely
+— nothing to open, no worker thread — at the cost of `svmhvctl` and the MCP
+server. The reasoning for both is in [CLAUDE.md](CLAUDE.md).
 
-**`STEALTHV_HIDE_EFER` is on, and it is not free.** The MSRPM describes only
-three MSR ranges, and anything outside them exits *unconditionally* once the MSR
-intercept is set. On bare metal every MSR Windows touches often is inside one of
-those ranges, so intercepting costs almost nothing. Under a parent hypervisor it
-is a different story: Hyper-V's synthetic MSRs live at `0x4000_00xx`, outside all
-three, and an APIC-enlightened guest writes `HV_X64_MSR_EOI` on every interrupt —
-about **200 000 exits per second**, measured in this lab.
-
-It is on anyway. A bit that says "a hypervisor is installed" is worth more to
-somebody looking for you than the cycles are to you, and this used to default off
-under a parent hypervisor precisely because the cost is visible — which meant the
-stealthiest configuration was the one nobody was running. If you are nested and
-want the throughput back, set it to 0 and accept that a ring-0 `RDMSR` can see
-`SVME`. The driver logs a line at load when it is hiding EFER under a parent
-hypervisor, so the cost is never a mystery later.
-
-**`STEALTHV_CONTROL_INTERFACE` is the last knob between instrumentable and
-absent.** With it at 1 there is still no device object, no symbolic link and no
-dispatch routine — nothing reachable from user mode without the key, and the
-control leaf passes straight through to the hardware for anyone who does not have
-it. What it does cost is a system thread that wakes ten times a second, which a
-scan of system threads can see, and a `VMMCALL` that answers the magic.
-
-Set it to 0 and the driver has no interface of any kind: nothing to open, nothing
-to call, no thread waking up to look at a doorbell. `svmhvctl.exe` and the MCP
-server stop working, because there is nothing left to talk to. That is the
-trade — full concealment or a tool you can drive, and you cannot have both.
-
-Two capability checks **refuse to load** rather than quietly downgrading: a
-processor without nested paging, and a host with `EFER.NXE` clear. Both used to
-disable hooks and carry on, which meant a build that asked for concealment could
-end up running with the hooks and the page hiding silently absent.
+A processor without nested paging, or a host with `EFER.NXE` clear, now **refuses
+to load** rather than quietly running with the hooks and page hiding absent.
 
 ## What is and is not tested
 
@@ -244,87 +209,22 @@ Hyper-V), twice per run with zero failures:
 [pass] unhook restored it
 ```
 
-plus the timing table above, a clean unload that restores the guest's view of
-SVM exactly, and the hypervisor's own pages reading as zeroes from inside the
-guest. The nested page tables are demonstrably live: hardware sets the accessed
-bit in the PML4, and a `#NPF` count of exactly 4 per hooked call matches the four
-transitions the design predicts.
+plus a clean unload that restores the guest's view of SVM exactly, and the
+hypervisor's own pages reading as zeroes from inside the guest. `CPUID` measures
+2376 cycles against a 2376-cycle native baseline.
 
-**The guest used to reset a few minutes after load. That is fixed.** For a long
-time this was described as the guest "hanging" or "wedging", and it was not: it
-was a hard reset, and the instrumentation hid it. `Get-VM Uptime` keeps counting
-straight across the reset, `Heartbeat` reads OK again as soon as the guest is
-back up, and PowerShell Direct "recovering" is just the machine having rebooted.
-Compare `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime` before and
-after; nothing else here can be trusted.
+**The guest used to reset a few minutes after load. That is fixed.** It was
+described for a long time as a hang, and it was not — it was a hard reset, and
+`Uptime`, `Heartbeat` and PowerShell Direct all disguised it. The cause was the
+TSC compensation that intercepting `CPUID` made necessary; not intercepting it
+removed both. Verified with every option enabled: 200 s and 220 s with an
+unchanged boot time, service RUNNING, `hvtest` at `RESULT: OK`, and
+`cpuid_exits=0` across 461 123 exits.
 
-The cause was the TSC compensation described above, and removing the `CPUID`
-intercept removed it. Bisected by rebuilding one constant at a time with a
-200-second observation each, which cleared `STEALTHV_CONTROL_INTERFACE`,
-`STEALTHV_HIDE_EFER` and `STEALTHV_HIDE_PAGES` in turn before
-`STEALTHV_TSC_OFFSET` gave the first clean pass.
-
-Verified with every option enabled: 200 seconds and then 220 seconds with an
-unchanged boot time, the service still RUNNING, `hvtest` at `RESULT: OK`, the
-control channel answering from ring 3, and `cpuid_exits=0` across 461 123 exits.
-
-The negative evidence from before the fix still holds and is worth keeping,
-because it is what identified the failure as a triple fault rather than a
-bugcheck: `nt!KiBugCheckData` was zero on every inspection, there is not a single
-event 1001 in the guest's log, and no crash dump was ever written.
-
-**Long-duration stability under concurrent load is still not verified.** The
-soak in `soak.ps1` has not been re-run since the fix. Minutes of idle stability
-is not hours of load.
-
-Part of what went wrong is the guest, and it has to be dealt with first or it
-hides everything else. Windows Defender scanning the soak's own scratch files,
-together with memory compression on a 6 GiB VM, jams an NTFS `ERESOURCE` for
-minutes at a time; the debugger prints `Possible deadlock` and `!locks` shows a
-System worker thread holding it with an IRP outstanding. That reproduces with
-this driver **not loaded**, and `Stop-VM` times out in it too. Exclude the
-scratch directory from Defender before attempting a soak — with that done, an
-iteration that had been taking many seconds takes 370–570 ms.
-
-With Defender out of the way the remaining behaviour is sharp: the soak gets a
-few iterations in, with **zero failures** in everything it did manage
-(30 process creations, 9 file round-trips, 3 hypervisor probes and 3 hook
-install/remove cycles), and then stops making progress. Three configurations,
-each cut short by a power-off and read back from the write-through log:
-
-| configuration | progress before it stopped |
-|---|---|
-| nested paging on, demand flush (shipped) | 3 iterations in ~3 s, 0 failures |
-| nested paging **off**, demand flush | 1 iteration |
-| nested paging on, **always** flush | 0 iterations — and the functional test wedges too |
-
-Two things follow. It is not the nested paging or the hooks: it happens with both
-switched off, which is what took them off the suspect list. And the ordering is
-the wrong way round for a deadlock in new code — the *slower* configuration
-wedges *sooner*, which is the signature of the guest being unable to keep up
-rather than of a lock cycle. That is plausible on the numbers, since a nested exit
-here costs 6 000–19 000 cycles and Windows makes hypercalls continuously while
-creating processes, but plausible is not measured, and no bugcheck or dump was
-ever produced to settle it.
-
-The third row is also the reason `STEALTHV_ALWAYS_FLUSH_TLB` defaults to 0. That went the
-opposite way to the guess: flush-every-entry was the historically safe setting,
-so it was tried as a fix, and it made a passing test fail.
-
-One caution about instrumentation: `Get-VM ... Uptime` looked like it was showing
-spontaneous VM resets during these runs. It was not trustworthy — it is reported
-through the integration services, and those are exactly what gets starved here.
-The event log and `KiBugCheckData` are the only evidence worth believing, and
-neither shows a crash.
-
-So the honest summary is that the hypervisor has not been observed to crash or
-corrupt anything, every functional and concealment check passes repeatedly, and
-it has *not* been shown to survive a sustained multi-vCPU load. That is the gap
-to close next. The way to close it is to stop inferring the failure from the
-outside: give the guest more than 6 GiB so memory compression is not competing,
-attach a kernel debugger and leave it attached without ever breaking in, and
-watch which processor stops making progress — `!running -it` while the soak is
-wedged answers in one command what a day of power-cycling does not.
+**Long-duration stability under concurrent load is still not verified.**
+`soak.ps1` has not been re-run since the fix. Minutes of idle stability is not
+hours of load. If you are chasing a stability problem here, read the ground
+rules in [CLAUDE.md](CLAUDE.md) first — most of the obvious instruments lie.
 
 ## Limitations
 
@@ -379,26 +279,14 @@ bin/        build output, not in source control
 ## Continuous integration
 
 `ci.yml` runs on every push and pull request: it installs the WDK, builds the
-driver and both tools with `/WX`, and runs the agent's test suite. That is a
-narrower promise than it looks, and worth being precise about — no hosted runner
-has an AMD processor with SVM and a VM to be a guest, so **CI never executes the
-hypervisor**. What it does catch is the two things most likely to break
-silently:
+driver and both tools with `/WX`, and runs `mcp/test_agent.py`.
 
-- a compile error or any warning, since `/WX` is on for the driver and
-  `svmhvctl`;
-- the `C_ASSERT`s in `include/svmhvctl.h`, which fail the build if a structure
-  the driver and its clients share ever drifts apart. Those offsets are
-  hardcoded in `tools/svmhvctl.c`, so this is the guardrail that keeps the two
-  sides honest — it already caught the trace record growing from 152 to 432
-  bytes.
-
-`mcp/test_agent.py` covers the rest of the client: the JSON-RPC handshake, the
-tool schemas, the option builder, the parsers and the capture decoder, all with
-`svmhvctl` stubbed out. Run it anywhere with `python mcp/test_agent.py`.
-
-Anything that needs the hypervisor actually running still has to be run by hand
-in a VM — see `scripts\runtests.ps1`.
+No hosted runner has an AMD processor with SVM, so **CI never executes the
+hypervisor**. What it does catch is a warning, and the `C_ASSERT`s in
+`include/svmhvctl.h` that fail the build if a structure the driver and its
+clients share ever drifts apart — that one already caught the trace record
+growing from 152 to 432 bytes. Anything needing the hypervisor actually running
+has to be run by hand in a VM; see `scriptsuntests.ps1`.
 
 ## How it works, in depth
 
