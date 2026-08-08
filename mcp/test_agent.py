@@ -123,6 +123,16 @@ check("hexarg strips 0x", agent.hexarg("0xFFFF") == "ffff")
 # ------------------------------------------------------- tools end to end
 
 print("tools, with svmhvctl stubbed")
+def hexdump(address, raw):
+    """svmhvctl's dump format, which the agent parses back into bytes."""
+    out = [f"bytes={len(raw)}"]
+    for offset in range(0, len(raw), 16):
+        chunk = raw[offset:offset + 16]
+        out.append(f"{address + offset:016x}  "
+                   + " ".join(f"{b:02x}" for b in chunk))
+    return "\n".join(out) + "\n"
+
+
 calls = []
 
 
@@ -140,6 +150,35 @@ def fake_ctl(*arguments):
     if arguments[0] == "hooks":
         return "hooks=1\nhook id=0 active=1 kind=0 action=0 target=0xffff1000 " \
                "gpa=0x1000 detour=0x0 trampoline=0x0 prolog=14 hits=5 filters=0\n"
+    if arguments[0] == "driverobj":
+        if arguments[1] == "onedispatch":
+            return "status=0x00000000\ndriver_object=0xffffab0000003000\n"
+        return "status=0x00000000\ndriver_object=0xffffab0000001000\n"
+    if arguments[0] == "read" and arguments[1] == "ffffab0000003000":
+        # Every slot pointing at one function inside the image, which is what
+        # partmgr does and what the majority rule used to mistake for "unset".
+        raw = bytearray(0x150)
+        raw[0x18:0x20] = (0xfffff80000010000).to_bytes(8, "little")
+        raw[0x20:0x24] = (0x30000).to_bytes(4, "little")
+        for slot in range(28):
+            raw[0x70 + slot * 8:0x78 + slot * 8] = \
+                (0xfffff80000011f00).to_bytes(8, "little")
+        return "status=0x00000000\n" + hexdump(0xffffab0000003000, bytes(raw))
+    if arguments[0] == "read" and arguments[1] == "ffffab0000001000":
+        # A DRIVER_OBJECT with one dispatch slot set: IRP_MJ_DEVICE_CONTROL is
+        # index 14, so its handler lands at 0x70 + 14 * 8.
+        raw = bytearray(0x150)
+        raw[0x70 + 14 * 8:0x70 + 14 * 8 + 8] = (0xffffab0000002000).to_bytes(8, "little")
+        return "status=0x00000000\n" + hexdump(0xffffab0000001000, bytes(raw))
+    if arguments[0] == "read" and arguments[1] == "ffffab0000002000":
+        # cmp eax, 0x222400 - FILE_DEVICE_UNKNOWN with a function in the vendor
+        # range, which is what a driver defining its own codes writes - then a
+        # constant that is not shaped like one, and an NTSTATUS, which decodes
+        # as a plausible control code and must not be reported as one.
+        code = bytes.fromhex("3d00242200") + bytes.fromhex("7402") \
+             + bytes.fromhex("3d34120000") \
+             + bytes.fromhex("3d050000c0") + b"\xc3"
+        return "status=0x00000000\n" + hexdump(0xffffab0000002000, code)
     if arguments[0] in ("read", "readphys"):
         # The hook tools decode this as a prologue, so it has to be
         # instructions - an MZ header is not, and a strict decoder is right to
@@ -533,6 +572,48 @@ check("a physical write reports what it wrote",
       "wrote 4 of 4 bytes at guest physical" in text, text)
 check("a physical write takes no pid",
       calls[-1] == ("writephys", "1000", "deadbeef"), calls[-1])
+
+text = rpc("tools/call", {"name": "svmhv_driver", "arguments": {
+    "name": "onedispatch"}})["result"]["content"][0]["text"]
+check("one dispatcher for every slot is not mistaken for an empty table",
+      "every slot ->" in text and "0xfffff80000011f00" in text, text)
+check("a single dispatcher is still offered as a hook target",
+      "svmhv_hook_trace" in text, text)
+
+length, text, _ = agent.disassemble_one(bytes.fromhex("3d0824409c"), 0, 0x1000)
+check("a 32-bit immediate is not rendered as a negative number",
+      text == "cmp eax, 0x9c402408", text)
+length, text, _ = agent.disassemble_one(bytes.fromhex("4883f8ff"), 0, 0x1000)
+check("an imm8 still reads as the small negative it is",
+      text in ("cmp rax, -0x1", "cmp rax, -1"), text)   # capstone drops the 0x
+
+text = rpc("tools/call", {"name": "svmhv_ioctl", "arguments": {
+    "code": "0x22e004"}})["result"]["content"][0]["text"]
+check("an ioctl decodes to its device type", "UNKNOWN" in text, text)
+check("an ioctl decodes to its method", "METHOD_BUFFERED" in text or
+      "method        : BUFFERED" in text, text)
+
+text = rpc("tools/call", {"name": "svmhv_ioctl", "arguments": {
+    "code": "0x22e003"}})["result"]["content"][0]["text"]
+check("METHOD_NEITHER is called out as the dangerous one",
+      "METHOD_NEITHER" in text and "probe them itself" in text, text)
+
+text = rpc("tools/call", {"name": "svmhv_ioctl", "arguments": {
+    "code": "not a number"}})["result"]["content"][0]["text"]
+check("a bad ioctl code is refused", "is not a number" in text, text)
+
+text = rpc("tools/call", {"name": "svmhv_ioctls", "arguments": {
+    "name": "victim"}})["result"]["content"][0]["text"]
+check("ioctls finds the code the dispatcher compares against",
+      "0x00222400" in text, text)
+check("ioctls does not report a constant that is not shaped like one",
+      "0x00001234" not in text, text)
+check("ioctls does not mistake an NTSTATUS for a control code",
+      "0xc0000005" not in text, text)
+check("ioctls says which dispatch slot it read",
+      "IRP_MJ_DEVICE_CONTROL" in text, text)
+check("ioctls reports an unhandled slot as unhandled",
+      "IRP_MJ_INTERNAL_DEVICE_CONTROL: not handled" in text, text)
 
 text = rpc("tools/call", {"name": "svmhv_devices", "arguments": {
     "name": "null"}})["result"]["content"][0]["text"]

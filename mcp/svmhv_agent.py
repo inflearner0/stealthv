@@ -982,6 +982,21 @@ def _hex(value: int) -> str:
     return f"-0x{-value:x}" if value < 0 else f"0x{value:x}"
 
 
+def _immediate(raw: int, width: int, operand_size: int) -> int:
+    """An immediate, signed only where the processor sign-extends it.
+
+    An imm8 is sign-extended to the operand size and reads correctly as a small
+    negative number; an imm32 against a 64-bit operand is too. An imm32 against
+    a 32-bit register is neither - it is the bit pattern, and rendering it
+    signed is actively misleading: a vendor IOCTL with its top bit set, which
+    is most of them, comes out as 'cmp eax, -0x63bfdbf8' and matches nothing
+    anybody would search for.
+    """
+    if width == 1 or operand_size == 8:
+        return _signed(raw, width)
+    return raw
+
+
 class _Operand:
     """One decoded ModRM, rendered lazily so RIP-relative can use the address."""
 
@@ -1168,7 +1183,8 @@ def _disassemble_builtin(code: bytes, at: int, address: int) -> tuple[int, str, 
                     else f"{name} {register}, {operand.text}")
         else:
             width = 1 if low == 4 else min(size, 4)
-            value = _signed(int.from_bytes(code[i:i + width], "little"), width)
+            value = _immediate(int.from_bytes(code[i:i + width], "little"),
+                               width, size)
             i += width
             text = f"{name} {_register(0, 1 if low == 4 else size)}, {_hex(value)}"
     elif 0x50 <= opcode <= 0x57:
@@ -1183,7 +1199,8 @@ def _disassemble_builtin(code: bytes, at: int, address: int) -> tuple[int, str, 
         operand_size = 1 if opcode == 0x80 else size
         operand, reg, i = modrm(operand_size)
         width = 1 if opcode in (0x80, 0x83) else min(size, 4)
-        value = _signed(int.from_bytes(code[i:i + width], "little"), width)
+        value = _immediate(int.from_bytes(code[i:i + width], "little"), width,
+                           operand_size)
         i += width
         text = f"{ARITH[reg & 7]} {operand.text}, {_hex(value)}"
     elif opcode in (0x84, 0x85):
@@ -3287,6 +3304,266 @@ def tool_disassemble(target: str, count: int = 24, pid: int = 0) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------------- ioctls
+
+# The device types that appear in a control code. Only the named ones matter:
+# a code whose type is not in here and is below 0x8000 is almost certainly not
+# a control code at all, which is what makes the scan below usable.
+DEVICE_TYPES = {
+    0x01: "BEEP", 0x02: "CD_ROM", 0x03: "CD_ROM_FILE_SYSTEM", 0x04: "CONTROLLER",
+    0x05: "DATALINK", 0x06: "DFS", 0x07: "DISK", 0x08: "DISK_FILE_SYSTEM",
+    0x09: "FILE_SYSTEM", 0x0A: "INPORT_PORT", 0x0B: "KEYBOARD", 0x0C: "MAILSLOT",
+    0x0D: "MIDI_IN", 0x0E: "MIDI_OUT", 0x0F: "MOUSE",
+    0x10: "MULTI_UNC_PROVIDER", 0x11: "NAMED_PIPE", 0x12: "NETWORK",
+    0x13: "NETWORK_BROWSER", 0x14: "NETWORK_FILE_SYSTEM", 0x15: "NULL",
+    0x16: "PARALLEL_PORT", 0x17: "PHYSICAL_NETCARD", 0x18: "PRINTER",
+    0x19: "SCANNER", 0x1A: "SERIAL_MOUSE_PORT", 0x1B: "SERIAL_PORT",
+    0x1C: "SCREEN", 0x1D: "SOUND", 0x1E: "STREAMS", 0x1F: "TAPE",
+    0x20: "TAPE_FILE_SYSTEM", 0x21: "TRANSPORT", 0x22: "UNKNOWN",
+    0x23: "VIDEO", 0x24: "VIRTUAL_DISK", 0x25: "WAVE_IN", 0x26: "WAVE_OUT",
+    0x27: "8042_PORT", 0x28: "NETWORK_REDIRECTOR", 0x29: "BATTERY",
+    0x2A: "BUS_EXTENDER", 0x2B: "MODEM", 0x2C: "VDM", 0x2D: "MASS_STORAGE",
+    0x2E: "SMB", 0x2F: "KS", 0x30: "CHANGER", 0x31: "SMARTCARD",
+    0x32: "ACPI", 0x33: "DVD", 0x34: "FULLSCREEN_VIDEO", 0x35: "DFS_FILE_SYSTEM",
+    0x36: "DFS_VOLUME", 0x37: "SERENUM", 0x38: "TERMSRV", 0x39: "KSEC",
+    0x3A: "FIPS", 0x3B: "INFINIBAND", 0x3E: "VMBUS", 0x3F: "CRYPT_PROVIDER",
+    0x40: "WPD", 0x41: "BLUETOOTH", 0x42: "MT_COMPOSITE", 0x43: "MT_TRANSPORT",
+    0x44: "BIOMETRIC", 0x45: "PMI", 0x46: "EHSTOR", 0x47: "DEVAPI",
+    0x48: "GPIO", 0x49: "USBEX", 0x50: "CONSOLE", 0x51: "NFP", 0x52: "SYSENV",
+    0x53: "VIRTUAL_BLOCK", 0x54: "POINT_OF_SERVICE", 0x55: "STORAGE_REPLICATION",
+    0x56: "TRUST_ENV", 0x57: "UCM", 0x58: "UCMTCPCI", 0x59: "PERSISTENT_MEMORY",
+    0x5A: "NVDIMM", 0x5B: "HOLOGRAPHIC", 0x5C: "SDFXHCI", 0x5D: "UCMUCSI",
+}
+
+METHODS = ["BUFFERED", "IN_DIRECT", "OUT_DIRECT", "NEITHER"]
+ACCESSES = ["FILE_ANY_ACCESS", "FILE_READ_ACCESS", "FILE_WRITE_ACCESS",
+            "FILE_READ_ACCESS | FILE_WRITE_ACCESS"]
+
+
+def decode_ioctl(code: int) -> dict:
+    """CTL_CODE, taken apart. Every field is fixed by the macro, not by taste."""
+    device = (code >> 16) & 0xFFFF
+    access = (code >> 14) & 0x3
+    function = (code >> 2) & 0xFFF
+    method = code & 0x3
+    return {
+        "code": code,
+        "device": device,
+        "device_name": DEVICE_TYPES.get(device,
+                                        "vendor-defined" if device >= 0x8000
+                                        else "unrecognised"),
+        "access": access,
+        "function": function,
+        "method": method,
+        # 0x800 and up is the range Microsoft reserves for third parties, so a
+        # function number in it is a strong sign this driver defined the code
+        # itself rather than implementing somebody else's interface.
+        "custom": function >= 0x800 or device >= 0x8000,
+    }
+
+
+def plausible_ioctl(code: int) -> bool:
+    """Is this 32-bit constant shaped like a control code?
+
+    The scan below sees every immediate in a dispatcher, most of which are
+    lengths, structure offsets and status values. The device type is what
+    carries the discrimination, and it has to be a type that exists.
+
+    Device types of 0x8000 and up are reserved for vendors and would be worth
+    accepting on the documentation - except that accepting them also accepts
+    every NTSTATUS in the function, and a dispatcher is full of them.
+    0xc0000005 decoded as a control code looked entirely convincing in the
+    first version of this and is STATUS_ACCESS_VIOLATION. Drivers defining
+    their own codes overwhelmingly use FILE_DEVICE_UNKNOWN with a function in
+    the vendor range, which this still finds.
+    """
+    if not 0 < code <= 0xFFFFFFFF:
+        return False
+    device = (code >> 16) & 0xFFFF
+    function = (code >> 2) & 0xFFF
+    if function == 0:
+        return False
+    return device in DEVICE_TYPES
+
+
+# cmp/sub against a 32-bit register: eax, r10d, and the memory forms a
+# dispatcher uses when it has spilled the code. "dword ptr [...]" counts, since
+# comparing a dword in memory against a constant is the same statement.
+IOCTL_COMPARE = re.compile(
+    r"\A(?:cmp|sub) (?:e[a-z]{2}|r\d+d|dword ptr \[[^]]*\]), (0x[0-9a-f]+)\Z")
+
+
+def format_ioctl(code: int) -> str:
+    parts = decode_ioctl(code)
+    return (f"{code:#010x}  device {parts['device']:#06x} "
+            f"({parts['device_name']})  function {parts['function']:#05x}"
+            f"{' [vendor range]' if parts['custom'] else ''}  "
+            f"{METHODS[parts['method']]}  {ACCESSES[parts['access']]}")
+
+
+def tool_ioctl(code: str) -> str:
+    """One control code, taken apart.
+
+    Worth its own call because the four fields decide how the driver is talked
+    to, not just what it is asked. METHOD_NEITHER in particular means the driver
+    receives the caller's own user-mode pointers and has to probe them itself,
+    which is where a large share of driver vulnerabilities live.
+    """
+    try:
+        value = int(code, 0) if isinstance(code, str) else int(code)
+    except ValueError:
+        return f"{code!r} is not a number"
+    if not 0 <= value <= 0xFFFFFFFF:
+        return "a control code is 32 bits"
+
+    parts = decode_ioctl(value)
+    lines = [
+        f"{value:#010x}",
+        f"  device type   : {parts['device']:#06x}  {parts['device_name']}",
+        f"  function      : {parts['function']:#05x}"
+        + ("   (0x800 and up is the vendor range, so this driver very likely "
+           "defined it)" if parts['function'] >= 0x800 else ""),
+        f"  method        : {METHODS[parts['method']]}",
+        f"  access        : {ACCESSES[parts['access']]}",
+        "",
+        f"  CTL_CODE({parts['device']:#06x}, {parts['function']:#05x}, "
+        f"METHOD_{METHODS[parts['method']]}, {ACCESSES[parts['access']]})",
+    ]
+    if parts["method"] == 3:
+        lines += ["",
+                  "  METHOD_NEITHER: the driver is handed the caller's own "
+                  "user-mode pointers", "  and has to probe them itself. Check "
+                  "that it does."]
+    elif parts["method"] in (1, 2):
+        lines += ["",
+                  "  A direct method: the output buffer arrives as an MDL, so "
+                  "the driver sees", "  a kernel mapping of pages the caller "
+                  "still owns and can change underneath it."]
+    return "\n".join(lines)
+
+
+def scan_for_ioctls(address: int, budget: int = 3000,
+                    seen: set[int] | None = None,
+                    depth: int = 0) -> tuple[set[int], list[str]]:
+    """Immediates that look like control codes, from one function outwards.
+
+    A dispatcher compares the code against each one it handles, so the constants
+    are in the instruction stream whether or not the driver has symbols - which
+    for a .sys is the usual case. Following direct calls one level matters:
+    plenty of dispatchers do nothing but validate and tail-call a worker, and
+    stopping at the first function then finds nothing at all.
+    """
+    seen = set() if seen is None else seen
+    found: set[int] = set()
+    followed: list[str] = []
+
+    if address in seen or depth > 1:
+        return found, followed
+    seen.add(address)
+
+    try:
+        code = read_bytes(address, min(budget, 4096))
+    except CtlError:
+        return found, followed
+
+    offset = 0
+    while offset < len(code):
+        try:
+            length, text, branch = disassemble_one(code, offset,
+                                                   address + offset)
+        except DecodeError:
+            offset += 1
+            continue
+
+        # A dispatcher compares the code against each one it handles, or
+        # subtracts the lowest before indexing a table. Both leave the constant
+        # against a 32-bit register, because a control code is a ULONG - and
+        # insisting on that is most of what keeps lengths and pool tags out,
+        # since those are moved rather than compared.
+        match = IOCTL_COMPARE.match(text)
+        if match:
+            value = int(match.group(1), 16)
+            if plausible_ioctl(value):
+                found.add(value)
+
+        # ret ends the linear sweep only if nothing has branched past it, which
+        # is not knowable here - so the budget is what stops it, and following
+        # calls is what makes up for stopping early.
+        if branch is not None and text.startswith(("call", "jmp")) and depth < 1:
+            inner, _ = scan_for_ioctls(branch, budget, seen, depth + 1)
+            if inner:
+                found |= inner
+                followed.append(symbolize(branch))
+
+        offset += length
+
+    return found, followed
+
+
+def tool_ioctls(name: str) -> str:
+    """The control codes a driver handles, recovered from its dispatcher.
+
+    This is the interface a .sys exposes to user mode, and nothing publishes it:
+    there is no table to read, no export to enumerate, and the header that
+    defined the codes is not on the machine. What there is, is the dispatcher
+    comparing against every one of them - so they are recovered by reading it.
+
+    Constants, not proof. Anything shaped like a control code is reported;
+    confirm one by opening the device and sending it, or by hooking the handler
+    and watching what actually arrives.
+    """
+    address = driver_object(name)
+    raw = read_bytes(address, DRIVER_OBJECT_SIZE)
+
+    def pointer(at):
+        return int.from_bytes(raw[at:at + 8], "little")
+
+    base = pointer(DRIVER_START)
+    size = int.from_bytes(raw[DRIVER_SIZE:DRIVER_SIZE + 4], "little")
+    handlers = [pointer(DRIVER_MAJOR + i * 8) for i in range(len(IRP_NAMES))]
+    default = unset_handler(handlers, base, size)
+
+    lines = [f"{name}: control codes recovered by reading the dispatcher", ""]
+    total: set[int] = set()
+
+    scanned: dict[int, str] = {}
+
+    for index, label in ((14, "IRP_MJ_DEVICE_CONTROL"),
+                         (15, "IRP_MJ_INTERNAL_DEVICE_CONTROL")):
+        handler = handlers[index]
+        if handler == 0 or handler == default:
+            lines.append(f"  {label}: not handled")
+            continue
+
+        # One function often serves both slots - and every other slot too. It
+        # is the same scan and the same answer; saying so is more useful than
+        # printing seventy identical lines a second time.
+        if handler in scanned:
+            lines += [f"  {label}: the same function as {scanned[handler]}", ""]
+            continue
+        scanned[handler] = label
+
+        found, followed = scan_for_ioctls(handler)
+        lines.append(f"  {label} at {symbolize(handler)}")
+        if followed:
+            lines.append(f"    (also read {', '.join(followed[:4])})")
+        if not found:
+            lines.append("    no constant in it is shaped like a control code")
+            lines.append("    - the codes may be reached through a table, or "
+                         "the dispatcher may be longer than one read")
+        for code in sorted(found):
+            lines.append(f"    {format_ioctl(code)}")
+        total |= found
+        lines.append("")
+
+    if total:
+        lines += [f"{len(total)} candidate(s). Send one and see, or hook the "
+                  f"handler with svmhv_hook_trace to watch the real traffic.",
+                  "Codes using METHOD_NEITHER are worth looking at first: the "
+                  "driver gets raw user pointers."]
+    return "\n".join(lines)
+
+
 def tool_explain(target: str) -> str:
     """Everything known about one address, in a single call."""
     address = resolve(target)
@@ -3447,6 +3724,26 @@ def describe_pointer(value: int) -> str:
     return named if "!" in named or "+" in named else f"{value:#x}"
 
 
+def unset_handler(handlers: list[int], base: int, size: int) -> int | None:
+    """Which pointer in a dispatch table means "this driver does not do that".
+
+    Almost every slot points at nt!IopInvalidDeviceRequest, so the majority
+    pointer is the obvious way to find it - and it is wrong for the drivers that
+    matter most. partmgr points all twenty-eight slots at one function of its
+    own; taking the majority there declares the driver's only dispatcher to be
+    the default and reports that it handles nothing.
+
+    Outside the image is the test that actually holds. The default handler is
+    in the kernel; anything a driver wrote is in the driver.
+    """
+    if not handlers:
+        return None
+    common = max(set(handlers), key=handlers.count)
+    if base <= common < base + size:
+        return None
+    return common
+
+
 def driver_object(name: str) -> int:
     values = pairs(ctl("driverobj", name))
     address = as_int(values, "driver_object")
@@ -3484,14 +3781,25 @@ def tool_driver(name: str) -> str:
         "  dispatch table (only the entries it actually handles):",
     ]
 
-    # Most slots point at nt!IopInvalidDeviceRequest; the interesting ones are
-    # those that do not, so find the majority pointer and treat it as "unset".
     handlers = [pointer(DRIVER_MAJOR + i * 8) for i in range(len(IRP_NAMES))]
-    common = max(set(handlers), key=handlers.count) if handlers else 0
+    default = unset_handler(handlers, base, size)
+
+    if default is None and len(set(handlers)) == 1:
+        # One function for every slot. partmgr does this, and the majority rule
+        # below would have called its only dispatcher "the default handler" and
+        # reported nothing at all.
+        lines += [f"    every slot -> {symbolize(handlers[0])} "
+                  f"({handlers[0]:#018x})",
+                  "    one dispatcher for everything; it switches on the "
+                  "major function itself",
+                  "",
+                  "  Hook that one function with svmhv_hook_trace to see every "
+                  "request this driver gets."]
+        return "\n".join(lines)
 
     shown = 0
     for index, handler in enumerate(handlers):
-        if handler in (0, common):
+        if handler == 0 or handler == default:
             continue
         shown += 1
         inside = base <= handler < base + size
@@ -4036,6 +4344,41 @@ TOOLS = [
                 "description": "only links whose name or target contains this"}},
         },
         "handler": lambda a: tool_symlinks(a.get("contains", "")),
+    },
+    {
+        "name": "svmhv_ioctl",
+        "description":
+            "Decode one IOCTL control code into its device type, function "
+            "number, transfer method and access. The method is the part worth "
+            "knowing: METHOD_NEITHER means the driver is handed the caller's "
+            "own user-mode pointers and has to probe them itself, which is "
+            "where a large share of driver vulnerabilities live.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"code": {
+                "type": "string",
+                "description": "the control code, e.g. '0x22e004'"}},
+            "required": ["code"],
+        },
+        "handler": lambda a: tool_ioctl(a["code"]),
+    },
+    {
+        "name": "svmhv_ioctls",
+        "description":
+            "Recover the control codes a driver handles by reading its "
+            "IRP_MJ_DEVICE_CONTROL dispatcher. This is the interface a .sys "
+            "exposes to user mode and nothing publishes it - no table, no "
+            "export, and the header that defined the codes is not on the "
+            "machine. The dispatcher compares against every one of them, so "
+            "they are recovered from the instruction stream. Candidates, not "
+            "proof: confirm by sending one or by hooking the handler.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {
+                "type": "string", "description": "driver name"}},
+            "required": ["name"],
+        },
+        "handler": lambda a: tool_ioctls(a["name"]),
     },
     {
         "name": "svmhv_sections",
