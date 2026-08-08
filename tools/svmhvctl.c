@@ -40,8 +40,8 @@
 #define SNAP_STATS              16
 #define SNAP_HISTOGRAM          656
 #define SNAP_HOOKS              2728
-#define SNAP_SELFTEST           6832
-#define SNAP_SIZE               7000
+#define SNAP_SELFTEST           19120
+#define SNAP_SIZE               19288
 
 #define REQ_TARGET              0
 #define REQ_DETOUR              8

@@ -261,7 +261,14 @@ typedef struct _SVMHV_HOOK_REQUEST
 #define SVMHV_SHELLCODE_TRAMPOLINE_SLOT 0xFF0
 #define SVMHV_SHELLCODE_HOOKID_SLOT     0xFF8
 
-#define SVMHV_MAX_HOOK_RECORDS  64
+/*
+ * How many hooks can exist at once.  Records are never recycled while the
+ * driver is loaded - removal only marks one inactive - so this is also the
+ * number of distinct targets one load can ever touch.  Sixty-four was reached
+ * quickly once several hooks could share a page and instrumenting a whole
+ * syscall table became expressible.
+ */
+#define SVMHV_MAX_HOOK_RECORDS  256
 
 typedef struct _SVMHV_HOOK_INFO
 {
@@ -450,7 +457,7 @@ C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432);
 C_ASSERT(sizeof(SVMHV_STATS)           == 640);
 C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
-C_ASSERT(sizeof(SVMHV_HOOK_LIST)       == 4104);
+C_ASSERT(sizeof(SVMHV_HOOK_LIST)       == 8 + 64 * SVMHV_MAX_HOOK_RECORDS);
 C_ASSERT(sizeof(SVMHV_SELFTEST)        == 168);
 C_ASSERT(sizeof(SVMHV_HOOK_REQUEST)    == 1320 + 24 + SVMHV_MEMORY_MAX);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryAddress) == 1320);
@@ -459,8 +466,8 @@ C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryData)    == 1344);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Stats)     == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram) == 656);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Hooks)     == 2728);
-C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest)  == 6832);
-C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 7000);
+C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest)  == 2728 + sizeof(SVMHV_HOOK_LIST));
+C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 2728 + sizeof(SVMHV_HOOK_LIST) + 168);
 
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Sequence)             == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Completed)            == 24);
