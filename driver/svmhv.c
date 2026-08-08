@@ -1425,23 +1425,37 @@ VOID SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result)
      * worth seeing - but only *asserted* when hiding was actually asked for.
      * Left unconditional, a correctly built driver reports two failures for
      * doing exactly what it was told to do.
+     *
+     * #if rather than a runtime test on the constant: "!MACRO || expression"
+     * folds to a constant when the macro is zero, and MSVC reports that as
+     * C4127, which this build treats as an error.  Whether it does so depends
+     * on the toolset version, so the runtime form compiled here and broke CI.
      */
     __cpuid(regs, CPUID_EXT_FEATURES);
     Result->CpuidSvmBit = (regs[2] & CPUID_EXT_FEATURE_SVM) ? 1 : 0;
-    if (!STEALTHV_HIDE_SVM_CPUID || Result->CpuidSvmBit == 0)
+#if STEALTHV_HIDE_SVM_CPUID
+    if (Result->CpuidSvmBit == 0)
     {
         Result->Passed |= SVMHV_TEST_SVM_CPUID_HIDDEN;
     }
+#else
+    /* Hiding was not asked for, so the bit being visible is the right answer. */
+    Result->Passed |= SVMHV_TEST_SVM_CPUID_HIDDEN;
+#endif
 
     __cpuid(regs, CPUID_SVM_FEATURES);
     Result->SvmFeatureLeaf[0] = (UINT32)regs[0];
     Result->SvmFeatureLeaf[1] = (UINT32)regs[1];
     Result->SvmFeatureLeaf[2] = (UINT32)regs[2];
     Result->SvmFeatureLeaf[3] = (UINT32)regs[3];
-    if (!STEALTHV_HIDE_SVM_CPUID || (regs[0] | regs[1] | regs[2] | regs[3]) == 0)
+#if STEALTHV_HIDE_SVM_CPUID
+    if ((regs[0] | regs[1] | regs[2] | regs[3]) == 0)
     {
         Result->Passed |= SVMHV_TEST_SVM_LEAF_HIDDEN;
     }
+#else
+    Result->Passed |= SVMHV_TEST_SVM_LEAF_HIDDEN;
+#endif
 
     Result->CpuidCycles    = SvMeasureCpuid(TRUE);
     Result->BaselineCycles = SvMeasureCpuid(FALSE);
