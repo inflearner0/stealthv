@@ -68,8 +68,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Tests
-        # Standard library only, so there is nothing to install.
+      - name: Tests, without keystone or capstone
+        # The agent runs on the standard library alone, and this is that path:
+        # what a guest with no pip gets, using the built-in assembler and
+        # decoder. It is only exercised if something selects it deliberately.
+        env:
+          SVMHV_NO_ENGINES: "1"
+        run: python mcp/test_agent.py
+
+      - name: Install the optional engines
+        # Optional to the agent, but this is the path the lab guest actually
+        # uses, so it has to be tested too - the two disagree about encodings
+        # and about what they will refuse.
+        run: python -m pip install --disable-pip-version-check capstone keystone-engine
+
+      - name: Tests, with keystone and capstone
         run: python mcp/test_agent.py
 
       - name: Compile check every script

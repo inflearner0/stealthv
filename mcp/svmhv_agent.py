@@ -1271,7 +1271,14 @@ no pip should still be able to write a simple stub.  It is a smaller language -
 no RIP-relative, no indirect call, no scaled index - and it says so.
 """
 
+# Set SVMHV_NO_ENGINES=1 to ignore both and use the fallback.  CI runs the
+# tests each way for exactly this reason: the fallback is what a guest with no
+# pip gets, and it is only tested if something deliberately selects it.
+_NO_ENGINES = os.environ.get("SVMHV_NO_ENGINES") == "1"
+
 try:
+    if _NO_ENGINES:
+        raise ImportError("disabled by SVMHV_NO_ENGINES")
     import keystone as _keystone
     _KS = _keystone.Ks(_keystone.KS_ARCH_X86, _keystone.KS_MODE_64)
 except Exception:                                   # not installed, or broken
@@ -1279,6 +1286,8 @@ except Exception:                                   # not installed, or broken
     _KS = None
 
 try:
+    if _NO_ENGINES:
+        raise ImportError("disabled by SVMHV_NO_ENGINES")
     import capstone as _capstone
     _CS = _capstone.Cs(_capstone.CS_ARCH_X86, _capstone.CS_MODE_64)
     _CS.detail = True
@@ -1569,10 +1578,17 @@ def assemble(source: str, base_address: int = 0) -> bytes:
             encoded, _ = _KS.asm(source, addr=base_address)
         except Exception as error:
             raise AsmError(f"keystone: {error}")
-        if encoded is None:
-            raise AsmError("keystone produced nothing; check the syntax")
-        return bytes(encoded)
-    return _assemble_builtin(source, base_address)
+        code = bytes(encoded) if encoded else b""
+    else:
+        code = _assemble_builtin(source, base_address)
+
+    # The same answer whichever engine ran.  Keystone raises on empty input and
+    # the fallback quietly returns nothing, and a caller that asked for code and
+    # got none should hear about it either way - not have an empty shellcode
+    # installed on a function.
+    if not code:
+        raise AsmError("that assembled to no instructions at all")
+    return code
 
 
 def _assemble_builtin(source: str, base_address: int = 0) -> bytes:
