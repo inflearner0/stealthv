@@ -148,7 +148,11 @@ def fake_ctl(*arguments):
         return ("status=0x00000000\nbytes=16\n"
                 "fffff78000000000  48 89 5c 24 08 57 48 83 ec 20 48 8b d9 33 c0 c3"
                 "  H..$.WH.. H..3..\n")
-    if arguments[0] == "write":
+    if arguments[0] == "translate":
+        if arguments[1] == "dead":
+            return "status=0x00000000\nva=0xdead not mapped\n"
+        return "status=0x00000000\nva=0xffff1234\ngpa=0x1a2b234\n"
+    if arguments[0] in ("write", "writephys"):
         return "status=0x00000000\nwritten=4\n"
     return "status=0x00000000\nhookid=1\ngpa=0x1000\ntrampoline=0x2000\n"
 
@@ -503,6 +507,34 @@ text = rpc("tools/call", {"name": "svmhv_write", "arguments": {
 check("write reports what it wrote", "wrote 4 of 4 bytes" in text, text)
 check("write strips the spaces out of the payload",
       calls[-1] == ("write", "ffff1000", "90909090"), calls[-1])
+
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_write_physical", "arguments": {
+    "gpa": "0x1000", "hex_bytes": "de ad be ef"}})["result"]["content"][0]["text"]
+check("a physical write reports what it wrote",
+      "wrote 4 of 4 bytes at guest physical" in text, text)
+check("a physical write takes no pid",
+      calls[-1] == ("writephys", "1000", "deadbeef"), calls[-1])
+
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_translate", "arguments": {
+    "address": "0xffff1234"}})["result"]["content"][0]["text"]
+check("translate reports the physical address", "0x1a2b234" in text, text)
+check("translate splits the page from the offset",
+      "page 0x1a2b000, offset 0x234" in text, text)
+check("translate defaults to kernel space",
+      calls[-1] == ("translate", "ffff1234"), calls[-1])
+
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_translate", "arguments": {
+    "address": "0x7ff600001000", "pid": 4}})["result"]["content"][0]["text"]
+check("translate passes a pid through",
+      calls[-1] == ("translate", "7ff600001000", "4"), calls[-1])
+check("translate names the process it looked in", "process 4" in text, text)
+
+text = rpc("tools/call", {"name": "svmhv_translate", "arguments": {
+    "address": "0xdead"}})["result"]["content"][0]["text"]
+check("translate says so when nothing is mapped", "is not mapped" in text, text)
 
 for bad, why in (("909", "an odd number of digits"),
                  ("zz", "a non-hex digit"),

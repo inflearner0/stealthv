@@ -460,6 +460,8 @@ typedef struct _SVMHV_SNAPSHOT
 
 /* Resolve \Driver\<name> to its DRIVER_OBJECT address; see memory.h. */
 #define SVMHV_CMD_DRIVER_OBJECT 8
+#define SVMHV_CMD_WRITE_PHYSICAL 9
+#define SVMHV_CMD_TRANSLATE     10
 
 typedef struct _SVMHV_CONTROL
 {

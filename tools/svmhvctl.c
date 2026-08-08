@@ -1106,7 +1106,9 @@ static void Usage(void)
         "  svmhvctl driverobj <name>\n"
         "  svmhvctl read  <address> [length] [pid]\n"
         "  svmhvctl dump  <address> <length> [pid]\n"
-        "  svmhvctl readphys <gpa> [length]\n"
+        "  svmhvctl readphys  <gpa> [length]\n"
+        "  svmhvctl writephys <gpa> <hexbytes>\n"
+        "  svmhvctl translate <address> [pid]\n"
         "  svmhvctl write <address> <hexbytes> [pid]\n"
         "  svmhvctl watch <target> write|access\n"
         "  svmhvctl unhook <target>\n\n"
@@ -1350,6 +1352,59 @@ int main(int argc, char** argv)
         }
 
         printf("pages=%u\n", pages);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "translate") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned int returned = 0;
+        const unsigned __int64 address = strtoull(argv[2], NULL, 16);
+        const unsigned int pid = (argc >= 4)
+                               ? (unsigned int)strtoul(argv[3], NULL, 0) : 0;
+        unsigned __int64 physical = 0;
+
+        if (!SubmitMemory(SVMHV_CMD_TRANSLATE, address, sizeof(physical), pid,
+                          NULL, data, &returned))
+        {
+            return 2;
+        }
+        if (returned < sizeof(physical))
+        {
+            fprintf(stderr, "nothing is mapped at 0x%llx\n", address);
+            return 3;
+        }
+
+        memcpy(&physical, data, sizeof(physical));
+        if (physical == 0)
+        {
+            printf("va=0x%llx not mapped\n", address);
+            return 3;
+        }
+
+        /* One per line: the client's parser reads whole lines as key=value. */
+        printf("va=0x%llx\ngpa=0x%llx\n", address, physical);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "writephys") == 0 && argc >= 4)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned int returned = 0;
+        const unsigned __int64 address = strtoull(argv[2], NULL, 16);
+        const int size = ParseHex(argv[3], data, sizeof(data));
+
+        if (size <= 0)
+        {
+            fprintf(stderr, "could not parse the bytes to write\n");
+            return 1;
+        }
+        if (!SubmitMemory(SVMHV_CMD_WRITE_PHYSICAL, address,
+                          (unsigned int)size, 0, data, NULL, &returned))
+        {
+            return 2;
+        }
+        printf("written=%u\n", returned);
         return 0;
     }
 

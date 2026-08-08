@@ -365,3 +365,76 @@ NTSTATUS SvMemoryReadPhysical(_Inout_ SVMHV_HOOK_REQUEST* Request)
 
     return (Request->MemoryReturned != 0) ? STATUS_SUCCESS : STATUS_PARTIAL_COPY;
 }
+
+NTSTATUS SvMemoryWritePhysical(_Inout_ SVMHV_HOOK_REQUEST* Request)
+{
+    PHYSICAL_ADDRESS physical;
+    const ULONG length = SvMemoryClampLength(Request->MemoryLength);
+    PVOID existing;
+    ULONG done = 0;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    Request->MemoryReturned = 0;
+
+    if (((Request->MemoryAddress & (PAGE_SIZE - 1)) + length) > PAGE_SIZE)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    physical.QuadPart = (LONGLONG)Request->MemoryAddress;
+
+    /*
+     * Through the mapping the page already has, for the same reason the read
+     * does: building a second one for RAM the memory manager is tracking is
+     * what MEMORY_MANAGEMENT bugchecks are made of.
+     */
+    existing = MmGetVirtualForPhysical(physical);
+    if (existing == NULL)
+    {
+        return STATUS_NOT_FOUND;
+    }
+
+    /*
+     * No check that the page is writable, because at this level there is no
+     * such thing - the page tables describing it are themselves just memory
+     * reachable from here.  What the SEH catches is the mapping going away
+     * underneath, not a permission being enforced.
+     */
+    __try
+    {
+        RtlCopyMemory(existing, Request->MemoryData, length);
+        done = length;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        done = 0;
+    }
+
+    Request->MemoryReturned = done;
+    return (done != 0) ? STATUS_SUCCESS : STATUS_PARTIAL_COPY;
+}
+
+/* ------------------------------------------------------------- translate */
+
+static ULONG SvMemoryTranslateOperation(_Inout_ SVMHV_HOOK_REQUEST* Request)
+{
+    const PHYSICAL_ADDRESS physical =
+        MmGetPhysicalAddress((PVOID)Request->MemoryAddress);
+
+    /* Zero means nothing is mapped there, which is an answer rather than a
+       failure - the caller asked whether it was, and it is not. */
+    *(UINT64*)Request->MemoryData = (UINT64)physical.QuadPart;
+    return sizeof(UINT64);
+}
+
+NTSTATUS SvMemoryTranslate(_Inout_ SVMHV_HOOK_REQUEST* Request)
+{
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    RtlZeroMemory(Request->MemoryData, sizeof(UINT64));
+
+    /* Attached, when a process was named: a user address means nothing
+       without one, exactly as for a read. */
+    return SvMemoryInProcess(Request, SvMemoryTranslateOperation);
+}

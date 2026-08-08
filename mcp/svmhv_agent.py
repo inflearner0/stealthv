@@ -1758,6 +1758,39 @@ def tool_read_physical(gpa: str, length: int = 64) -> str:
                          f"read {length} bytes at guest physical {gpa}")
 
 
+def tool_write_physical(gpa: str, hex_bytes: str) -> str:
+    cleaned = "".join(hex_bytes.split()).removeprefix("0x").lower()
+    if not cleaned or len(cleaned) % 2 or any(c not in "0123456789abcdef"
+                                              for c in cleaned):
+        return "hex_bytes must be an even number of hex digits"
+    if len(cleaned) // 2 > 4096:
+        return "at most 4096 bytes, and it may not cross a page boundary"
+
+    text = ctl("writephys", hexarg(gpa), cleaned)
+    values = pairs(text)
+    status = as_int(values, "status", -1)
+    if status != 0:
+        return f"write failed: {status & 0xFFFFFFFF:#010x}"
+    return (f"wrote {as_int(values, 'written')} of {len(cleaned) // 2} bytes "
+            f"at guest physical {gpa}")
+
+
+def tool_translate(address: str, pid: int = 0) -> str:
+    arguments = ["translate", hexarg(address)]
+    if pid:
+        arguments.append(str(int(pid)))
+    text = ctl(*arguments)
+    values = pairs(text)
+
+    gpa = as_int(values, "gpa", 0)
+    if not gpa:
+        return f"{address} is not mapped"
+
+    where = f"process {pid}" if pid else "kernel space"
+    return (f"{address} in {where} is guest physical {gpa:#x}\n"
+            f"page {gpa & ~0xFFF:#x}, offset {gpa & 0xFFF:#x}")
+
+
 def tool_write(address: str, hex_bytes: str, pid: int = 0) -> str:
     cleaned = "".join(hex_bytes.split()).removeprefix("0x").lower()
     if not cleaned or len(cleaned) % 2 or any(c not in "0123456789abcdef"
@@ -4015,6 +4048,47 @@ TOOLS = [
             "required": ["gpa"],
         },
         "handler": lambda a: tool_read_physical(a["gpa"], a.get("length", 64)),
+    },
+    {
+        "name": "svmhv_write_physical",
+        "description":
+            "Write guest physical memory directly, consulting no page tables. "
+            "There is no safety net: it goes where it is pointed, with no "
+            "process, no page protection and no owner to consult - a page "
+            "mapped read-only everywhere is still writable from here, because "
+            "the tables saying otherwise are themselves just memory. One page "
+            "maximum, and it may not cross a page boundary.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gpa": {"type": "string",
+                        "description": "hex guest physical address"},
+                "hex_bytes": {"type": "string",
+                              "description": "bytes to write, as hex"},
+            },
+            "required": ["gpa", "hex_bytes"],
+        },
+        "handler": lambda a: tool_write_physical(a["gpa"], a["hex_bytes"]),
+    },
+    {
+        "name": "svmhv_translate",
+        "description":
+            "Translate a virtual address to a guest physical one, optionally in "
+            "another process. This is what makes the two physical calls usable: "
+            "they take an address nothing else in the interface produces. It is "
+            "also how to tell whether a page moved - a physical address that "
+            "changes under a virtual one invalidates anything keyed on the "
+            "physical, hooks included.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "hex address"},
+                "pid": {"type": "integer",
+                        "description": "process id for a user address"},
+            },
+            "required": ["address"],
+        },
+        "handler": lambda a: tool_translate(a["address"], a.get("pid", 0)),
     },
     {
         "name": "svmhv_write",

@@ -44,6 +44,24 @@ NTSTATUS SvMemoryWrite(_Inout_ SVMHV_HOOK_REQUEST* Request);
 NTSTATUS SvMemoryReadPhysical(_Inout_ SVMHV_HOOK_REQUEST* Request);
 
 /*
+ * And the same in reverse.  There is no safety net on this one: a physical
+ * write goes wherever it is pointed, with no process, no page protection and
+ * no owner to consult - the address space it edits is the machine's.
+ */
+NTSTATUS SvMemoryWritePhysical(_Inout_ SVMHV_HOOK_REQUEST* Request);
+
+/*
+ * Virtual to physical, optionally in another process.
+ *
+ * Without this the two physical calls above are not usable: they take an
+ * address nothing else in the interface produces.  It is also the answer to
+ * "is this page really where it was" - a physical address that changes under a
+ * virtual one is a page that moved, which matters to anything keyed on the
+ * physical, hooks included.
+ */
+NTSTATUS SvMemoryTranslate(_Inout_ SVMHV_HOOK_REQUEST* Request);
+
+/*
  * Look up \Driver\<name> and hand back the address of its DRIVER_OBJECT.
  *
  * This is the one thing about a driver that a client cannot reach with a read:
