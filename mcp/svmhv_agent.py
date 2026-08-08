@@ -1299,6 +1299,18 @@ def module_by_name(name: str) -> dict | None:
     return None
 
 
+def known_symbols(base: int) -> list[tuple[int, str]]:
+    """Everything nameable in a module: PDB symbols if loaded, else exports.
+
+    A PDB replaces rather than supplements, because its public symbol table
+    already contains the exports - keeping both would report every exported
+    function twice, once under each name it happens to have.
+    """
+    if base in _pdb_symbols:
+        return _pdb_symbols[base]
+    return exports(base)
+
+
 def exports(base: int) -> list[tuple[int, str]]:
     """Every exported name in the image at `base`, as (address, name).
 
@@ -1416,7 +1428,7 @@ def resolve(name: str) -> int:
         symbol, _, plus = symbol.partition("+")
         offset = int(plus, 0)
 
-    for address, export in exports(module["base"]):
+    for address, export in known_symbols(module["base"]):
         if export.lower() == symbol.lower():
             return address + offset
     raise CtlError(f"{module['name']} exports no symbol called {symbol!r}")
@@ -1432,7 +1444,7 @@ def symbolize(address: int) -> str:
 
     best = None
     try:
-        for export_address, name in exports(module["base"]):
+        for export_address, name in known_symbols(module["base"]):
             if export_address <= address and (best is None
                                               or export_address > best[0]):
                 best = (export_address, name)
@@ -1451,7 +1463,7 @@ def symbolize(address: int) -> str:
     # caller acting on "ntoskrnl!_setjmpex+0x9138" would be misled about what
     # called what. Past the threshold, say where it is and stop claiming to
     # know what it is.
-    if delta > SYMBOL_MAX_OFFSET:
+    if delta > SYMBOL_MAX_OFFSET and module["base"] not in _pdb_symbols:
         return f"{module['name']}+{address - module['base']:#x}"
 
     return (f"{module['name']}!{best[1]}"
@@ -1493,6 +1505,276 @@ def tool_exports(module_name: str, contains: str = "") -> str:
     if len(found) > 400:
         lines.append(f"... and {len(found) - 400} more; narrow it with 'contains'")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------- pdb
+
+def pdb_info(base: int) -> dict:
+    """Which PDB a module was built with, out of its debug directory.
+
+    This works with no network and no symbol file present, and it is the part
+    you need first: the name, GUID and age together are the only thing that
+    identifies the right PDB, and the symbol server path is built from them.
+    Matching on name alone gets you a file that will confidently give wrong
+    answers for a different build.
+    """
+    header = read_bytes(base, 0x400)
+    if header[:2] != b"MZ":
+        raise CtlError(f"no MZ header at {base:#x}")
+    pe = int.from_bytes(header[0x3C:0x40], "little")
+    optional = pe + 0x18
+    magic = int.from_bytes(header[optional:optional + 2], "little")
+    directory = optional + (0x70 if magic == 0x20B else 0x60)
+
+    # The debug directory is the seventh data directory, so six entries in.
+    rva = int.from_bytes(header[directory + 6 * 8:directory + 6 * 8 + 4], "little")
+    size = int.from_bytes(header[directory + 6 * 8 + 4:directory + 6 * 8 + 8],
+                          "little")
+    if rva == 0 or size == 0:
+        raise CtlError("the module has no debug directory")
+
+    entries = read_bytes(base + rva, min(size, 0x200))
+    for offset in range(0, len(entries) - 27, 28):
+        entry = entries[offset:offset + 28]
+        kind = int.from_bytes(entry[12:16], "little")
+        if kind != 2:                       # IMAGE_DEBUG_TYPE_CODEVIEW
+            continue
+        data_size = int.from_bytes(entry[16:20], "little")
+        data_rva = int.from_bytes(entry[20:24], "little")
+        blob = read_bytes(base + data_rva, min(max(data_size, 24), 512))
+        if blob[:4] != b"RSDS":
+            continue
+
+        # RSDS: signature, 16-byte GUID, 4-byte age, then a NUL-terminated name.
+        guid = blob[4:20]
+        age = int.from_bytes(blob[20:24], "little")
+        name = blob[24:].split(b"\0", 1)[0].decode("ascii", "replace")
+        # The server spells the GUID as a struct, not as bytes in order.
+        text = ("%08X%04X%04X%s" % (
+            int.from_bytes(guid[0:4], "little"),
+            int.from_bytes(guid[4:6], "little"),
+            int.from_bytes(guid[6:8], "little"),
+            guid[8:16].hex().upper())) + f"{age:X}"
+        return {"name": name.replace("\\", "/").split("/")[-1],
+                "full": name, "guid": text, "age": age}
+
+    raise CtlError("the debug directory has no CodeView entry")
+
+
+class PdbError(RuntimeError):
+    pass
+
+
+# ?? followed by one of these is a special member rather than a name.
+MANGLED_SPECIAL = {
+    "0": "{ctor}", "1": "{dtor}", "2": "operator new", "3": "operator delete",
+    "4": "operator=", "5": "operator>>", "6": "operator<<", "7": "operator!",
+    "8": "operator==", "9": "operator!=",
+    "_E": "{vector dtor}", "_G": "{scalar dtor}",
+}
+
+
+def readable_name(mangled: str) -> str:
+    """The qualified name out of an MSVC decorated name.
+
+    Deliberately not a demangler: it recovers Class::method and stops, leaving
+    the type signature alone. The signature is most of the complexity and the
+    least of the value - what a reader needs is to see
+    CClfsBaseFilePersisted::~CClfsBaseFilePersisted rather than
+    ??1CClfsBaseFilePersisted@@UEAA@XZ, and the argument types are visible in
+    the disassembly anyway.
+
+    Anything it does not confidently understand comes back unchanged, because a
+    half-decoded name is worse than a decorated one.
+    """
+    if not mangled.startswith("?"):
+        # A plain C symbol, possibly with the stdcall decoration.
+        return mangled.lstrip("_").split("@")[0] if "@" in mangled else mangled
+
+    body = mangled[1:]
+    special = ""
+    if body.startswith("?"):
+        body = body[1:]
+        for key in ("_E", "_G", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"):
+            if body.startswith(key):
+                special = MANGLED_SPECIAL[key]
+                body = body[len(key):]
+                break
+        else:
+            return mangled                      # an operator we do not know
+
+    # Name components run up to "@@", innermost first.
+    end = body.find("@@")
+    if end < 0:
+        return mangled
+    parts = [p for p in body[:end].split("@") if p]
+    if not parts:
+        return mangled
+
+    scopes = list(reversed(parts))
+    if special == "{ctor}":
+        return "::".join(scopes + [scopes[-1]])
+    if special in ("{dtor}", "{vector dtor}", "{scalar dtor}"):
+        suffix = "~" + scopes[-1]
+        if special != "{dtor}":
+            suffix += "  " + special
+        return "::".join(scopes[:-1] + [scopes[-1]] + [suffix]) \
+            if False else "::".join(scopes) + "::" + suffix
+    if special:
+        return "::".join(scopes) + "::" + special
+    return "::".join(scopes)
+
+
+def pdb_public_symbols(path: str) -> list[tuple[int, str, int]]:
+    """Public symbols from a PDB, as (segment, name, offset).
+
+    A deliberately narrow reader. A PDB is an MSF container holding a dozen
+    streams in several formats; all that is wanted here is the public symbol
+    table, which is the one that names the functions a module does not export.
+    So: the superblock, the stream directory, the DBI header to find the symbol
+    stream, and the S_PUB32 records in it. Everything else is skipped rather
+    than half-parsed.
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+
+    if not data.startswith(b"Microsoft C/C++ MSF 7.00"):
+        raise PdbError("not an MSF 7.00 file (an old-format PDB, or not a PDB)")
+
+    block_size = int.from_bytes(data[0x20:0x24], "little")
+    directory_bytes = int.from_bytes(data[0x2C:0x30], "little")
+    block_map = int.from_bytes(data[0x34:0x38], "little")
+    if block_size == 0 or block_size & (block_size - 1):
+        raise PdbError(f"implausible block size {block_size}")
+
+    def block(index):
+        start = index * block_size
+        return data[start:start + block_size]
+
+    def stream_from(blocks, size):
+        out = bytearray()
+        for index in blocks:
+            out += block(index)
+        return bytes(out[:size])
+
+    # The directory is itself a stream, described by a list of block numbers.
+    directory_blocks_needed = (directory_bytes + block_size - 1) // block_size
+    map_bytes = block(block_map)
+    directory_blocks = [
+        int.from_bytes(map_bytes[i * 4:i * 4 + 4], "little")
+        for i in range(directory_blocks_needed)]
+    directory = stream_from(directory_blocks, directory_bytes)
+
+    count = int.from_bytes(directory[0:4], "little")
+    if count == 0 or count > 0x10000:
+        raise PdbError(f"implausible stream count {count}")
+
+    sizes = [int.from_bytes(directory[4 + i * 4:8 + i * 4], "little")
+             for i in range(count)]
+    at = 4 + count * 4
+    streams = []
+    for size in sizes:
+        needed = 0 if size == 0xFFFFFFFF else (size + block_size - 1) // block_size
+        blocks = [int.from_bytes(directory[at + i * 4:at + i * 4 + 4], "little")
+                  for i in range(needed)]
+        at += needed * 4
+        streams.append((blocks, 0 if size == 0xFFFFFFFF else size))
+
+    if len(streams) <= 3:
+        raise PdbError("no DBI stream")
+
+    dbi = stream_from(*streams[3])
+    if len(dbi) < 24:
+        raise PdbError("the DBI stream is too short to hold a header")
+
+    symbol_stream = int.from_bytes(dbi[20:22], "little")
+    if symbol_stream == 0xFFFF or symbol_stream >= len(streams):
+        raise PdbError("the DBI header names no symbol stream")
+
+    symbols = stream_from(*streams[symbol_stream])
+
+    found = []
+    offset = 0
+    while offset + 4 <= len(symbols):
+        length = int.from_bytes(symbols[offset:offset + 2], "little")
+        if length < 2:
+            break
+        kind = int.from_bytes(symbols[offset + 2:offset + 4], "little")
+        record = symbols[offset + 4:offset + 2 + length]
+
+        if kind == 0x110E and len(record) >= 10:        # S_PUB32
+            symbol_offset = int.from_bytes(record[4:8], "little")
+            segment = int.from_bytes(record[8:10], "little")
+            name = record[10:].split(b"\0", 1)[0].decode("ascii", "replace")
+            if name and segment:
+                found.append((segment, name, symbol_offset))
+
+        offset += 2 + length
+        offset = (offset + 3) & ~3                      # records are 4-aligned
+
+    if not found:
+        raise PdbError("the symbol stream held no public symbols")
+    return found
+
+
+_pdb_symbols: dict[int, list[tuple[int, str]]] = {}
+
+
+def load_pdb_symbols(module_name: str, path: str) -> int:
+    """Parse a PDB and attach its symbols to a loaded module."""
+    resolved = module_by_name(module_name)
+    if resolved is None:
+        raise CtlError(f"no loaded module called {module_name!r}")
+
+    sections = pe_sections(resolved["base"])
+    publics = pdb_public_symbols(path)
+
+    # Public symbols are segment:offset; the module's own section table turns
+    # those into addresses. Segments are 1-based.
+    attached = []
+    for segment, name, offset in publics:
+        if 1 <= segment <= len(sections):
+            attached.append((resolved["base"] + sections[segment - 1]["rva"]
+                             + offset, readable_name(name)))
+
+    if not attached:
+        raise PdbError("no symbol landed in a section this module has")
+
+    attached.sort()
+    _pdb_symbols[resolved["base"]] = attached
+    _exports_cache.pop(resolved["base"], None)
+    return len(attached)
+
+
+def tool_pdb_info(module: str) -> str:
+    resolved = module_by_name(module)
+    if resolved is None:
+        return f"no loaded module called {module!r}"
+    info = pdb_info(resolved["base"])
+    return "\n".join([
+        f"{resolved['name']} was built with:",
+        f"  pdb  : {info['name']}",
+        f"  path : {info['full']}",
+        f"  guid : {info['guid']}",
+        "",
+        "The symbol server path is built from exactly those three:",
+        f"  https://msdl.microsoft.com/download/symbols/"
+        f"{info['name']}/{info['guid']}/{info['name']}",
+        "",
+        "Put the file anywhere the guest can read it and load it with "
+        "svmhv_symbols_load. Matching on the name alone gets a PDB for a "
+        "different build, which answers confidently and wrongly.",
+    ])
+
+
+def tool_symbols_load(module: str, path: str) -> str:
+    try:
+        count = load_pdb_symbols(module, path)
+    except (PdbError, OSError) as error:
+        return f"could not read {path}: {error}"
+    return (f"{count} symbol(s) loaded for {module} from {path}.\n"
+            "These now take precedence over exported names everywhere an "
+            "address is rendered.")
 
 
 # ------------------------------------------------------------- processes
@@ -2278,6 +2560,41 @@ TOOLS = [
                 "description": "substring of the module name, e.g. 'ndis'"}},
         },
         "handler": lambda a: tool_modules(a.get("filter", "")),
+    },
+    {
+        "name": "svmhv_pdb_info",
+        "description":
+            "Which PDB a module was built with - name, GUID and age - read out "
+            "of its debug directory in memory, with no network and no symbol "
+            "file needed. Returns the exact symbol server URL. The GUID is the "
+            "point: a PDB matched by name alone is for a different build and "
+            "will answer confidently and wrongly.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"module": {"type": "string"}},
+            "required": ["module"],
+        },
+        "handler": lambda a: tool_pdb_info(a["module"]),
+    },
+    {
+        "name": "svmhv_symbols_load",
+        "description":
+            "Parse a PDB and attach its symbols to a loaded module. This is "
+            "what gets names for functions a module does not export - the "
+            "Mi*, Ki* and Ob* internals of the kernel, and everything in a "
+            "driver, which usually exports nothing at all. Once loaded these "
+            "are used everywhere an address is rendered: disassembly, trace "
+            "callers, cross-references.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string"},
+                "path": {"type": "string",
+                         "description": "path to the .pdb inside the guest"},
+            },
+            "required": ["module", "path"],
+        },
+        "handler": lambda a: tool_symbols_load(a["module"], a["path"]),
     },
     {
         "name": "svmhv_exports",

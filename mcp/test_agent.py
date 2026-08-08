@@ -276,6 +276,22 @@ try:
 except agent.DecodeError:
     check("an unknown opcode is refused, never guessed", True)
 
+print("decorated names")
+for mangled, want in (
+        ("??1CClfsBaseFilePersisted@@UEAA@XZ",
+         "CClfsBaseFilePersisted::~CClfsBaseFilePersisted"),
+        ("??0CClfsBaseFile@@QEAA@XZ", "CClfsBaseFile::CClfsBaseFile"),
+        ("?AhcGetLogFlags@@YAIXZ", "AhcGetLogFlags"),
+        ("?Method@Inner@Outer@@AEAAXXZ", "Outer::Inner::Method"),
+        ("SdbpGetMatchingXap", "SdbpGetMatchingXap"),
+):
+    got = agent.readable_name(mangled)
+    check(f"reads {want}", got == want, f"got {got!r}")
+
+check("an unrecognised decoration is left alone",
+      agent.readable_name("??_C@_0CC@HPCEKKIJ@junk@")
+      == "??_C@_0CC@HPCEKKIJ@junk@")
+
 print("symbols")
 _fake_modules = [
     {"base": 0xFFFFF80010000000, "size": 0x900000,
