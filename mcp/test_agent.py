@@ -91,6 +91,9 @@ check("capture_return becomes a flag with no value",
       agent.hook_options(capture_return=True))
 check("capture_return off adds nothing",
       agent.hook_options(capture_return=False) == [])
+check("capture_stack is its own flag",
+      agent.hook_options(capture_stack=True) == ["--capture-stack"],
+      agent.hook_options(capture_stack=True))
 
 check("the sanitiser passes the option strings it has to",
       all(agent.SAFE_ARGUMENT.match(a) for a in

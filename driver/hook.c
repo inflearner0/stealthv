@@ -60,6 +60,7 @@ typedef struct _SVM_HOOK
     SVMHV_CAPTURE Captures[SVMHV_MAX_CAPTURES];
     SVMHV_SPOOF Spoofs[SVMHV_MAX_SPOOFS];
     BOOLEAN CaptureReturn;
+    BOOLEAN CaptureStack;
     char    ProcessName[SVMHV_PROCESS_NAME_MAX];
     PVOID   BlockStub;          /* mov rax, imm64; ret - when blocking      */
     UINT8   OriginalProlog[SVMHV_MAX_PROLOG];
@@ -315,6 +316,7 @@ BOOLEAN SvHookTraceInfo(_In_ UINT32 HookId, _Out_ SVM_HOOK_TRACE_INFO* Info)
     Info->CaptureCount = hook->CaptureCount;
     Info->SpoofCount   = hook->SpoofCount;
     Info->CaptureReturn = hook->CaptureReturn;
+    Info->CaptureStack  = hook->CaptureStack;
     for (i = 0; i < SVMHV_MAX_FILTERS; i++)
     {
         Info->Filters[i] = hook->Filters[i];
@@ -589,6 +591,7 @@ static NTSTATUS SvHookApplyPolicy(_Inout_ SVM_HOOK* Hook,
     }
 
     Hook->CaptureReturn = (Request->CaptureReturn != 0);
+    Hook->CaptureStack  = (Request->CaptureStack != 0);
 
     Hook->BlockStub = NULL;
     if (Request->Block)

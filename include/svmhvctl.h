@@ -170,6 +170,9 @@ typedef struct _SVMHV_SPOOF
 
 #define SVMHV_PROCESS_NAME_MAX  16
 
+/* Return addresses kept per trace record; see Frames below. */
+#define SVMHV_MAX_FRAMES        8
+
 typedef struct _SVMHV_HOOK_REQUEST
 {
     UINT64 Target;                      /* kernel virtual address           */
@@ -196,7 +199,19 @@ typedef struct _SVMHV_HOOK_REQUEST
     UINT64 Trampoline;
     UINT64 Gpa;
     UINT32 HookId;
-    UINT32 Reserved2;
+
+    /*
+     * Record candidate return addresses as well.  Opt-in: reading a couple of
+     * hundred stack slots on every call is not free, and left unconditional on
+     * a function in the file path it was enough to starve the control agent
+     * that would have removed the hook.
+     *
+     * In this spare word rather than at the end of the structure, because a
+     * hook submit only pushes the first 1320 bytes across the channel - the
+     * memory fields past that are written separately, and a flag placed there
+     * is silently never sent.
+     */
+    UINT32 CaptureStack;
 
     /*
      * Only fire for this process, matched against the image name in EPROCESS.
@@ -335,6 +350,22 @@ typedef struct _SVMHV_TRACE_RECORD
        not be taken safely. */
     UINT32 CaptureLength[SVMHV_MAX_CAPTURES];
     UINT8  CaptureData[SVMHV_MAX_CAPTURES][SVMHV_CAPTURE_MAX];
+
+    /*
+     * Who called, beyond the immediate caller.
+     *
+     * ReturnAddress above says which instruction the call came from, and that
+     * is one frame - enough to name the function but not to say why it was
+     * reached.  A driver calling ZwCreateFile through three layers of its own
+     * dispatch looks identical to one calling it directly, and telling those
+     * apart is most of what a trace is for.
+     *
+     * Zero-terminated: fewer than SVMHV_MAX_FRAMES means the walk ended, not
+     * that the stack did.
+     */
+    UINT32 FrameCount;
+    UINT32 FrameReserved;
+    UINT64 Frames[SVMHV_MAX_FRAMES];
 } SVMHV_TRACE_RECORD;
 
 /* ------------------------------------------------------------- self test */
@@ -468,7 +499,7 @@ typedef struct _SVMHV_CONTROL
  * fires, mcp\svmhv_mcp.py needs the same edit.
  */
 C_ASSERT(sizeof(SVMHV_FILTER)          == 24);
-C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432);
+C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES);
 C_ASSERT(sizeof(SVMHV_STATS)           == 640);
 C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
@@ -477,6 +508,7 @@ C_ASSERT(sizeof(SVMHV_SELFTEST)        == 176);
 C_ASSERT(sizeof(SVMHV_HOOK_REQUEST)    == 1320 + 24 + SVMHV_MEMORY_MAX);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryAddress) == 1320);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryData)    == 1344);
+C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, CaptureStack)  == 156);
 
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Stats)     == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram) == 656);

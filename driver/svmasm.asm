@@ -304,22 +304,43 @@ AsmSignatureCall ENDP
 ; stack in the slot RAX was saved in and RET does both jobs at once: RSP ends up
 ; exactly where the traced function expects it, with its return address on top.
 ;
-AsmTraceEntry PROC
+; FRAME, and the directives below, exist so the kernel can unwind *through*
+; this.  Hand-written assembly has no .pdata unless it says so, and without it
+; RtlCaptureStackBackTrace stops at the first frame and reports nothing - which
+; is exactly what a traced call looked like: one caller and no stack behind it.
+;
+; The unwind codes describe the prologue's effect on RSP, which is all the
+; unwinder needs to find the frame above.  This function is reached by a jump
+; rather than a call, so at entry RSP already points at the hooked function's
+; own return address; undoing the pushes therefore lands the walk on the real
+; caller, which is the right answer.
+AsmTraceEntry PROC FRAME
         push    rax
+        .pushreg rax
         mov     rax, rsp
         add     rax, 8                          ; RSP as the function was entered
         push    rcx
+        .pushreg rcx
         push    rdx
+        .pushreg rdx
         push    r8
+        .pushreg r8
         push    r9
+        .pushreg r9
         push    r10
+        .pushreg r10
         push    r11
+        .pushreg r11
         push    rax                             ; 8 pushes -> RSP is 8 mod 16
+        .allocstack 8                           ; a value, not a register save
 
         ; 0x68, not 0x60: the eight pushes left RSP eight short of a 16-byte
         ; boundary, and movaps on a misaligned address faults.  The spare eight
         ; bytes sit above the six saved registers, at [rsp + 60h].
         sub     rsp, 68h
+        .allocstack 68h
+        .endprolog
+
         movaps  xmmword ptr [rsp + 000h], xmm0
         movaps  xmmword ptr [rsp + 010h], xmm1
         movaps  xmmword ptr [rsp + 020h], xmm2
@@ -375,21 +396,32 @@ AsmTraceEntry ENDP
 ; RET jumps to it - the same trick AsmTraceEntry uses, and for the same reason:
 ; there is no register left that is safe to hold it while RAX is restored.
 ;
-AsmTraceReturn PROC
+AsmTraceReturn PROC FRAME
         push    rax                             ; the return value
+        .pushreg rax
         push    rcx
+        .pushreg rcx
         push    rdx                             ; high half of a 128-bit result
+        .pushreg rdx
         push    r8
+        .pushreg r8
         push    r9
+        .pushreg r9
         push    r10
+        .pushreg r10
         push    r11
+        .pushreg r11
         push    rax                             ; scratch, for the destination
+        .allocstack 8
 
         ; 0x60, not 0x68.  AsmTraceEntry is entered at a function's first
         ; instruction, where RSP is 8 mod 16; this is entered after a RET has
         ; popped, so RSP is 0 mod 16 and eight pushes leave it there.  Taking
         ; another eight off would misalign movaps and fault.
         sub     rsp, 60h
+        .allocstack 60h
+        .endprolog
+
         movaps  xmmword ptr [rsp + 000h], xmm0  ; a floating point result
         movaps  xmmword ptr [rsp + 010h], xmm1
         movaps  xmmword ptr [rsp + 020h], xmm2

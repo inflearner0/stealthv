@@ -62,6 +62,7 @@
 #define REQ_BLOCK               280
 #define REQ_BLOCKVALUE          288
 #define REQ_CAPRETURN           284
+#define REQ_CAPSTACK            156
 #define REQ_TARGET_PID          132
 #define REQ_SHELLCODE           296
 
@@ -760,6 +761,11 @@ static int ApplyOptions(unsigned char* request, int argc, char** argv, int index
             const unsigned int pid = (unsigned int)strtoul(argv[++index], NULL, 0);
             memcpy(request + REQ_TARGET_PID, &pid, 4);
         }
+        else if (_stricmp(option, "--capture-stack") == 0)
+        {
+            const unsigned int on = 1;
+            memcpy(request + REQ_CAPSTACK, &on, 4);
+        }
         else if (_stricmp(option, "--capture-return") == 0)
         {
             const unsigned int on = 1;
@@ -1023,6 +1029,18 @@ static void PrintTrace(unsigned int count)
                record.ErrorCode, record.Arguments[0], record.Arguments[1],
                record.Arguments[2], record.Arguments[3],
                record.StackArguments[0], record.StackArguments[1]);
+
+        /* The stack, when the walk managed one. */
+        if (record.FrameCount != 0)
+        {
+            unsigned int f;
+            printf(" frames=");
+            for (f = 0; f < record.FrameCount && f < SVMHV_MAX_FRAMES; f++)
+            {
+                printf("%s0x%llx", (f != 0) ? "," : "",
+                       (unsigned long long)record.Frames[f]);
+            }
+        }
 
         /* Captures go out as hex so the client can decide what they were. */
         {

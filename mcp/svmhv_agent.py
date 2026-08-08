@@ -130,7 +130,7 @@ CAPTURE_TYPES = ("ansi", "wide", "unicode", "objattr", "bytes")
 def hook_options(process=None, pid=None, caller_base=None, caller_size=None,
                  filter_expr=None, capture=None, capture2=None,
                  spoof=None, spoof2=None, block=None, in_process=None,
-                 capture_return=None) -> list[str]:
+                 capture_return=None, capture_stack=None) -> list[str]:
     """
     Turn the tool parameters into svmhvctl's named options.
 
@@ -175,6 +175,8 @@ def hook_options(process=None, pid=None, caller_base=None, caller_size=None,
         options += ["--block", str(block)]
     if capture_return:
         options += ["--capture-return"]
+    if capture_stack:
+        options += ["--capture-stack"]
     if in_process is not None:
         # Which address space the *target* is in, as opposed to --pid, which
         # narrows what gets recorded once the hook is already placed.
@@ -375,6 +377,27 @@ def tool_trace(count: int = 40) -> str:
                 f"      stack {row.get('s0')} {row.get('s1')} "
                 f"ret {row.get('ret')} rsp {row.get('rsp')}",
             ]
+            frames = row.get("frames")
+            if frames:
+                # The immediate caller is already on the line above; these are
+                # the frames beyond it, which is what says why the call
+                # happened rather than merely where from.
+                # Only what lands in a module.  The driver keeps anything
+                # that looks like a kernel address, which includes stack
+                # pointers; a value that names no module is not a return
+                # address and only makes the chain harder to read.
+                named = []
+                for frame in frames.split(","):
+                    try:
+                        address = int(frame, 0)
+                    except ValueError:
+                        continue
+                    if module_for(address) is not None:
+                        named.append(symbolize(address))
+                if named:
+                    entry.append("      stack (candidates read off the stack, "
+                                 "not unwound - later entries may be stale):")
+                    entry += [f"        {name}" for name in named[:8]]
             if int(row.get("spoofed", "0"), 0):
                 entry.append(f"      {row['spoofed']} argument(s) replaced "
                              f"before the original saw them")
@@ -454,6 +477,23 @@ def tool_trace_summary(count: int = 200) -> str:
         if callers:
             lines.append("  callers   : " + ", ".join(
                 f"{name} x{n}" for name, n in callers[:5]))
+
+        # One representative stack. Which path reached the function is usually
+        # the same for every call in a burst, so showing it once beats
+        # repeating it sixty times.
+        with_stack = [r for r in group if r.get("frames")]
+        if with_stack:
+            named = []
+            for frame in with_stack[-1]["frames"].split(","):
+                try:
+                    address = int(frame, 0)
+                except ValueError:
+                    continue
+                if module_for(address) is not None:
+                    named.append(symbolize(address))
+            if named:
+                lines.append("  stack     : (candidates, not unwound)")
+                lines += [f"      {name}" for name in named[:6]]
 
         cpus = tally("cpu")
         if cpus:
@@ -1782,10 +1822,29 @@ def modules(refresh: bool = False) -> list[dict]:
     return found
 
 
+_modules_fetched = 0.0
+
+
 def module_for(address: int) -> dict | None:
+    """Which loaded module an address belongs to.
+
+    Refreshes once on a miss.  The list is cached because every symbolized
+    address consults it, but drivers load and unload while a session is
+    running - this one unloads and reloads constantly - and a cache filled
+    before that happened reports "not inside any loaded module" for addresses
+    that plainly are.  A miss is the only reliable signal that it is stale.
+    """
+    global _modules_fetched
+
     for module in modules():
         if module["base"] <= address < module["base"] + module["size"]:
             return module
+
+    if time.time() - _modules_fetched > 5:
+        _modules_fetched = time.time()
+        for module in modules(refresh=True):
+            if module["base"] <= address < module["base"] + module["size"]:
+                return module
     return None
 
 
@@ -4056,7 +4115,7 @@ TOOLS = [
             **{k: a[k] for k in (
                 "process", "pid", "caller_base", "caller_size", "filter_expr",
                 "capture", "capture2", "spoof", "spoof2", "block",
-                "capture_return") if k in a}),
+                "capture_return", "capture_stack") if k in a}),
     },
     {
         "name": "svmhv_hook_detour",

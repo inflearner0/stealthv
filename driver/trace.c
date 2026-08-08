@@ -15,6 +15,70 @@
 NTKERNELAPI UCHAR* PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 /*
+ * The kernel's own stack walker.  Exported and usable from any IRQL, and it
+ * reads the .pdata unwind tables rather than assuming frame pointers, which is
+ * the only approach that works on optimised x64 code.
+ *
+ * Writing one by hand was the alternative and it is not close: an unwinder that
+ * guesses is an unwinder that eventually reads a bad address inside a recorder
+ * running with a hook installed, and the machine is then wedged in the one path
+ * that could remove the hook.
+ */
+/*
+ * Candidate return addresses, by reading the stack.
+ *
+ * Not an unwind, and it does not pretend to be.  Three ways of doing this
+ * properly were tried and none of them works from here: the stack walkers the
+ * kernel exports start from the caller's frame, which is this recorder and the
+ * thunk rather than anything interesting, and a manual RtlVirtualUnwind needs a
+ * CONTEXT whose non-volatile registers are the traced function's - and by the
+ * time C code is running, its own prologue has saved and reused them.
+ *
+ * So: read the stack and keep what could be a return address.  A value that
+ * points into a module's code is either a return address or a coincidence, and
+ * the client can tell which by whether the chain makes sense - it symbolizes
+ * every entry, so a stray pointer shows up as an odd name rather than hiding.
+ * That is weaker than an unwind and it is reported as candidates rather than
+ * as a call stack.
+ *
+ * Reading is the only risk and it is a small one: this is the current thread's
+ * own stack, below the pointer it was entered with, and therefore resident.
+ */
+static ULONG SvTraceStackCandidates(_In_ UINT64 Rsp,
+                                    _Out_writes_(Count) UINT64* Frames,
+                                    _In_ ULONG Count)
+{
+    const ULONG64* stack = (const ULONG64*)Rsp;
+    ULONG found = 0;
+    ULONG i;
+
+    if (Rsp == 0 || Count == 0)
+    {
+        return 0;
+    }
+
+    __try
+    {
+        for (i = 0; i < 256 && found < Count; i++)
+        {
+            const UINT64 value = stack[i];
+
+            /* Kernel code lives above this; anything else is data. */
+            if (value >= 0xFFFFF80000000000ULL && value < 0xFFFFFFFFFFFF0000ULL)
+            {
+                Frames[found++] = value;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        /* Ran off the end of the stack; keep whatever was found. */
+    }
+
+    return found;
+}
+
+/*
  * Power of two, so the modulo is a mask.  4096 records is about 640 KiB, which
  * buys roughly a second of a moderately busy hook before a client that is
  * draining once a second starts losing the oldest of them.
@@ -582,6 +646,24 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
                 record->StackArguments[i] = arguments[4 + i];
             }
             record->ReturnAddress = returnAddress;
+
+            /*
+             * The frames above the immediate caller.  Skipped frames are this
+             * recorder and the thunk that reached it, which are ours and say
+             * nothing about the call.
+             *
+             * Only at an IRQL where a page fault is legal.  The unwinder reads
+             * .pdata, which is pageable, and taking a fault at DISPATCH_LEVEL
+             * inside a hook is not survivable - the same reason the captures
+             * above are fenced.
+             */
+            if (info.CaptureStack && irql <= APC_LEVEL)
+            {
+                record->FrameCount = SvTraceStackCandidates(
+                    OriginalRsp + sizeof(UINT64), record->Frames,
+                    SVMHV_MAX_FRAMES);
+            }
+
             record->Gpa       = info.Gpa;
             record->HookId    = (UINT32)HookId;
             record->Type      = SVMHV_TRACE_EXEC;
