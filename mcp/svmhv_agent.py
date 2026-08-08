@@ -534,6 +534,122 @@ def tool_watch(target: str, mode: str = "write", **options) -> str:
                        f"{mode} watch on the page holding {target}")
 
 
+def tool_hook_many(module: str, contains: str, limit: int = 24,
+                   **options) -> str:
+    """Instrument every export whose name matches, in one call.
+
+    This is what several hooks per page bought. Before that, the second
+    install into any page failed, and kernel functions are packed several to a
+    page - so "trace every Nt* entry point" did not fail cleanly, it failed on
+    an arbitrary subset determined by where the linker put things.
+
+    Each target still gets its prologue decoded separately, and one that cannot
+    be decoded is skipped and named rather than hooked with a guessed length.
+    """
+    limit = max(1, min(int(limit), 64))
+    resolved = module_by_name(module)
+    if resolved is None:
+        return f"no loaded module called {module!r}"
+
+    wanted = contains.lower()
+    targets = [(a, n) for a, n in exports(resolved["base"])
+               if wanted in n.lower()]
+    if not targets:
+        return f"{resolved['name']} exports nothing matching {contains!r}"
+
+    extra = hook_options(**options)
+    installed, skipped = [], []
+    for address, name in targets[:limit]:
+        try:
+            prolog = safe_prolog_length(read_bytes(address, 64))
+        except (CtlError, DecodeError) as error:
+            skipped.append(f"{name}: {error}")
+            continue
+        text = ctl("hook-trace", f"{address:x}", str(prolog), *extra)
+        values = pairs(text)
+        if as_int(values, "status", -1) & 0xFFFFFFFF:
+            skipped.append(f"{name}: "
+                           f"{STATUS_NAMES.get(as_int(values, 'status') & 0xFFFFFFFF, 'failed')}")
+        else:
+            installed.append(f"{name} (id {as_int(values, 'hookid')}, "
+                             f"prologue {prolog})")
+
+    lines = [f"{len(installed)} of {min(len(targets), limit)} hooked"]
+    if len(targets) > limit:
+        lines[0] += f"; {len(targets) - limit} more matched but the limit is {limit}"
+    lines += [""] + [f"  {entry}" for entry in installed]
+    if skipped:
+        lines += ["", f"{len(skipped)} skipped:"] + [f"  {s}" for s in skipped]
+    lines += ["", "svmhv_trace_summary is the way to read what these produce; "
+              "svmhv_unhook_all takes them all off again."]
+    return "\n".join(lines)
+
+
+def tool_watch_range(target: str, size: int, mode: str = "write",
+                     **options) -> str:
+    """Watch every page a range touches.
+
+    A watch traps a page, but a structure or a buffer worth watching is a
+    range, and asking somebody to work out which pages that covers is asking
+    them to get it wrong at the edges. This installs one watch per page and
+    reports them as a group.
+    """
+    if mode not in ("write", "access"):
+        return "mode must be 'write' or 'access'"
+    size = max(1, min(int(size), 64 * 4096))
+
+    start = resolve(target)
+    first = start & ~0xFFF
+    last = (start + size - 1) & ~0xFFF
+    pages = list(range(first, last + 0x1000, 0x1000))
+
+    extra = hook_options(**options)
+    installed, failed = [], []
+    for page in pages:
+        values = pairs(ctl("watch", f"{page:x}", mode, *extra))
+        if as_int(values, "status", -1) & 0xFFFFFFFF:
+            failed.append(f"{page:#x}: "
+                          f"{STATUS_NAMES.get(as_int(values, 'status') & 0xFFFFFFFF, 'failed')}")
+        else:
+            installed.append(page)
+
+    lines = [f"{mode} watch over {size} byte(s) at {target} "
+             f"= {len(pages)} page(s), {len(installed)} armed"]
+    for page in installed:
+        lines.append(f"  {page:#018x}")
+    if failed:
+        lines += ["", "failed:"] + [f"  {f}" for f in failed]
+    lines += ["", "A watch fires twice per store and traps the WHOLE page, so "
+              "these will also report accesses to whatever else shares them."]
+    return "\n".join(lines)
+
+
+def tool_unhook_all() -> str:
+    """Take everything off, in one call.
+
+    The panic button. An agent exploring will eventually arm something that
+    floods the ring or slows the machine badly enough that issuing removals one
+    at a time is painful, and that is exactly when it needs to be one call.
+    """
+    removed, failed = 0, []
+    for hook in records(ctl("hooks"), "hook"):
+        if hook.get("active") != "1":
+            continue
+        target = hook.get("target", "0")
+        status = as_int(pairs(ctl("unhook", hexarg(target))), "status", -1)
+        if status == 0:
+            removed += 1
+        else:
+            failed.append(f"{target}: {status & 0xFFFFFFFF:#010x}")
+
+    if removed == 0 and not failed:
+        return "nothing was armed"
+    lines = [f"removed {removed} hook(s)"]
+    if failed:
+        lines += ["", "failed:"] + [f"  {f}" for f in failed]
+    return "\n".join(lines)
+
+
 def tool_unhook(target: str) -> str:
     # Symbols everywhere a target is accepted, or the tool that installed a hook
     # by name cannot remove it by the same name.
@@ -2302,6 +2418,62 @@ TOOLS = [
         },
         "handler": lambda a: tool_watch(a["target"], a.get("mode", "write"),
                                         in_process=a.get("in_process")),
+    },
+    {
+        "name": "svmhv_hook_many",
+        "description":
+            "Trace every export in a module whose name matches, in one call - "
+            "'every Nt* entry point' or 'every FsRtl* function'. Each target "
+            "gets its own prologue decoded; one that cannot be decoded safely "
+            "is skipped and named rather than hooked with a guessed length. "
+            "Read the result with svmhv_trace_summary, and take them all off "
+            "with svmhv_unhook_all.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string", "description": "'nt' for the kernel"},
+                "contains": {"type": "string",
+                             "description": "substring of the export name"},
+                "limit": {"type": "integer",
+                          "description": "how many at most, 1-64 (default 24)"},
+                "process": {"type": "string",
+                            "description": "only record calls from this image"},
+            },
+            "required": ["module", "contains"],
+        },
+        "handler": lambda a: tool_hook_many(
+            a["module"], a["contains"], a.get("limit", 24),
+            process=a.get("process")),
+    },
+    {
+        "name": "svmhv_watch_range",
+        "description":
+            "Watch every page a range of memory touches, as one group - for a "
+            "structure or a buffer, where working out which pages it spans by "
+            "hand is a way to miss the edges. Each page is trapped whole, so "
+            "accesses to anything sharing those pages are reported too.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string",
+                           "description": "hex address or module!symbol"},
+                "size": {"type": "integer", "description": "bytes to cover"},
+                "mode": {"type": "string", "enum": ["write", "access"]},
+            },
+            "required": ["target", "size"],
+        },
+        "handler": lambda a: tool_watch_range(a["target"], a["size"],
+                                              a.get("mode", "write")),
+    },
+    {
+        "name": "svmhv_unhook_all",
+        "description":
+            "Remove every armed hook and watch in one call. The panic button: "
+            "use it when something is flooding the trace ring or slowing the "
+            "machine, which is exactly when removing them one at a time is "
+            "painful.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": lambda a: tool_unhook_all(),
     },
     {
         "name": "svmhv_unhook",
