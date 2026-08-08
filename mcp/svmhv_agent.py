@@ -338,6 +338,17 @@ def tool_hooks() -> str:
             f"{int(row.get('gpa', '0'), 0):#014x} "
             f"{int(row.get('hits', '0'), 0):>10,}  {prolog or '-'}"
         )
+        # Where the hook goes when it fires. For a shellcode hook that is the
+        # page holding your own bytes, which is the only way to find it again -
+        # to read what it wrote, or to check what is actually there.
+        detour = int(row.get("detour", "0"), 0)
+        if detour:
+            lines.append(f"{'':>3} {'':<8} -> {ACTION_NAMES.get(action, '?')} "
+                         f"at {detour:#018x}")
+
+    lines.append("")
+    lines.append("hits counts trace and watch firings; a shellcode hook does "
+                 "not go through the recorder, so it stays at zero.")
     return "\n".join(lines)
 
 
@@ -526,17 +537,48 @@ def tool_hook_detour(target: str, detour: str, prolog_length: int | None = None,
         f"detoured {target} -> {detour}{note}")
 
 
-def tool_hook_shellcode(target: str, shellcode_hex: str,
+def tool_assemble(source: str, base: str = "0") -> str:
+    """Assemble and show what would actually run, without installing anything."""
+    try:
+        code, listing = assemble_checked(source, _parse_number(base))
+    except AsmError as error:
+        return f"assembly failed: {error}"
+    return "\n".join([
+        f"{len(code)} bytes", "", listing, "", f"hex: {code.hex()}",
+        "",
+        "That listing is the disassembler reading back what the assembler "
+        "produced, not a repeat of your input - if they disagreed this would "
+        "have failed instead.",
+    ])
+
+
+def tool_hook_shellcode(target: str, shellcode_hex: str = "", asm: str = "",
                         prolog_length: int | None = None, **options) -> str:
-    cleaned = shellcode_hex.replace(" ", "").replace("0x", "").replace(",", "")
+    listing = ""
+    if asm:
+        if shellcode_hex:
+            return "give either asm or shellcode_hex, not both"
+        try:
+            code, listing = assemble_checked(asm, 0)
+        except AsmError as error:
+            return f"assembly failed: {error}"
+        cleaned = code.hex()
+    else:
+        cleaned = shellcode_hex.replace(" ", "").replace("0x", "").replace(",", "")
     if not cleaned or len(cleaned) % 2:
-        return "shellcode_hex must be an even number of hex digits"
+        return "give asm, or shellcode_hex as an even number of hex digits"
     if len(cleaned) // 2 > 1024:
         return f"shellcode is {len(cleaned) // 2} bytes; the limit is 1024"
+    address, prolog, note = hook_target(target, prolog_length)
     extra = hook_options(**options)
-    return hook_result(
-        ctl("hook-shellcode", hexarg(target), str(prolog_length), cleaned, *extra),
-        f"{len(cleaned) // 2} bytes of shellcode on {target}")
+    outcome = hook_result(
+        ctl("hook-shellcode", address, prolog, cleaned, *extra),
+        f"{len(cleaned) // 2} bytes of shellcode on {target}{note}")
+
+    # Show what was installed, not what was asked for.  These bytes run in
+    # kernel mode with nothing catching a fault, so the listing is the last
+    # chance to notice that they are not what was meant.
+    return outcome + (f"\n\nwhat will run:\n{listing}" if listing else "")
 
 
 def tool_watch(target: str, mode: str = "write", **options) -> str:
@@ -1146,6 +1188,329 @@ def disassemble_one(code: bytes, at: int, address: int) -> tuple[int, str, int |
                 target = None      # a data reference, not a branch
 
     return length, text, target
+
+
+# --------------------------------------------------------------- assembly
+
+class AsmError(ValueError):
+    pass
+
+
+_ARITH_OPCODES = {"add": 0, "or": 1, "adc": 2, "sbb": 3,
+                  "and": 4, "sub": 5, "xor": 6, "cmp": 7}
+_SIZE_NAMES = {"byte": 1, "word": 2, "dword": 4, "qword": 8}
+
+
+def _register_number(name: str) -> tuple[int, int]:
+    """(number, size in bytes) for a register name."""
+    name = name.lower()
+    for table, size in ((REG64, 8), (REG32, 4), (REG8, 1)):
+        if name in table:
+            return table.index(name), size
+    raise AsmError(f"unknown register {name!r}")
+
+
+class _PendingLabels(dict):
+    """Labels during the first pass, when forward ones are not placed yet.
+
+    Every branch is encoded as a rel32 whatever the distance, so an
+    instruction's size never depends on where its target turns out to be -
+    which lets pass one answer zero for a label it has not seen and still
+    measure every instruction correctly.
+    """
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or key.replace("_", "").isalnum()
+
+    def __missing__(self, key):
+        return 0
+
+
+def _parse_number(text: str, labels: dict[str, int] | None = None) -> int:
+    text = text.strip()
+    if labels is not None and text in labels:
+        return labels[text]
+    negative = text.startswith("-")
+    if negative:
+        text = text[1:]
+    try:
+        value = int(text, 16) if text.lower().startswith("0x") else int(text, 0)
+    except ValueError:
+        raise AsmError(f"{text!r} is not a number")
+    return -value if negative else value
+
+
+class _Memory:
+    def __init__(self, base, displacement, size):
+        self.base = base                    # register number
+        self.displacement = displacement
+        self.size = size                    # operand size in bytes, or None
+
+
+def _parse_operand(text: str):
+    """A register, an immediate, or [base+displacement]."""
+    text = text.strip()
+    size = None
+
+    for name, width in _SIZE_NAMES.items():
+        if text.lower().startswith(name):
+            size = width
+            text = text[len(name):].strip()
+            if text.lower().startswith("ptr"):
+                text = text[3:].strip()
+            break
+
+    if text.startswith("["):
+        if not text.endswith("]"):
+            raise AsmError(f"unclosed memory operand in {text!r}")
+        inside = text[1:-1].strip()
+        displacement = 0
+        for separator in ("+", "-"):
+            index = inside.find(separator, 1)
+            if index > 0:
+                displacement = _parse_number(inside[index:].replace("+", ""))
+                if separator == "-":
+                    displacement = -abs(_parse_number(inside[index + 1:]))
+                inside = inside[:index].strip()
+                break
+        if "*" in inside:
+            raise AsmError("scaled index operands are not supported")
+        base, _ = _register_number(inside)
+        return _Memory(base, displacement, size)
+
+    try:
+        number, width = _register_number(text)
+        return ("reg", number, width)
+    except AsmError:
+        pass
+    return ("imm", text)
+
+
+def _rex(w, reg, rm_base, force=False):
+    value = 0x40 | (0x08 if w else 0) | ((reg >> 3) << 2) | (rm_base >> 3)
+    return bytes([value]) if (value != 0x40 or force) else b""
+
+
+def _modrm_memory(reg: int, memory: _Memory) -> bytes:
+    base = memory.base & 7
+    displacement = memory.displacement
+
+    # rbp/r13 as a base with mod=00 means RIP-relative, so it always needs a
+    # displacement byte; rsp/r12 as a base always needs a SIB to express it.
+    if displacement == 0 and base != 5:
+        mod = 0
+        tail = b""
+    elif -128 <= displacement <= 127:
+        mod = 1
+        tail = bytes([displacement & 0xFF])
+    else:
+        mod = 2
+        tail = (displacement & 0xFFFFFFFF).to_bytes(4, "little")
+
+    out = bytes([(mod << 6) | ((reg & 7) << 3) | base])
+    if base == 4:
+        out += b"\x24"                      # SIB: base=rsp, no index
+    return out + tail
+
+
+def assemble_line(text: str, address: int, labels: dict[str, int]) -> bytes:
+    """One instruction. Intel syntax, the subset a hook stub needs."""
+    text = text.split(";")[0].strip()
+    if not text:
+        return b""
+
+    parts = text.split(None, 1)
+    mnemonic = parts[0].lower()
+    operands = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
+
+    if mnemonic in ("ret", "retn"):
+        return b"\xC3"
+    if mnemonic == "nop":
+        return b"\x90"
+    if mnemonic in ("int3", "brk"):
+        return b"\xCC"
+    if mnemonic == "leave":
+        return b"\xC9"
+
+    if mnemonic in ("push", "pop") and len(operands) == 1:
+        number, size = _register_number(operands[0])
+        if size != 8:
+            raise AsmError(f"{mnemonic} takes a 64-bit register")
+        prefix = b"\x41" if number >= 8 else b""
+        return prefix + bytes([(0x50 if mnemonic == "push" else 0x58)
+                               + (number & 7)])
+
+    if mnemonic in ("jmp", "call") and len(operands) == 1:
+        target = _parse_number(operands[0], labels)
+        delta = target - (address + 5)
+        return bytes([0xE9 if mnemonic == "jmp" else 0xE8]) + \
+            (delta & 0xFFFFFFFF).to_bytes(4, "little")
+
+    if mnemonic.startswith("j") and mnemonic[1:] in CONDITION and len(operands) == 1:
+        target = _parse_number(operands[0], labels)
+        delta = target - (address + 6)
+        return bytes([0x0F, 0x80 + CONDITION.index(mnemonic[1:])]) + \
+            (delta & 0xFFFFFFFF).to_bytes(4, "little")
+
+    if len(operands) != 2:
+        raise AsmError(f"{mnemonic!r} with {len(operands)} operand(s) is not "
+                       "supported")
+
+    left = _parse_operand(operands[0])
+    right = _parse_operand(operands[1])
+
+    # mov reg, imm - the only place a 64-bit immediate is encodable.
+    if mnemonic == "mov" and isinstance(left, tuple) and left[0] == "reg" \
+            and isinstance(right, tuple) and right[0] == "imm":
+        number, size = left[1], left[2]
+        value = _parse_number(right[1], labels)
+        if size == 8:
+            # Shellcode has a 1024-byte budget and small constants are most of
+            # what a stub loads, so take the shorter encodings where they are
+            # exactly equivalent. Writing a 32-bit register zero-extends into
+            # the full 64, which covers every value that fits unsigned - and
+            # 0xC0000022, the status code most likely to be loaded here, is one
+            # of them. A negative value needs the sign-extended form instead.
+            if 0 <= value <= 0xFFFFFFFF:
+                return _rex(False, 0, number) + bytes([0xB8 + (number & 7)]) + \
+                    value.to_bytes(4, "little")
+            if -0x80000000 <= value < 0:
+                return _rex(True, 0, number) + \
+                    bytes([0xC7, 0xC0 | (number & 7)]) + \
+                    (value & 0xFFFFFFFF).to_bytes(4, "little")
+            return _rex(True, 0, number) + bytes([0xB8 + (number & 7)]) + \
+                (value & (2 ** 64 - 1)).to_bytes(8, "little")
+        if size == 4:
+            return _rex(False, 0, number) + bytes([0xB8 + (number & 7)]) + \
+                (value & 0xFFFFFFFF).to_bytes(4, "little")
+        raise AsmError("mov to an 8-bit register with an immediate is not "
+                       "supported")
+
+    if mnemonic in ("mov", "lea") or mnemonic in _ARITH_OPCODES or \
+            mnemonic == "test":
+        # reg, reg
+        if isinstance(left, tuple) and left[0] == "reg" and \
+                isinstance(right, tuple) and right[0] == "reg":
+            if mnemonic == "lea":
+                raise AsmError("lea needs a memory operand")
+            size = left[2]
+            opcode = {"mov": 0x89, "test": 0x85}.get(
+                mnemonic, (_ARITH_OPCODES.get(mnemonic, 0) << 3) | 0x01)
+            if size == 1:
+                opcode -= 1
+            return _rex(size == 8, right[1], left[1]) + \
+                bytes([opcode, 0xC0 | ((right[1] & 7) << 3) | (left[1] & 7)])
+
+        # reg, [mem]  and  lea reg, [mem]
+        if isinstance(left, tuple) and left[0] == "reg" and \
+                isinstance(right, _Memory):
+            size = left[2]
+            opcode = {"mov": 0x8B, "lea": 0x8D}.get(
+                mnemonic, (_ARITH_OPCODES.get(mnemonic, 0) << 3) | 0x03)
+            return _rex(size == 8, left[1], right.base) + bytes([opcode]) + \
+                _modrm_memory(left[1], right)
+
+        # [mem], reg
+        if isinstance(left, _Memory) and isinstance(right, tuple) and \
+                right[0] == "reg":
+            size = right[2]
+            opcode = {"mov": 0x89}.get(
+                mnemonic, (_ARITH_OPCODES.get(mnemonic, 0) << 3) | 0x01)
+            if size == 1:
+                opcode -= 1
+            return _rex(size == 8, right[1], left.base) + bytes([opcode]) + \
+                _modrm_memory(right[1], left)
+
+        # reg, imm  /  [mem], imm
+        if isinstance(right, tuple) and right[0] == "imm":
+            value = _parse_number(right[1], labels)
+            if mnemonic == "mov":
+                if isinstance(left, _Memory):
+                    size = left.size or 8
+                    return _rex(size == 8, 0, left.base) + bytes([0xC7]) + \
+                        _modrm_memory(0, left) + \
+                        (value & 0xFFFFFFFF).to_bytes(4, "little")
+                raise AsmError("unreachable: handled above")
+
+            digit = _ARITH_OPCODES.get(mnemonic)
+            if digit is None:
+                raise AsmError(f"{mnemonic} with an immediate is not supported")
+            short = -128 <= value <= 127
+            if isinstance(left, _Memory):
+                size = left.size or 8
+                return _rex(size == 8, 0, left.base) + \
+                    bytes([0x83 if short else 0x81]) + \
+                    _modrm_memory(digit, left) + \
+                    (bytes([value & 0xFF]) if short
+                     else (value & 0xFFFFFFFF).to_bytes(4, "little"))
+            size = left[2]
+            return _rex(size == 8, 0, left[1]) + \
+                bytes([0x83 if short else 0x81,
+                       0xC0 | (digit << 3) | (left[1] & 7)]) + \
+                (bytes([value & 0xFF]) if short
+                 else (value & 0xFFFFFFFF).to_bytes(4, "little"))
+
+    raise AsmError(f"{text!r} is not in the supported subset")
+
+
+def assemble(source: str, base_address: int = 0) -> bytes:
+    """Assemble Intel-syntax source, resolving labels in a second pass."""
+    lines = []
+    # ';' introduces a comment, which assemble_line strips - it is not a
+    # separator, or "mov rax, 1 ; set the result" becomes two instructions.
+    for raw in source.splitlines():
+        piece = raw.strip()
+        if piece:
+            lines.append(piece)
+
+    # Pass one: sizes, to place the labels.
+    labels: dict[str, int] = {}
+    address = base_address
+    pending = []
+    for line in lines:
+        if line.endswith(":") and " " not in line[:-1]:
+            labels[line[:-1]] = address
+            continue
+        pending.append((address, line))
+        address += len(assemble_line(line, address, _PendingLabels()))
+
+    # Pass two: the real thing, now that every label has an address.
+    out = bytearray()
+    for at, line in pending:
+        encoded = assemble_line(line, base_address + len(out), labels)
+        out += encoded
+    return bytes(out)
+
+
+def assemble_checked(source: str, base_address: int = 0) -> tuple[bytes, str]:
+    """Assemble, then read the result back with the disassembler.
+
+    The round trip is the point.  These bytes are about to run in kernel mode
+    on a real thread with no exception handling around them, so the thing worth
+    having is not a promise that the assembler is right but a listing of what
+    will actually execute, produced by a separate decoder that has been read
+    against real ntoskrnl.  If the two disagree the code is refused - an
+    encoding neither of them agrees on is not one to find out about in ring 0.
+    """
+    code = assemble(source, base_address)
+    if not code:
+        raise AsmError("nothing to assemble")
+
+    lines = []
+    offset = 0
+    while offset < len(code):
+        try:
+            length, text, _ = disassemble_one(code, offset, base_address + offset)
+        except DecodeError as error:
+            raise AsmError(
+                f"assembled to bytes the disassembler cannot read back at "
+                f"offset {offset}: {error}. "
+                f"bytes so far: {code[offset:offset + 8].hex()}")
+        lines.append(f"  {base_address + offset:#06x}  "
+                     f"{code[offset:offset + length].hex():<24} {text}")
+        offset += length
+
+    return code, "\n".join(lines)
 
 
 def instruction_offsets(code: bytes, limit: int = 32) -> list[int]:
@@ -3010,6 +3375,32 @@ TOOLS = [
                 "capture", "capture2", "spoof", "spoof2", "block") if k in a}),
     },
     {
+        "name": "svmhv_assemble",
+        "description":
+            "Assemble Intel-syntax x86-64 and show what it encodes to, without "
+            "installing anything. The listing is produced by disassembling the "
+            "result, so it is what will actually execute rather than a repeat "
+            "of the input; if the two decoders disagree the assembly is "
+            "refused. Supports mov/lea, add/sub/and/or/xor/cmp/test, push/pop, "
+            "call/jmp/jcc with labels, and ret - the subset a hook stub needs. "
+            "Use it to check a stub before svmhv_hook_shellcode runs it in "
+            "kernel mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string",
+                           "description": "Intel syntax, one instruction per "
+                                          "line; 'label:' on its own line, "
+                                          "';' starts a comment"},
+                "base": {"type": "string",
+                         "description": "address to assemble at, for the "
+                                        "listing (default 0)"},
+            },
+            "required": ["source"],
+        },
+        "handler": lambda a: tool_assemble(a["source"], a.get("base", "0")),
+    },
+    {
         "name": "svmhv_hook_shellcode",
         "description":
             "Hook a function so it runs raw bytes you supply, entered with the "
@@ -3022,7 +3413,11 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "target": {"type": "string"},
-                "shellcode_hex": {"type": "string"},
+                "asm": {"type": "string", "description":
+                    "Intel-syntax source, assembled and round-trip checked "
+                    "before install; use this instead of shellcode_hex"},
+                "shellcode_hex": {"type": "string", "description":
+                    "raw bytes, if you already have them"},
                 "prolog_length": {"type": "integer"},
                 "process": {"type": "string", "description":
                     "only fire when this image is the current process, e.g. "
@@ -3051,10 +3446,11 @@ TOOLS = [
                     "do not call the original at all; return this value to the "
                     "caller instead"},
             },
-            "required": ["target", "shellcode_hex"],
+            "required": ["target"],
         },
         "handler": lambda a: tool_hook_shellcode(
-            a["target"], a["shellcode_hex"], (int(a["prolog_length"]) if a.get("prolog_length") else None),
+            a["target"], a.get("shellcode_hex", ""), a.get("asm", ""),
+            (int(a["prolog_length"]) if a.get("prolog_length") else None),
             **{k: a[k] for k in (
                 "process", "pid", "caller_base", "caller_size", "filter_expr",
                 "capture", "capture2", "spoof", "spoof2", "block") if k in a}),

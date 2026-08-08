@@ -76,17 +76,46 @@ BOOLEAN SvIsHypervisorMemory(_In_ PVOID Address)
  */
 #define CONTROL_RUNAWAY_HITS_PER_POLL   20000
 
+/*
+ * The same idea for execution hooks, which the rule above cannot see.
+ *
+ * It watches the trace ring, and a hook that detours or runs shellcode
+ * produces no records at all - it never reaches the recorder.  So a shellcode
+ * hook on a busy function is invisible to it, and busy is easy to hit by
+ * accident: hooking anything in the file path means every read the control
+ * agent does goes through it, and the agent is what would take the hook off.
+ *
+ * Nested page faults are the signal that does cover them.  Every entry into a
+ * hooked page and every exit is one switch, so this counts what the mechanism
+ * actually costs regardless of what the hook then does.  200 000 a second is
+ * far past useful and roughly ten times what a hook on a genuinely busy
+ * function produces.
+ *
+ * Learned the hard way: a shellcode hook on a filter-manager path slowed the
+ * guest until the agent could no longer answer, which is the same shape as the
+ * watch problem this file already guarded against - and the guard did not
+ * apply.
+ */
+#define CONTROL_RUNAWAY_SWITCHES_PER_POLL   20000
+
 static UINT64 g_LastTraceRecords;
+static UINT64 g_LastHookSwitches;
 
 static VOID SvControlDisarmRunaways(VOID)
 {
     const UINT64 records = g_Snapshot.Stats.TraceRecords;
-    const UINT64 delta = records - g_LastTraceRecords;
+    const UINT64 switches = g_Snapshot.Stats.HookSwitches;
+    const UINT64 recordDelta = records - g_LastTraceRecords;
+    const UINT64 switchDelta = switches - g_LastHookSwitches;
+    const BOOLEAN watchRunaway = (recordDelta >= CONTROL_RUNAWAY_HITS_PER_POLL);
+    const BOOLEAN execRunaway =
+        (switchDelta >= CONTROL_RUNAWAY_SWITCHES_PER_POLL);
     ULONG i;
 
     g_LastTraceRecords = records;
+    g_LastHookSwitches = switches;
 
-    if (delta < CONTROL_RUNAWAY_HITS_PER_POLL)
+    if (!watchRunaway && !execRunaway)
     {
         return;
     }
@@ -95,12 +124,29 @@ static VOID SvControlDisarmRunaways(VOID)
     {
         const SVMHV_HOOK_INFO* hook = &g_Snapshot.Hooks.Hooks[i];
 
-        if (hook->Active != 0 && hook->Kind != SVMHV_HOOK_EXEC)
+        if (hook->Active == 0)
+        {
+            continue;
+        }
+
+        if (hook->Kind != SVMHV_HOOK_EXEC && watchRunaway)
         {
             DbgPrint("svmhv: disarming runaway %s watch on %llx "
                      "(%llu hits in one interval)\n",
                      (hook->Kind == SVMHV_HOOK_WRITE) ? "write" : "access",
-                     hook->Target, delta);
+                     hook->Target, recordDelta);
+            (VOID)SvHookRemove((PVOID)hook->Target);
+        }
+        else if (hook->Kind == SVMHV_HOOK_EXEC && execRunaway)
+        {
+            /*
+             * Every armed execution hook goes, not the worst one: there is no
+             * per-hook switch count to pick by, and by the time this fires the
+             * machine is too slow to be choosy on.
+             */
+            DbgPrint("svmhv: disarming runaway hook on %llx "
+                     "(%llu page switches in one interval)\n",
+                     hook->Target, switchDelta);
             (VOID)SvHookRemove((PVOID)hook->Target);
         }
     }

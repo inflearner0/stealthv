@@ -276,6 +276,42 @@ try:
 except agent.DecodeError:
     check("an unknown opcode is refused, never guessed", True)
 
+print("assembly")
+for source, want, why in (
+        ("mov rax, 0x100000000", "48b80000000001000000", "imm64 when it needs one"),
+        ("mov rax, 0xC0000022", "b8220000c0", "a 32-bit load zero-extends"),
+        ("mov rax, -1", "48c7c0ffffffff", "a negative needs sign extension"),
+        ("mov rcx, rdx", "4889d1", "mov r64, r64"),
+        ("xor eax, eax", "31c0", "32-bit needs no REX"),
+        ("push rbx", "53", "push r64"),
+        ("push r15", "4157", "push needs REX.B for r8-r15"),
+        ("sub rsp, 0x28", "4883ec28", "imm8 form when it fits"),
+        ("mov [rsp+0x20], rax", "4889442420", "rsp as a base needs a SIB"),
+        ("mov [rbp+0], rax", "48894500", "rbp as a base needs a displacement"),
+        ("mov rax, [rcx+8]", "488b4108", "load with disp8"),
+        ("lea rdx, [rcx+0x10]", "488d5110", "lea"),
+        ("test rcx, rcx", "4885c9", "test"),
+        ("ret", "c3", "ret"),
+):
+    got = agent.assemble(source).hex()
+    check(f"assembles {why}", got == want, f"{source!r} -> {got}, want {want}")
+
+# Labels resolve, and the round trip is what proves the encoding.
+code, listing = agent.assemble_checked(
+    "test rcx, rcx\nje done\nmov rax, 1\ndone:\nret", 0)
+check("a forward label resolves to the right offset",
+      "je 0xe" in listing, listing)
+check("the listing is disassembled, not echoed", "ret" in listing.splitlines()[-1])
+
+for bad, why in (("mov rax, rbx, rcx", "three operands"),
+                 ("frobnicate rax", "an unknown mnemonic"),
+                 ("mov rax, [rcx+rdx*4]", "a scaled index")):
+    try:
+        agent.assemble(bad)
+        check(f"rejects {why}", False)
+    except agent.AsmError:
+        check(f"rejects {why}", True)
+
 print("decorated names")
 for mangled, want in (
         ("??1CClfsBaseFilePersisted@@UEAA@XZ",
