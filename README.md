@@ -161,37 +161,6 @@ Two guards exist because of that, and neither makes it a good idea:
 Watch data you expect to be touched rarely. For anything frequent, use an exec
 hook with a filter.
 
-## Configuration
-
-There is no registry key, and nothing is read at load time. Every option is a
-constant in `driver/config.h`, folded into the code at build time.
-
-That is itself a concealment decision. A driver that reads its own settings out
-of `HKLM` leaves the settings sitting in `HKLM`, where anyone curious about the
-machine can read the exact list of what is being hidden from them and switch it
-off — and the read is a behaviour worth noticing in its own right. The only way
-to change any of this is to rebuild.
-
-| Constant | Default | What it does |
-|---|---|---|
-| `STEALTHV_NESTED_PAGING` | 1 | nested page tables, and therefore hooks and page hiding |
-| `STEALTHV_HIDE_SVM_CPUID` | 0 | impossible without intercepting `CPUID`; see above |
-| `STEALTHV_HIDE_EFER` | 1 | intercept `EFER` so `SVME` reads as clear |
-| `STEALTHV_TSC_OFFSET` | 0 | removed: `CPUID` is not intercepted, so there is no cost |
-| `STEALTHV_HIDE_PAGES` | 1 | the driver's own pages read as zeroes |
-| `STEALTHV_ALWAYS_FLUSH_TLB` | 0 | flush the ASID every entry — **leave this off** |
-| `STEALTHV_CONTROL_INTERFACE` | 1 | answer the control leaf and run its worker |
-
-Everything defaults to the most concealed setting it can. Two are worth knowing
-about before you change them: `STEALTHV_HIDE_EFER` costs about 200 000 exits per
-second under a parent hypervisor (Hyper-V's synthetic MSRs sit outside every
-MSRPM range), and `STEALTHV_CONTROL_INTERFACE 0` removes the interface entirely
-— nothing to open, no worker thread — at the cost of `svmhvctl` and the MCP
-server. The reasoning for both is in [CLAUDE.md](CLAUDE.md).
-
-A processor without nested paging, or a host with `EFER.NXE` clear, now **refuses
-to load** rather than quietly running with the hooks and page hiding absent.
-
 ## What is and is not tested
 
 Verified in the lab VM (Ryzen 9 6900HS, 8 vCPU, Windows 11 22621, nested under
@@ -244,7 +213,7 @@ Deliberate, in the name of staying readable:
   that tries to *use* SVM still finds a `#UD` from `VMRUN` where it did not
   expect one.
 - Hiding `EFER.SVME` costs about 200 000 extra exits per second under a parent
-  hypervisor, and that cost is now paid by default — see *Configuration* above.
+  hypervisor, and that cost is paid by default.
   Set `STEALTHV_HIDE_EFER` to 0 to get the throughput back, at the price of a
   ring-0 `RDMSR` seeing `SVME` set.
 - `RDMSR`/`WRMSR` exits are not TSC-compensated, and while `EFER` is hidden, an

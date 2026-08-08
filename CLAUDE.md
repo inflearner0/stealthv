@@ -337,7 +337,21 @@ attach a kernel debugger and leave it attached without ever breaking in, and
 watch which processor stops making progress — `!running -it` while the soak is
 wedged answers in one command what a day of power-cycling does not.
 
-## Configuration rationale
+## Configuration
+
+No registry key: every option is a constant in `driver/config.h`, folded in at
+build time. A driver that reads its settings out of `HKLM` leaves them sitting
+in `HKLM` for anyone curious about the machine.
+
+| Constant | Default | What it does |
+|---|---|---|
+| `STEALTHV_NESTED_PAGING` | 1 | nested page tables, and therefore hooks and page hiding |
+| `STEALTHV_HIDE_SVM_CPUID` | 0 | impossible without intercepting `CPUID`; see above |
+| `STEALTHV_HIDE_EFER` | 1 | intercept `EFER` so `SVME` reads as clear |
+| `STEALTHV_TSC_OFFSET` | 0 | removed: `CPUID` is not intercepted, so there is no cost |
+| `STEALTHV_HIDE_PAGES` | 1 | the driver's own pages read as zeroes |
+| `STEALTHV_ALWAYS_FLUSH_TLB` | 0 | flush the ASID every entry — **leave this off** |
+| `STEALTHV_CONTROL_INTERFACE` | 1 | answer the control leaf and run its worker |
 
 Everything defaults to the most concealed setting it can. Two of them are worth
 understanding before you change anything.
