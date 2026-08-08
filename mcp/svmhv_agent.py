@@ -1765,6 +1765,70 @@ def tool_search(pattern: str, module: str = "", start: str = "",
     return "\n".join(lines)
 
 
+def tool_xrefs(target: str, module: str = "", limit: int = 40) -> str:
+    """Who reaches this address.
+
+    svmhv_disassemble follows calls outwards; this follows them inwards, and
+    between them a function stops being an isolated blob. Three kinds are worth
+    finding and they mean different things: a direct call is a caller, a jump
+    is usually a tail call or a thunk, and an eight-byte pointer sitting in
+    data is a table - a dispatch table, a callback registration, an import.
+    """
+    limit = max(1, min(int(limit), 200))
+    address = resolve(target)
+
+    resolved = module_by_name(module) if module else module_for(address)
+    if resolved is None:
+        return ("give a module to search: the target is not inside a loaded "
+                "one, so there is nothing to sweep")
+
+    begin, span = resolved["base"], min(resolved["size"], 8 << 20)
+    absolute = address.to_bytes(8, "little")
+
+    calls, jumps, pointers = [], [], []
+    for page, blob in sorted(dump_range(begin, span).items()):
+        for offset in range(len(blob)):
+            byte = blob[offset]
+
+            # E8/E9 rel32: the displacement is from the end of the instruction.
+            if byte in (0xE8, 0xE9) and offset + 5 <= len(blob):
+                delta = int.from_bytes(blob[offset + 1:offset + 5], "little",
+                                       signed=True)
+                if page + offset + 5 + delta == address:
+                    (calls if byte == 0xE8 else jumps).append(page + offset)
+
+            if (offset + 8 <= len(blob)
+                    and blob[offset:offset + 8] == absolute):
+                pointers.append(page + offset)
+
+        if len(calls) + len(jumps) + len(pointers) >= limit * 3:
+            break
+
+    lines = [f"references to {symbolize(address)} ({address:#x}) in "
+             f"{resolved['name']}", ""]
+
+    def render(title, found, note):
+        if not found:
+            return
+        lines.append(f"{title} ({len(found)}) - {note}")
+        for where in found[:limit]:
+            lines.append(f"  {where:#018x}  {symbolize(where)}")
+        if len(found) > limit:
+            lines.append(f"  ... and {len(found) - limit} more")
+        lines.append("")
+
+    render("direct calls", calls, "these are its callers")
+    render("jumps", jumps, "usually a tail call or a thunk")
+    render("pointers in data", pointers,
+           "a table: dispatch, callback registration or import")
+
+    if not (calls or jumps or pointers):
+        lines.append("none found. A function reached only through a computed "
+                     "call - a vtable or a table indexed at runtime - leaves "
+                     "no reference a scan can see.")
+    return "\n".join(lines)
+
+
 def tool_disassemble(target: str, count: int = 24, pid: int = 0) -> str:
     """A listing with branch targets named.
 
@@ -2261,6 +2325,30 @@ TOOLS = [
             "required": ["pid"],
         },
         "handler": lambda a: tool_process_modules(a["pid"]),
+    },
+    {
+        "name": "svmhv_xrefs",
+        "description":
+            "Who reaches an address: direct calls (its callers), jumps (tail "
+            "calls and thunks) and eight-byte pointers in data (dispatch "
+            "tables, callback registrations, imports). svmhv_disassemble "
+            "follows calls outwards; this follows them inwards. A function "
+            "reached only through a computed call leaves nothing to find, and "
+            "that is reported rather than hidden.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string",
+                           "description": "hex address or module!symbol"},
+                "module": {"type": "string",
+                           "description": "module to sweep; defaults to the "
+                                          "one containing the target"},
+                "limit": {"type": "integer", "description": "default 40"},
+            },
+            "required": ["target"],
+        },
+        "handler": lambda a: tool_xrefs(a["target"], a.get("module", ""),
+                                        a.get("limit", 40)),
     },
     {
         "name": "svmhv_disassemble",
