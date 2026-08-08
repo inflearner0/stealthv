@@ -7,6 +7,7 @@
 #include "hook.h"
 #include "trace.h"
 #include "memory.h"
+#include "objects.h"
 
 /*
  * Both are ordinary driver globals on purpose: a client resolves svmhv!g_Control
@@ -202,6 +203,12 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
 
     case SVMHV_CMD_TRANSLATE:
         return SvMemoryTranslate(&g_Control.Request);
+
+    case SVMHV_CMD_DEVICES:
+        return SvObjectsDevices(&g_Control.Request);
+
+    case SVMHV_CMD_SYMLINKS:
+        return SvObjectsSymbolicLinks(&g_Control.Request);
 
     default:
         return STATUS_INVALID_DEVICE_REQUEST;

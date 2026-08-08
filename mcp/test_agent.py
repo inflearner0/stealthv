@@ -148,6 +148,24 @@ def fake_ctl(*arguments):
         return ("status=0x00000000\nbytes=16\n"
                 "fffff78000000000  48 89 5c 24 08 57 48 83 ec 20 48 8b d9 33 c0 c3"
                 "  H..$.WH.. H..3..\n")
+    if arguments[0] == "devices":
+        if arguments[1] == "quiet":
+            return "status=0x00000000\ndevices=0\n"
+        return ("status=0x00000000\n"
+                "device 0xffffab0011112220 type=0x22 flags=0x40 chars=0x100 "
+                "ext=0xffffab0011112370 stack=1 name=\\Device\\Null\n"
+                "  attached 0xffffab0022223330 driver=0xffffab0033334440 "
+                "name=\\Driver\\Snoop\n"
+                "devices=1\n")
+    if arguments[0] == "symlinks":
+        if arguments[1] == "0":
+            return ("status=0x00000000\n"
+                    "link NUL -> \\Device\\Null\n"
+                    "next=1\n"
+                    "links=1\n")
+        return ("status=0x00000000\n"
+                "link PhysicalDrive0 -> \\Device\\Harddisk0\\DR0\n"
+                "links=1\n")
     if arguments[0] == "translate":
         if arguments[1] == "dead":
             return "status=0x00000000\nva=0xdead not mapped\n"
@@ -515,6 +533,34 @@ check("a physical write reports what it wrote",
       "wrote 4 of 4 bytes at guest physical" in text, text)
 check("a physical write takes no pid",
       calls[-1] == ("writephys", "1000", "deadbeef"), calls[-1])
+
+text = rpc("tools/call", {"name": "svmhv_devices", "arguments": {
+    "name": "null"}})["result"]["content"][0]["text"]
+check("devices names the device", "\\Device\\Null" in text, text)
+check("devices shows what is filtering it", "\\Driver\\Snoop" in text, text)
+check("devices counts them", "1 device object(s)" in text, text)
+check("devices does not echo the count line back", "devices=1" not in text, text)
+
+text = rpc("tools/call", {"name": "svmhv_devices", "arguments": {
+    "name": "quiet"}})["result"]["content"][0]["text"]
+check("a driver with no devices is said to be unreachable by name",
+      "owns no device objects" in text, text)
+
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_symlinks", "arguments": {}})["result"]["content"][0]["text"]
+check("symlinks follows the resume index",
+      calls == [("symlinks", "0"), ("symlinks", "1")], calls)
+check("symlinks reports both pages", "2 of 2 symbolic link(s)" in text, text)
+
+text = rpc("tools/call", {"name": "svmhv_symlinks", "arguments": {
+    "contains": "harddisk"}})["result"]["content"][0]["text"]
+check("symlinks filters on the target as well as the name",
+      "PhysicalDrive0" in text and "NUL ->" not in text, text)
+
+text = rpc("tools/call", {"name": "svmhv_symlinks", "arguments": {
+    "contains": "nothing-like-this"}})["result"]["content"][0]["text"]
+check("symlinks says how many it looked at when nothing matches",
+      "2 link(s) looked at" in text, text)
 
 calls.clear()
 text = rpc("tools/call", {"name": "svmhv_translate", "arguments": {

@@ -462,6 +462,8 @@ typedef struct _SVMHV_SNAPSHOT
 #define SVMHV_CMD_DRIVER_OBJECT 8
 #define SVMHV_CMD_WRITE_PHYSICAL 9
 #define SVMHV_CMD_TRANSLATE     10
+#define SVMHV_CMD_DEVICES       11
+#define SVMHV_CMD_SYMLINKS      12
 
 typedef struct _SVMHV_CONTROL
 {

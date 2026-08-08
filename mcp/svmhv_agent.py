@@ -3507,6 +3507,81 @@ def tool_driver(name: str) -> str:
     return "\n".join(lines)
 
 
+def tool_devices(name: str) -> str:
+    """The devices a driver owns, and whatever is filtering them.
+
+    The dispatch table says how a driver can be entered; this says how anything
+    outside the kernel reaches it at all. A driver with no device object is not
+    reachable from user mode by any name, which for a .sys that was loaded
+    deliberately is a fact worth having early.
+    """
+    text = ctl("devices", name)
+    body = "\n".join(line for line in text.splitlines()
+                     if not line.startswith("status="))
+    lines = [line for line in body.splitlines() if line.strip()]
+    count = 0
+    for line in lines:
+        if line.startswith("devices="):
+            count = int(line.split("=", 1)[1] or 0)
+
+    if count == 0:
+        return (f"{name} owns no device objects.\n"
+                "Nothing in user mode can open it by name; it is reached "
+                "some other way - as a filter, from another driver, or not "
+                "at all after DriverEntry.")
+
+    out = [f"{name}: {count} device object(s)", ""]
+    for line in lines:
+        if line.startswith("devices=") or line.startswith("truncated="):
+            continue
+        out.append("  " + line if not line.startswith("  ") else "  " + line)
+    if any(line.startswith("truncated=") for line in lines):
+        out.append("  ... more than fitted in one answer")
+
+    named = [line for line in lines if " name=\\" in line]
+    if named:
+        out += ["",
+                "Cross-reference a name against svmhv_symlinks to find the "
+                "string an application would open."]
+    return "\n".join(out)
+
+
+def tool_symlinks(contains: str = "") -> str:
+    """Every symbolic link in \\GLOBAL??, optionally filtered by substring.
+
+    This is the missing half of a device name: an application opens \\\\.\\Foo,
+    which is a link, and the link is the only record of which device that was.
+    """
+    wanted = contains.lower()
+    found: list[str] = []
+    start = 0
+
+    # Several hundred of them, about forty to an answer; the driver says where
+    # to resume and stops saying it when there is nothing left.
+    for _ in range(64):
+        text = ctl("symlinks", str(start))
+        nxt = None
+        for line in text.splitlines():
+            if line.startswith("link "):
+                found.append(line[len("link "):])
+            elif line.startswith("next="):
+                nxt = int(line.split("=", 1)[1] or 0)
+        if nxt is None:
+            break
+        start = nxt
+
+    matched = [entry for entry in found
+               if not wanted or wanted in entry.lower()]
+    if not matched:
+        return (f"no symbolic link matches {contains!r} "
+                f"({len(found)} link(s) looked at)")
+
+    head = (f"{len(matched)} of {len(found)} symbolic link(s)"
+            + (f" matching {contains!r}" if contains else ""))
+    body = "\n".join(f"  {entry}" for entry in sorted(matched))
+    return f"{head}\n\n{body}"
+
+
 def tool_imports(module_name: str) -> str:
     """What a module calls. For a driver with no exports, this is the profile."""
     module = module_by_name(module_name)
@@ -3927,6 +4002,40 @@ TOOLS = [
             "required": ["name"],
         },
         "handler": lambda a: tool_driver(a["name"]),
+    },
+    {
+        "name": "svmhv_devices",
+        "description":
+            "The device objects a driver owns, with their names, device type, "
+            "flags, extension pointer, and every filter attached above them. "
+            "The dispatch table says how a driver can be entered; this says how "
+            "anything outside the kernel reaches it in the first place - and a "
+            "filter driver becomes visible here and nowhere else. A driver with "
+            "no device object cannot be opened by name at all.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {
+                "type": "string",
+                "description": "driver name, e.g. 'null' for \\Driver\\Null"}},
+            "required": ["name"],
+        },
+        "handler": lambda a: tool_devices(a["name"]),
+    },
+    {
+        "name": "svmhv_symlinks",
+        "description":
+            "Every symbolic link in \\GLOBAL?? and what it points at. This is "
+            "the missing half of a device name: an application opens \\\\.\\Foo, "
+            "which is a link, and the link is the only record of which device "
+            "that was. Filter by substring to work backwards from a device name "
+            "to the string a program would have used to open it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"contains": {
+                "type": "string",
+                "description": "only links whose name or target contains this"}},
+        },
+        "handler": lambda a: tool_symlinks(a.get("contains", "")),
     },
     {
         "name": "svmhv_sections",

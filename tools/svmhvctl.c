@@ -1104,6 +1104,8 @@ static void Usage(void)
         "  svmhvctl hook-shellcode <target> <prolog> <hexbytes>\n"
         "  svmhvctl modules\n"
         "  svmhvctl driverobj <name>\n"
+        "  svmhvctl devices   <name>\n"
+        "  svmhvctl symlinks  [start]\n"
         "  svmhvctl read  <address> [length] [pid]\n"
         "  svmhvctl dump  <address> <length> [pid]\n"
         "  svmhvctl readphys  <gpa> [length]\n"
@@ -1271,6 +1273,52 @@ int main(int argc, char** argv)
             memcpy(&address, data, 8);
             printf("driver_object=0x%llx\n", address);
         }
+        return 0;
+    }
+
+    /*
+     * These two answer in text rather than in bytes: the driver formats the
+     * lines, because what it is reporting - an object's name, a link's target -
+     * is not in any structure a client could read for itself.
+     */
+    if (_stricmp(argv[1], "devices") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX] = { 0 };
+        unsigned int returned = 0;
+        const size_t length = strlen(argv[2]);
+
+        if (length == 0 || length >= 64)
+        {
+            fprintf(stderr, "driver name must be 1-63 characters\n");
+            return 1;
+        }
+        memcpy(data, argv[2], length);
+
+        if (!SubmitMemory(SVMHV_CMD_DEVICES, 0, REQ_MEM_MAX, 0, data, data,
+                          &returned))
+        {
+            return 2;
+        }
+        data[(returned < REQ_MEM_MAX) ? returned : REQ_MEM_MAX - 1] = 0;
+        fputs((const char*)data, stdout);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "symlinks") == 0)
+    {
+        unsigned char data[REQ_MEM_MAX] = { 0 };
+        unsigned int returned = 0;
+        const unsigned int start = (argc >= 3)
+                                 ? (unsigned int)strtoul(argv[2], NULL, 0) : 0;
+
+        /* The start index rides in the process id field; see objects.h. */
+        if (!SubmitMemory(SVMHV_CMD_SYMLINKS, 0, REQ_MEM_MAX, start, NULL, data,
+                          &returned))
+        {
+            return 2;
+        }
+        data[(returned < REQ_MEM_MAX) ? returned : REQ_MEM_MAX - 1] = 0;
+        fputs((const char*)data, stdout);
         return 0;
     }
 
