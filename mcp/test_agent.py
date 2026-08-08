@@ -221,6 +221,38 @@ for bad, why in (("4889c8", "bytes that run out mid-prologue"),
     except agent.DecodeError:
         check(f"refuses {why}", True)
 
+print("disassembly")
+for encoding, want in (
+        ("4889c8", "mov rax, rcx"),
+        ("4883ec28", "sub rsp, 0x28"),
+        ("48895c2408", "mov [rsp+0x8], rbx"),
+        ("4157", "push r15"),
+        ("33c0", "xor eax, eax"),
+        ("4885c9", "test rcx, rcx"),
+        ("f30f1efa", "endbr64"),
+        ("48b81122334455667788", "mov rax, 0x8877665544332211"),
+        ("488b4c2420", "mov rcx, [rsp+0x20]"),
+        ("65488b042588010000", "mov rax, gs:[0x188]"),
+        ("64488b042530000000", "mov rax, fs:[0x30]"),
+        ("0f1f440000", "nop [rax+rax*1]"),
+):
+    _, got, _ = agent.disassemble_one(bytes.fromhex(encoding), 0, 0x140001000)
+    check(f"disassembles {want}", got == want, f"got {got!r}")
+
+_, text, target = agent.disassemble_one(bytes.fromhex("e800000000"), 0, 0x140001000)
+check("a call resolves its target", target == 0x140001005 and text.startswith("call"),
+      (text, target))
+_, text, target = agent.disassemble_one(bytes.fromhex("7405"), 0, 0x140001000)
+check("a short jump resolves its target", target == 0x140001007, (text, target))
+# An opcode it does not know must stop the decoder rather than produce a wrong
+# mnemonic; the listing renders those as db, which is the tool's job, not this
+# function's.
+try:
+    agent.disassemble_one(bytes.fromhex("6208"), 0, 0x1000)
+    check("an unknown opcode is refused, never guessed", False)
+except agent.DecodeError:
+    check("an unknown opcode is refused, never guessed", True)
+
 print("symbols")
 _fake_modules = [
     {"base": 0xFFFFF80010000000, "size": 0x900000,

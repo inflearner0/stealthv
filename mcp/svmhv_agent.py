@@ -636,6 +636,305 @@ def safe_prolog_length(code: bytes, minimum: int = 14) -> int:
     return total
 
 
+# ------------------------------------------------------------- disassembly
+
+REG64 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+REG32 = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
+         "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"]
+REG8 = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil",
+        "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
+
+ARITH = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"]
+SHIFT = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sal", "sar"]
+CONDITION = ["o", "no", "b", "ae", "e", "ne", "be", "a",
+             "s", "ns", "p", "np", "l", "ge", "le", "g"]
+GROUP3 = ["test", "test", "not", "neg", "mul", "imul", "div", "idiv"]
+GROUP5 = ["inc", "dec", "call", "callf", "jmp", "jmpf", "push", "?"]
+
+
+def _register(index: int, size: int) -> str:
+    if size == 8:
+        return REG64[index]
+    if size == 4:
+        return REG32[index]
+    if size == 1:
+        return REG8[index]
+    return REG64[index]
+
+
+def _signed(value: int, width: int) -> int:
+    top = 1 << (width * 8 - 1)
+    return value - (top << 1) if value & top else value
+
+
+def _hex(value: int) -> str:
+    return f"-0x{-value:x}" if value < 0 else f"0x{value:x}"
+
+
+class _Operand:
+    """One decoded ModRM, rendered lazily so RIP-relative can use the address."""
+
+    def __init__(self, text, rip_target=None):
+        self.text = text
+        self.rip_target = rip_target
+
+
+def _decode_modrm(code, i, size, rex_b, rex_x, rex_r):
+    """Returns (operand, reg_index, next_offset)."""
+    modrm = code[i]
+    i += 1
+    mod, reg, rm = modrm >> 6, ((modrm >> 3) & 7) | (rex_r << 3), modrm & 7
+
+    if mod == 3:
+        return _Operand(_register(rm | (rex_b << 3), size)), reg, i
+
+    base = None
+    index_text = ""
+    if rm == 4:                                     # SIB
+        sib = code[i]
+        i += 1
+        scale, index, sib_base = sib >> 6, ((sib >> 3) & 7) | (rex_x << 3), sib & 7
+        if index != 4:
+            index_text = f"+{REG64[index]}*{1 << scale}"
+        if mod == 0 and sib_base == 5:
+            displacement = _signed(int.from_bytes(code[i:i + 4], "little"), 4)
+            i += 4
+            return _Operand(f"[{_hex(displacement)}{index_text}]"), reg, i
+        base = REG64[sib_base | (rex_b << 3)]
+    elif mod == 0 and rm == 5:                      # RIP-relative
+        displacement = _signed(int.from_bytes(code[i:i + 4], "little"), 4)
+        i += 4
+        return _Operand("[rip%+#x]" % displacement, rip_target=displacement), reg, i
+    else:
+        base = REG64[rm | (rex_b << 3)]
+
+    displacement = 0
+    if mod == 1:
+        displacement = _signed(code[i], 1)
+        i += 1
+    elif mod == 2:
+        displacement = _signed(int.from_bytes(code[i:i + 4], "little"), 4)
+        i += 4
+
+    inside = base + index_text
+    if displacement:
+        inside += ("+" if displacement > 0 else "-") + f"0x{abs(displacement):x}"
+    return _Operand(f"[{inside}]"), reg, i
+
+
+def disassemble_one(code: bytes, at: int, address: int) -> tuple[int, str, int | None]:
+    """Decode one instruction.
+
+    Returns (length, text, branch_target). Not a complete disassembler - it
+    covers the integer subset a compiler emits, and anything it does not
+    recognise comes back as 'db' rather than a guess, because a wrong mnemonic
+    is worse than an honest gap. The branch target is what makes it useful for
+    reverse engineering: it is resolved to a symbol by the caller, so a listing
+    shows which functions this one calls.
+    """
+    length = instruction_length(code, at)
+    raw = code[at:at + length]
+    i = at
+    size = 4
+    rex_b = rex_x = rex_r = 0
+    segment = ""
+
+    while i < len(code):
+        byte = code[i]
+        if byte == 0x66:
+            size = 2
+            i += 1
+        elif byte in (0x64, 0x65):
+            # fs:/gs: is never noise on x64 - gs is where the KPCR lives, so
+            # "gs:[0x188]" is the current thread and "[0x188]" is nonsense.
+            segment = "fs:" if byte == 0x64 else "gs:"
+            i += 1
+        elif byte in (0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x67):
+            i += 1
+        else:
+            break
+
+    if 0x40 <= code[i] <= 0x4F:
+        rex = code[i]
+        rex_b, rex_x, rex_r = rex & 1, (rex >> 1) & 1, (rex >> 2) & 1
+        if rex & 8:
+            size = 8
+        i += 1
+
+    opcode = code[i]
+    i += 1
+    text = None
+    target = None
+
+    def modrm(operand_size=None):
+        return _decode_modrm(code, i, operand_size or size, rex_b, rex_x, rex_r)
+
+    if opcode == 0x0F:
+        second = code[i]
+        i += 1
+        if 0x80 <= second <= 0x8F:
+            delta = _signed(int.from_bytes(code[i:i + 4], "little"), 4)
+            target = address + length + delta
+            text = f"j{CONDITION[second - 0x80]} {target:#x}"
+        elif 0x90 <= second <= 0x9F:
+            operand, _, i = modrm(1)
+            text = f"set{CONDITION[second - 0x90]} {operand.text}"
+        elif 0x40 <= second <= 0x4F:
+            operand, reg, i = modrm()
+            text = f"cmov{CONDITION[second - 0x40]} {_register(reg, size)}, {operand.text}"
+        elif second in (0xB6, 0xB7, 0xBE, 0xBF):
+            operand, reg, i = modrm(1 if second in (0xB6, 0xBE) else 2)
+            name = "movzx" if second in (0xB6, 0xB7) else "movsx"
+            text = f"{name} {_register(reg, size)}, {operand.text}"
+        elif second == 0xAF:
+            operand, reg, i = modrm()
+            text = f"imul {_register(reg, size)}, {operand.text}"
+        elif second == 0x1E:
+            text = "endbr64"
+        elif second == 0x1F:
+            operand, _, i = modrm()
+            text = f"nop {operand.text}"
+        elif second == 0x05:
+            text = "syscall"
+        elif second == 0x0B:
+            text = "ud2"
+        elif second == 0xA2:
+            text = "cpuid"
+    elif opcode < 0x40 and (opcode & 7) < 6 and (opcode >> 3) < 8:
+        name = ARITH[opcode >> 3]
+        low = opcode & 7
+        if low in (0, 1, 2, 3):
+            operand_size = 1 if low in (0, 2) else size
+            operand, reg, i = modrm(operand_size)
+            register = _register(reg, operand_size)
+            text = (f"{name} {operand.text}, {register}" if low in (0, 1)
+                    else f"{name} {register}, {operand.text}")
+        else:
+            width = 1 if low == 4 else min(size, 4)
+            value = _signed(int.from_bytes(code[i:i + width], "little"), width)
+            i += width
+            text = f"{name} {_register(0, 1 if low == 4 else size)}, {_hex(value)}"
+    elif 0x50 <= opcode <= 0x57:
+        text = f"push {REG64[(opcode - 0x50) | (rex_b << 3)]}"
+    elif 0x58 <= opcode <= 0x5F:
+        text = f"pop {REG64[(opcode - 0x58) | (rex_b << 3)]}"
+    elif 0x70 <= opcode <= 0x7F:
+        delta = _signed(code[i], 1)
+        target = address + length + delta
+        text = f"j{CONDITION[opcode - 0x70]} {target:#x}"
+    elif opcode in (0x80, 0x81, 0x83):
+        operand_size = 1 if opcode == 0x80 else size
+        operand, reg, i = modrm(operand_size)
+        width = 1 if opcode in (0x80, 0x83) else min(size, 4)
+        value = _signed(int.from_bytes(code[i:i + width], "little"), width)
+        i += width
+        text = f"{ARITH[reg & 7]} {operand.text}, {_hex(value)}"
+    elif opcode in (0x84, 0x85):
+        operand_size = 1 if opcode == 0x84 else size
+        operand, reg, i = modrm(operand_size)
+        text = f"test {operand.text}, {_register(reg, operand_size)}"
+    elif opcode in (0x88, 0x89, 0x8A, 0x8B):
+        operand_size = 1 if opcode in (0x88, 0x8A) else size
+        operand, reg, i = modrm(operand_size)
+        register = _register(reg, operand_size)
+        text = (f"mov {operand.text}, {register}" if opcode in (0x88, 0x89)
+                else f"mov {register}, {operand.text}")
+    elif opcode == 0x8D:
+        operand, reg, i = modrm()
+        text = f"lea {_register(reg, size)}, {operand.text}"
+    elif opcode == 0x90:
+        text = "nop"
+    elif 0xB8 <= opcode <= 0xBF:
+        width = 8 if size == 8 else 4
+        value = int.from_bytes(code[i:i + width], "little")
+        i += width
+        text = f"mov {_register((opcode - 0xB8) | (rex_b << 3), size)}, {value:#x}"
+    elif 0xB0 <= opcode <= 0xB7:
+        text = f"mov {REG8[(opcode - 0xB0) | (rex_b << 3)]}, {code[i]:#x}"
+        i += 1
+    elif opcode in (0xC0, 0xC1, 0xD0, 0xD1, 0xD3):
+        operand, reg, i = modrm()
+        if opcode in (0xC0, 0xC1):
+            text = f"{SHIFT[reg & 7]} {operand.text}, {code[i]:#x}"
+            i += 1
+        elif opcode == 0xD3:
+            text = f"{SHIFT[reg & 7]} {operand.text}, cl"
+        else:
+            text = f"{SHIFT[reg & 7]} {operand.text}, 1"
+    elif opcode == 0xC3:
+        text = "ret"
+    elif opcode == 0xC9:
+        text = "leave"
+    elif opcode == 0xCC:
+        text = "int3"
+    elif opcode in (0xC6, 0xC7):
+        operand_size = 1 if opcode == 0xC6 else size
+        operand, _, i = modrm(operand_size)
+        width = 1 if opcode == 0xC6 else min(size, 4)
+        value = int.from_bytes(code[i:i + width], "little")
+        i += width
+        text = f"mov {operand.text}, {value:#x}"
+    elif opcode in (0xE8, 0xE9):
+        delta = _signed(int.from_bytes(code[i:i + 4], "little"), 4)
+        target = address + length + delta
+        text = f"{'call' if opcode == 0xE8 else 'jmp'} {target:#x}"
+    elif opcode == 0xEB:
+        delta = _signed(code[i], 1)
+        target = address + length + delta
+        text = f"jmp {target:#x}"
+    elif opcode in (0xF6, 0xF7):
+        operand_size = 1 if opcode == 0xF6 else size
+        operand, reg, i = modrm(operand_size)
+        name = GROUP3[reg & 7]
+        if (reg & 7) in (0, 1):
+            width = 1 if opcode == 0xF6 else min(size, 4)
+            value = int.from_bytes(code[i:i + width], "little")
+            i += width
+            text = f"{name} {operand.text}, {value:#x}"
+        else:
+            text = f"{name} {operand.text}"
+    elif opcode == 0xFF:
+        operand, reg, i = modrm()
+        text = f"{GROUP5[reg & 7]} {operand.text}"
+        if operand.rip_target is not None:
+            target = address + length + operand.rip_target
+    elif opcode == 0x63:
+        operand, reg, i = modrm(4)
+        text = f"movsxd {_register(reg, 8)}, {operand.text}"
+    elif opcode in (0x68, 0x6A):
+        width = 1 if opcode == 0x6A else 4
+        value = _signed(int.from_bytes(code[i:i + width], "little"), width)
+        i += width
+        text = f"push {_hex(value)}"
+
+    if text is not None and segment and "[" in text:
+        text = text[:text.index("[")] + segment + text[text.index("["):]
+
+    if text is None:
+        text = "db " + " ".join(f"{b:02x}" for b in raw)
+    elif "[rip" in text:
+        # Render RIP-relative against the real address, which is the only form
+        # a reader can do anything with.
+        for operand_text in (text,):
+            pass
+        delta = None
+        marker = text.index("[rip")
+        end = text.index("]", marker)
+        inside = text[marker + 4:end]
+        try:
+            delta = int(inside, 16) if inside.startswith(("0x", "-0x")) else int(inside, 0)
+        except ValueError:
+            delta = None
+        if delta is not None:
+            absolute = address + length + delta
+            text = text[:marker] + f"[{absolute:#x}]" + text[end + 1:]
+            if target is None:
+                target = None      # a data reference, not a branch
+
+    return length, text, target
+
+
 def instruction_offsets(code: bytes, limit: int = 32) -> list[int]:
     offsets = []
     at = 0
@@ -961,6 +1260,57 @@ def tool_exports(module_name: str, contains: str = "") -> str:
         lines.append(f"{address:#018x}  {name}")
     if len(found) > 400:
         lines.append(f"... and {len(found) - 400} more; narrow it with 'contains'")
+    return "\n".join(lines)
+
+
+def tool_disassemble(target: str, count: int = 24, pid: int = 0) -> str:
+    """A listing with branch targets named.
+
+    The naming is the point. A call to 0xfffff80023f1a2b0 tells a reader
+    nothing; a call to nt!ExAllocatePool2 tells them what the function does.
+    Following the calls out of a function is most of how anybody works out what
+    it is for, and it is the one thing a raw byte dump cannot support.
+    """
+    count = max(1, min(int(count), 200))
+    address = resolve(target)
+    # Roughly 15 bytes per instruction, bounded by what one transfer carries.
+    wanted = min(4096, max(64, count * 15))
+    code = read_bytes(address, wanted, pid)
+    if not code:
+        return f"nothing readable at {target}"
+
+    lines = [f"{symbolize(address)}  ({address:#x})", ""]
+    offset = 0
+    shown = 0
+    calls: list[str] = []
+
+    while offset < len(code) and shown < count:
+        try:
+            length, text, branch = disassemble_one(code, offset, address + offset)
+        except DecodeError:
+            lines.append(f"  {address + offset:#018x}  "
+                         f"{code[offset]:02x}"
+                         f"{'':<28}db {code[offset]:#04x}   <- not decoded")
+            offset += 1
+            shown += 1
+            continue
+
+        raw = code[offset:offset + length].hex()
+        note = ""
+        if branch is not None:
+            named = symbolize(branch)
+            if named != f"{branch:#x}":
+                note = f"   ; {named}"
+                if text.startswith("call") and named not in calls:
+                    calls.append(named)
+
+        lines.append(f"  {address + offset:#018x}  {raw:<30} {text}{note}")
+        offset += length
+        shown += 1
+
+    if calls:
+        lines += ["", "calls out of this range:"]
+        lines += [f"  {name}" for name in calls]
     return "\n".join(lines)
 
 
@@ -1381,6 +1731,30 @@ TOOLS = [
             "required": ["name"],
         },
         "handler": lambda a: tool_symbol(a["name"]),
+    },
+    {
+        "name": "svmhv_disassemble",
+        "description":
+            "Disassemble at an address or symbol, with every call and jump "
+            "target resolved to module!symbol and the calls summarised at the "
+            "end. Following the calls out of a function is most of how you work "
+            "out what it does, and it is the one thing a byte dump cannot "
+            "support. Covers the integer subset a compiler emits; anything "
+            "unrecognised is shown as db rather than guessed at.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string",
+                           "description": "hex address or module!symbol"},
+                "count": {"type": "integer",
+                          "description": "instructions, 1-200 (default 24)"},
+                "pid": {"type": "integer",
+                        "description": "disassemble in this process"},
+            },
+            "required": ["target"],
+        },
+        "handler": lambda a: tool_disassemble(a["target"], a.get("count", 24),
+                                              a.get("pid", 0)),
     },
     {
         "name": "svmhv_explain",
