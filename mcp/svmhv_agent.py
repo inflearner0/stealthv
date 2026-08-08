@@ -530,12 +530,14 @@ def tool_watch(target: str, mode: str = "write", **options) -> str:
     if mode not in ("write", "access"):
         return "mode must be 'write' or 'access'"
     extra = hook_options(**options)
-    return hook_result(ctl("watch", hexarg(target), mode, *extra),
+    return hook_result(ctl("watch", f"{resolve(target):x}", mode, *extra),
                        f"{mode} watch on the page holding {target}")
 
 
 def tool_unhook(target: str) -> str:
-    status = as_int(pairs(ctl("unhook", hexarg(target))), "status", -1)
+    # Symbols everywhere a target is accepted, or the tool that installed a hook
+    # by name cannot remove it by the same name.
+    status = as_int(pairs(ctl("unhook", f"{resolve(target):x}")), "status", -1)
     return (f"removed the hook on {target}" if status == 0
             else f"remove failed: {status & 0xFFFFFFFF:#010x}")
 

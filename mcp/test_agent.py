@@ -303,6 +303,12 @@ for bad, why in (("nosuch.sys!Foo", "an unloaded module"),
 calls.clear()
 rpc("tools/call", {"name": "svmhv_hook_trace",
                    "arguments": {"target": "nt!NtCreateFile"}})
+calls.clear()
+rpc("tools/call", {"name": "svmhv_unhook",
+                   "arguments": {"target": "nt!NtCreateFile"}})
+check("unhook accepts a symbol too",
+      calls and calls[-1] == ("unhook", "fffff80010001000"), calls)
+
 check("a hook target may be a symbol",
       calls and calls[-1][1] == "fffff80010001000", calls)
 

@@ -40,6 +40,15 @@ typedef struct _SVM_HOOK
      * going away.
      */
     UINT32  TargetProcessId;
+
+    /*
+     * TRUE if this record owns the page's shared resources - the MDL, the
+     * shadow copy and the two page table entry pointers.  Several execution
+     * hooks may sit in one page; the first one to arrive owns them and the
+     * rest borrow, so only the owner may free them and only the last hook to
+     * leave the page may put its mappings back.
+     */
+    BOOLEAN OwnsPage;
     UINT64* PrimaryPte;
     UINT64* ShadowPte;
     ULONG   PrologLength;
@@ -198,17 +207,19 @@ VOID SvHookCleanup(VOID)
     {
         SVM_HOOK* hook = &g_Hooks[i];
 
-        if (hook->Mdl != NULL)
+        if (hook->Mdl != NULL && hook->OwnsPage)
         {
             MmUnlockPages(hook->Mdl);
             IoFreeMdl(hook->Mdl);
-            hook->Mdl = NULL;
         }
-        if (hook->ShadowVa != NULL)
+        hook->Mdl = NULL;
+        /* Borrowed shadow pages point at the owner's copy; freeing one from
+           every record that shares it would free it several times over. */
+        if (hook->ShadowVa != NULL && hook->OwnsPage)
         {
             MmFreeContiguousMemory(hook->ShadowVa);
-            hook->ShadowVa = NULL;
         }
+        hook->ShadowVa = NULL;
         if (hook->ShellcodePage != NULL)
         {
             SvHookFreeExecutable(hook->ShellcodePage);
@@ -247,6 +258,23 @@ BOOLEAN SvHookFindPage(_In_ UINT64 Gpa, _Out_ SVM_HOOK_PAGE* Page)
     }
 
     return FALSE;
+}
+
+/* How many hooks are currently armed in one guest physical page. */
+static ULONG SvHookPageActiveCount(_In_ UINT64 Gpa)
+{
+    ULONG count = 0;
+    ULONG i;
+
+    for (i = 0; i < SVMHV_MAX_HOOKS; i++)
+    {
+        if (g_Hooks[i].Active != 0 && g_Hooks[i].Gpa == Gpa)
+        {
+            count++;
+        }
+    }
+
+    return count;
 }
 
 ULONG SvHookActiveCount(VOID)
@@ -622,6 +650,7 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     PVOID shadowVa = NULL;
     PMDL mdl = NULL;
     SVMHV_ATTACH attach = { 0 };
+    SVM_HOOK* pageOwner = NULL;
     const BOOLEAN isExec = (Request->Kind == SVMHV_HOOK_EXEC);
 
     Request->Trampoline = 0;
@@ -733,18 +762,59 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     }
 
     /*
-     * One hook per guest physical page.  Two in the same page would have to
-     * share one set of nested page table entries, and the second install would
-     * silently redefine the first one's behaviour.
+     * Several hooks may share one guest physical page.
+     *
+     * They have to share the page's resources, because there is only one of
+     * each: two nested page table entries, one shadow copy, one MDL pinning
+     * the page.  What they do not share is the patch - each hook writes its own
+     * jump at its own offset into the one shadow copy, and the fault handler
+     * does not care how many there are, because the page either faults or it
+     * does not.
+     *
+     * This matters more than it sounds.  Kernel functions are packed several to
+     * a page, so "instrument every Nt* entry point" was impossible while a page
+     * could hold one hook - the second install in any page failed, and which
+     * ones collided depended on where the linker happened to put things.
      */
     gpa = (UINT64)MmGetPhysicalAddress(pageVa).QuadPart;
     for (i = 0; i < SVMHV_MAX_HOOKS; i++)
     {
-        if (g_Hooks[i].Active != 0 && g_Hooks[i].Gpa == gpa)
+        SVM_HOOK* neighbour = &g_Hooks[i];
+
+        if (neighbour->Active == 0 || neighbour->Gpa != gpa)
+        {
+            continue;
+        }
+        if (neighbour->TargetVa == target)
+        {
+            status = STATUS_ALREADY_REGISTERED;    /* this exact target */
+            goto done;
+        }
+
+        /*
+         * Only execution hooks can share.  A watch traps the whole page, so a
+         * watch and a hook in one page would each be describing what the other
+         * one's entries should be, and only one of them could win.
+         */
+        if (!isExec || neighbour->Kind != SVMHV_HOOK_EXEC)
         {
             status = STATUS_ALREADY_REGISTERED;
             goto done;
         }
+
+        /*
+         * And only in kernel space.  A user page's pin is released the moment
+         * its hook is removed, which a second hook sharing that pin would not
+         * survive; kernel pins live until unload, so sharing one is safe.
+         */
+        if (Request->TargetProcessId != 0 || neighbour->TargetProcessId != 0)
+        {
+            status = STATUS_ALREADY_REGISTERED;
+            goto done;
+        }
+
+        pageOwner = neighbour;
+        break;
     }
 
     /*
@@ -799,7 +869,15 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
 
         if (isExec)
         {
-            RtlCopyMemory(previous->ShadowVa, pageVa, PAGE_SIZE);
+            /*
+             * Refresh the whole shadow copy only when nothing else is using it.
+             * With a neighbour still armed in this page, copying the original
+             * over the top would erase its patch and quietly unhook it.
+             */
+            if (SvHookPageActiveCount(gpa) == 0)
+            {
+                RtlCopyMemory(previous->ShadowVa, pageVa, PAGE_SIZE);
+            }
             RtlCopyMemory(previous->OriginalProlog, target, Request->PrologLength);
 
             if (previous->PrologLength != Request->PrologLength)
@@ -849,43 +927,60 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         goto done;
     }
 
-    /*
-     * Pin the page.  A hook keyed on a physical address is only meaningful for
-     * as long as that physical page stays where it is.
-     */
-    mdl = IoAllocateMdl(pageVa, PAGE_SIZE, FALSE, FALSE, NULL);
-    if (mdl == NULL)
+    if (pageOwner == NULL)
     {
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto done;
-    }
-
-    __try
-    {
-        MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        IoFreeMdl(mdl);
-        mdl = NULL;
-        status = STATUS_INVALID_ADDRESS;
-        goto done;
-    }
-
-    /* Re-read: locking may not move a kernel page, but do not assume it. */
-    gpa = (UINT64)MmGetPhysicalAddress(pageVa).QuadPart;
-
-    if (isExec)
-    {
-        PHYSICAL_ADDRESS highest;
-        highest.QuadPart = MAXULONG64;
-        shadowVa = MmAllocateContiguousMemory(PAGE_SIZE, highest);
-        if (shadowVa == NULL)
+        /*
+         * Pin the page.  A hook keyed on a physical address is only meaningful
+         * for as long as that physical page stays where it is.
+         */
+        mdl = IoAllocateMdl(pageVa, PAGE_SIZE, FALSE, FALSE, NULL);
+        if (mdl == NULL)
         {
             status = STATUS_INSUFFICIENT_RESOURCES;
             goto done;
         }
-        RtlCopyMemory(shadowVa, pageVa, PAGE_SIZE);
+
+        __try
+        {
+            MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            IoFreeMdl(mdl);
+            mdl = NULL;
+            status = STATUS_INVALID_ADDRESS;
+            goto done;
+        }
+
+        /* Re-read: locking may not move a kernel page, but do not assume it. */
+        gpa = (UINT64)MmGetPhysicalAddress(pageVa).QuadPart;
+
+        if (isExec)
+        {
+            PHYSICAL_ADDRESS highest;
+            highest.QuadPart = MAXULONG64;
+            shadowVa = MmAllocateContiguousMemory(PAGE_SIZE, highest);
+            if (shadowVa == NULL)
+            {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                goto done;
+            }
+            RtlCopyMemory(shadowVa, pageVa, PAGE_SIZE);
+        }
+    }
+    else
+    {
+        /*
+         * Joining a page somebody else already owns.  The pin, the shadow copy
+         * and the page table entries are all already there and already correct;
+         * taking a second MDL on the same page or copying the original over the
+         * shadow would undo the neighbour rather than add to it.
+         */
+        shadowVa = pageOwner->ShadowVa;
+    }
+
+    if (isExec)
+    {
         RtlCopyMemory(hook->OriginalProlog, target, Request->PrologLength);
     }
 
@@ -898,6 +993,7 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     hook->ShadowPa     = (shadowVa != NULL)
                        ? (UINT64)MmGetPhysicalAddress(shadowVa).QuadPart : 0;
     hook->Mdl          = mdl;
+    hook->OwnsPage     = (pageOwner == NULL);
     hook->TargetProcessId = Request->TargetProcessId;
     hook->PrologLength = isExec ? Request->PrologLength : 0;
     hook->Hits         = 0;
@@ -908,8 +1004,18 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         goto done;
     }
 
-    hook->PrimaryPte = SvNptSplitTo4Kb(&g_NptPrimary, gpa);
-    hook->ShadowPte  = SvNptSplitTo4Kb(&g_NptShadow, gpa);
+    if (pageOwner != NULL)
+    {
+        /* One page, one pair of entries: borrow the owner's rather than
+           splitting the tables again and getting the same two pointers. */
+        hook->PrimaryPte = pageOwner->PrimaryPte;
+        hook->ShadowPte  = pageOwner->ShadowPte;
+    }
+    else
+    {
+        hook->PrimaryPte = SvNptSplitTo4Kb(&g_NptPrimary, gpa);
+        hook->ShadowPte  = SvNptSplitTo4Kb(&g_NptShadow, gpa);
+    }
     if (hook->PrimaryPte == NULL || hook->ShadowPte == NULL)
     {
         status = STATUS_INSUFFICIENT_RESOURCES;
@@ -981,7 +1087,9 @@ done:
 
     if (!NT_SUCCESS(status))
     {
-        if (shadowVa != NULL)
+        /* Only if we allocated it.  When joining a page, shadowVa is the
+           neighbour's copy and freeing it here would unhook them instead. */
+        if (shadowVa != NULL && pageOwner == NULL)
         {
             MmFreeContiguousMemory(shadowVa);
         }
@@ -1022,7 +1130,33 @@ NTSTATUS SvHookRemove(_In_ PVOID Target)
             continue;
         }
 
-        SvHookRestoreEntries(hook);
+        /*
+         * Take this hook's patch out of the shadow copy first, so that a page
+         * still holding other hooks stops detouring this target and keeps
+         * detouring theirs.  The original bytes are the ones we saved when the
+         * jump went in.
+         */
+        if (hook->Kind == SVMHV_HOOK_EXEC && hook->ShadowVa != NULL)
+        {
+            const ULONG offset =
+                (ULONG)((ULONG_PTR)hook->TargetVa & (PAGE_SIZE - 1));
+
+            RtlCopyMemory((UINT8*)hook->ShadowVa + offset,
+                          hook->OriginalProlog, hook->PrologLength);
+        }
+
+        InterlockedExchange(&hook->Active, 0);
+
+        /*
+         * Only the last hook out puts the mappings back.  Doing it while a
+         * neighbour is still armed would make the page ordinary again and
+         * silently stop that hook firing - the page either faults for all of
+         * them or none.
+         */
+        if (SvHookPageActiveCount(hook->Gpa) == 0)
+        {
+            SvHookRestoreEntries(hook);
+        }
         SvSyncTlbFlush();
 
         /*
@@ -1034,7 +1168,7 @@ NTSTATUS SvHookRemove(_In_ PVOID Target)
          * The flush above is what makes this safe to do here: no processor is
          * still using a translation that depended on the page staying put.
          */
-        if (hook->TargetProcessId != 0 && hook->Mdl != NULL)
+        if (hook->TargetProcessId != 0 && hook->Mdl != NULL && hook->OwnsPage)
         {
             MmUnlockPages(hook->Mdl);
             IoFreeMdl(hook->Mdl);
