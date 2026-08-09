@@ -22,7 +22,7 @@ AMD counterpart to the Intel VT-x/EPT projects.
 ## Driven over MCP
 
 An [MCP server](mcp/svmhv_agent.py) runs **inside the guest** and exposes the
-whole instrument as 46 tools, so what drives it can be a model rather than a
+whole instrument as 47 tools, so what drives it can be a model rather than a
 person at a console. Ask what a driver's IOCTL interface is, hook the handler,
 watch the arguments arrive, patch one in flight, read the original bytes back to
 confirm the page never changed.
@@ -46,7 +46,7 @@ Each tool is `svmhv_` plus the name below:
 | **code** | `disassemble` `assemble` `xrefs` `explain` `search` `strings` |
 | **symbols** | `symbols_auto` `symbols_load` `symbol` `exports` `imports` `pdb_info` `syscalls` |
 | **modules and processes** | `modules` `sections` `processes` `process_modules` `verify` |
-| **drivers** | `driver` `devices` `symlinks` `ioctl` `ioctls` `callbacks` |
+| **drivers** | `driver` `devices` `symlinks` `ioctl` `ioctls` `watch_ioctls` `callbacks` |
 | **notes** | `note` |
 
 Symbols download themselves on first use. Disassembly and assembly use capstone
@@ -73,7 +73,7 @@ place.
 running on it. Nested page tables identity-map the whole 48-bit guest physical
 space with 1 GiB leaves, split to 4 KiB on demand. `VMLOAD`/`VMSAVE`,
 `STGI`/`CLGI`, `SKINIT` and `INVLPGA` answered with `#UD`. Devirtualises for
-sleep and re-enters on resume.
+sleep and re-enters on resume — one transition at a time; see below.
 
 **Reading the machine.** Guest virtual and guest physical memory, in the kernel
 or inside any process, without opening a handle to it or being visible to it,
@@ -114,8 +114,14 @@ firing and coming off, capture and spoofing, the memory paths, and
   outstanding problem.
 - **Long-duration stability under load.** `soak.ps1` has not been re-run since
   `CPUID` interception was removed.
-- **Resume from sleep.** Written and reviewed, but a Hyper-V guest does not do
-  S3, so nothing here can exercise it.
+- **Resume from sleep — known broken under repetition.** `svmhvctl powercycle`
+  runs the same two steps the power callback does, so the path can be exercised
+  without an S3 this lab cannot produce. One cycle works, repeatedly: eight
+  processors back, self-test passing either side. Seven to nine cycles kill the
+  machine — 0xEF `CRITICAL_PROCESS_DIED` on the ninth at two-second spacing,
+  0xB8 `ATTEMPTED_SWITCH_FROM_DPC` on the seventh at thirty-second spacing.
+  Wider spacing died sooner, so something accumulates per cycle. Not
+  root-caused.
 - **Bare metal.** Everything was measured nested under Hyper-V.
 
 `CLAUDE.md` has the engineering detail, including the four bugs that shaped the
