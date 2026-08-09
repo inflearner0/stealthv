@@ -15,9 +15,9 @@ page tables**, and studies **hypervisor detection** from inside the guest. The
 AMD counterpart to the Intel VT-x/EPT projects.
 
 > **A lab instrument.** It hides itself from the guest, installs invisible
-> kernel hooks, and runs caller-supplied shellcode in kernel mode on request.
-> Machines you own, isolated network, and read *What is and is not tested*
-> first.
+> kernel hooks, and runs caller-supplied shellcode in kernel mode on request,
+> and it will reset the machine it is running on. Machines you own, isolated
+> network, and read `CLAUDE.md` before trusting it with anything.
 
 ## Driven over MCP
 
@@ -73,7 +73,8 @@ place.
 running on it. Nested page tables identity-map the whole 48-bit guest physical
 space with 1 GiB leaves, split to 4 KiB on demand. `VMLOAD`/`VMSAVE`,
 `STGI`/`CLGI`, `SKINIT` and `INVLPGA` answered with `#UD`. Devirtualises for
-sleep and re-enters on resume — one transition at a time; see below.
+sleep and re-enters on resume — one transition at a time; repeated cycles are
+known to crash the machine.
 
 **Reading the machine.** Guest virtual and guest physical memory, in the kernel
 or inside any process, without opening a handle to it or being visible to it,
@@ -97,32 +98,5 @@ dispatcher, and `callbacks` lists every driver registered for process, thread or
 image notifications — those arrays have no symbol and look identical, so the
 driver plants a callback of its own and finds it rather than guessing.
 
-## What is and is not tested
-
-**Verified repeatedly** on an eight-processor Windows 11 guest: entering and
-leaving on every processor, the self-test's twelve checks, hooks installing and
-firing and coming off, capture and spoofing, the memory paths, and
-`cpuid exits taken: 0` from the hypervisor's own counter.
-
-**Not verified:**
-
-- **The guest still resets.** Triple faults at unpredictable intervals after
-  load — three in one afternoon at about three hours, three minutes and ten
-  minutes. The ten-minute one happened with the guest *idle*, so it is not the
-  exit load. Never a bugcheck or a dump: the host logs event 18560, and
-  `LastBootUpTime` is the only honest instrument in the guest. This is the
-  outstanding problem.
-- **Long-duration stability under load.** `soak.ps1` has not been re-run since
-  `CPUID` interception was removed.
-- **Resume from sleep — known broken under repetition.** `svmhvctl powercycle`
-  runs the same two steps the power callback does, so the path can be exercised
-  without an S3 this lab cannot produce. One cycle works, repeatedly: eight
-  processors back, self-test passing either side. Seven to nine cycles kill the
-  machine — 0xEF `CRITICAL_PROCESS_DIED` on the ninth at two-second spacing,
-  0xB8 `ATTEMPTED_SWITCH_FROM_DPC` on the seventh at thirty-second spacing.
-  Wider spacing died sooner, so something accumulates per cycle. Not
-  root-caused.
-- **Bare metal.** Everything was measured nested under Hyper-V.
-
-`CLAUDE.md` has the engineering detail, including the four bugs that shaped the
-design and the things every instrument lies about.
+`CLAUDE.md` has the engineering detail, including the four bugs that shaped
+the design and the things every instrument lies about.
