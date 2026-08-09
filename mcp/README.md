@@ -82,18 +82,19 @@ that machine.
 
 ## Tools
 
-| Tool | |
+47 of them. Each is `svmhv_` plus the name below:
+
+| | |
 |---|---|
-| `svmhv_status` | options, exits by category, host-mode cycles, TSC compensation, trace health |
-| `svmhv_exit_histogram` | every exit code taken, summed over processors |
-| `svmhv_hook_trace` | record arguments on every call, then run the original |
-| `svmhv_hook_detour` | jump to a kernel address you already have |
-| `svmhv_hook_shellcode` | jump to raw bytes you supply |
-| `svmhv_watch` | trap writes, or every access, to a page |
-| `svmhv_hooks` | every hook record, live and retired |
-| `svmhv_trace` | read the newest trace records |
-| `svmhv_trace_reset` | empty the ring |
-| `svmhv_selftest` | the driver's own end-to-end check |
+| **the hypervisor** | `status` `exit_histogram` `selftest` `service` |
+| **hooks** | `hook_trace` `hook_detour` `hook_shellcode` `hook_many` `watch` `watch_range` `unhook` `unhook_all` `hooks` |
+| **what they caught** | `trace` `trace_summary` `trace_reset` |
+| **memory** | `read` `write` `read_physical` `write_physical` `translate` |
+| **code** | `disassemble` `assemble` `xrefs` `explain` `search` `strings` |
+| **symbols** | `symbols_auto` `symbols_load` `symbol` `exports` `imports` `pdb_info` `syscalls` |
+| **modules and processes** | `modules` `sections` `processes` `process_modules` `verify` |
+| **drivers** | `driver` `devices` `symlinks` `ioctl` `ioctls` `watch_ioctls` `callbacks` |
+| **notes** | `note` |
 
 Plus `GET /health` for a quick liveness check.
 
@@ -102,9 +103,12 @@ Plus `GET /health` for a quick liveness check.
 **`prolog_length` must land on an instruction boundary.** It is how many bytes at
 the start of the target may be overwritten, minimum 14 for an absolute jump.
 There is deliberately no length disassembler in the driver — get this wrong and
-you will corrupt the function. Decode the prologue first, and note that with the
-debugger out of the picture nothing here resolves symbols for you: addresses are
-hex, and you supply them.
+you will corrupt the function. The agent decodes the prologue for you and passes
+a length that lands on an instruction boundary, so omitting `prolog_length` is
+the safe choice; supply one only when you have decoded it yourself.
+
+Symbols do resolve: `nt!NtCreateFile` works as a target, and the PDB is fetched
+from the Microsoft symbol server on first use.
 
 ## Watchpoints are page-granular and expensive
 
