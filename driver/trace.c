@@ -295,6 +295,50 @@ static ULONG SvTraceCopyIn(_Out_writes_bytes_(Maximum) UINT8* Out,
     return Length;
 }
 
+/*
+ * "<label>0x<value>" into a bounded buffer, returning what it wrote.
+ *
+ * Small enough to keep here rather than share: this runs with GIF clear, out of
+ * the exit handler, so it may not call anything that could fault or allocate -
+ * which rules out every formatting routine the kernel offers.
+ */
+static ULONG SvTraceFormatText(_Out_writes_bytes_(Maximum) UINT8* Out,
+                               _In_ ULONG Maximum, _In_ const CHAR* Label,
+                               _In_ UINT64 Value)
+{
+    static const CHAR digits[] = "0123456789abcdef";
+    CHAR temp[16];
+    ULONG used = 0;
+    int at = 0;
+
+    while (*Label != '\0' && used + 1 < Maximum)
+    {
+        Out[used++] = (UINT8)*Label++;
+    }
+    if (used + 3 >= Maximum)
+    {
+        return used;
+    }
+    Out[used++] = '0';
+    Out[used++] = 'x';
+
+    if (Value == 0)
+    {
+        Out[used++] = '0';
+        return used;
+    }
+    while (Value != 0 && at < (int)sizeof(temp))
+    {
+        temp[at++] = digits[Value & 0xF];
+        Value >>= 4;
+    }
+    while (at > 0 && used + 1 < Maximum)
+    {
+        Out[used++] = (UINT8)temp[--at];
+    }
+    return used;
+}
+
 static ULONG SvTraceCapture(_In_ const SVMHV_CAPTURE* Capture,
                             _In_ UINT64 Argument,
                             _Out_writes_bytes_(SVMHV_CAPTURE_MAX) UINT8* Out)
@@ -350,6 +394,71 @@ static ULONG SvTraceCapture(_In_ const SVMHV_CAPTURE* Capture,
         }
         return SvTraceCopyIn(Out, SVMHV_CAPTURE_MAX - 2, descriptor.Buffer,
                              descriptor.Length);
+    }
+
+    case SVMHV_CAPTURE_IRP:
+    {
+        /*
+         * An IRP, reported as the request it carries.
+         *
+         * This is the one capture that follows a pointer inside a structure
+         * rather than reading one, and it is worth the special case: the
+         * control code a driver was actually asked for is two dereferences from
+         * the IRP and lives nowhere else.  Reading the dispatcher recovers the
+         * codes a driver *can* handle; this is the only way to see which ones
+         * anything really sends, and with what buffer sizes.
+         *
+         * The offsets are the x64 IRP and IO_STACK_LOCATION layout: the current
+         * stack location at +0xB8, and inside it the major function at +0x00
+         * and the DeviceIoControl parameters from +0x08.
+         *
+         * Formatted as text rather than as a structure so that it arrives
+         * legible with no agreement about layout between here and the client -
+         * a capture slot is 128 bytes and this needs about seventy.
+         */
+        UINT64 stackLocation = 0;
+        UINT8 slot[0x38];
+        ULONG used = 0;
+
+        if (SvTraceCopyIn((UINT8*)&stackLocation, sizeof(stackLocation),
+                          (const UINT8*)Argument + 0xB8,
+                          sizeof(stackLocation)) != sizeof(stackLocation) ||
+            stackLocation == 0)
+        {
+            return 0;
+        }
+        if (SvTraceCopyIn(slot, sizeof(slot), (const VOID*)stackLocation,
+                          sizeof(slot)) != sizeof(slot))
+        {
+            return 0;
+        }
+
+        used += SvTraceFormatText(Out + used, SVMHV_CAPTURE_MAX - used,
+                                  "major=", slot[0]);
+
+        /*
+         * Parameters is a union, and only the device control majors put a
+         * control code in it.  A dispatcher that serves every major function -
+         * which is the common shape, and the reason this hook is worth
+         * installing - therefore produces reads and creates through here too,
+         * and printing their parameters as "ioctl=" invents a control code out
+         * of a buffer length.  It looked entirely plausible: an IRP_MJ_READ
+         * came out as ioctl=0xbbc2d000.
+         */
+        if (slot[0] == IRP_MJ_DEVICE_CONTROL ||
+            slot[0] == IRP_MJ_INTERNAL_DEVICE_CONTROL)
+        {
+            used += SvTraceFormatText(Out + used, SVMHV_CAPTURE_MAX - used,
+                                      " ioctl=", *(const UINT32*)(slot + 0x18));
+            used += SvTraceFormatText(Out + used, SVMHV_CAPTURE_MAX - used,
+                                      " in=", *(const UINT32*)(slot + 0x10));
+            used += SvTraceFormatText(Out + used, SVMHV_CAPTURE_MAX - used,
+                                      " out=", *(const UINT32*)(slot + 0x08));
+        }
+
+        used += SvTraceFormatText(Out + used, SVMHV_CAPTURE_MAX - used,
+                                  " dev=", *(const UINT64*)(slot + 0x28));
+        return used;
     }
 
     case SVMHV_CAPTURE_BYTES:

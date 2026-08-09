@@ -225,10 +225,13 @@ def fake_ctl(*arguments):
         return "status=0x00000000\nva=0xffff1234\ngpa=0x1a2b234\n"
     if arguments[0] in ("write", "writephys"):
         return "status=0x00000000\nwritten=4\n"
+    if arguments[0].startswith("hook-") and fake_ctl.hook_fails:
+        return "status=0xc000000d\n"
     return "status=0x00000000\nhookid=1\ngpa=0x1000\ntrampoline=0x2000\n"
 
 
 fake_ctl.folded = False
+fake_ctl.hook_fails = False
 agent.ctl = fake_ctl
 
 text = rpc("tools/call", {"name": "svmhv_status", "arguments": {}})["result"]["content"][0]["text"]
@@ -615,6 +618,35 @@ check("a plausible table is accepted",
       agent.array_shape(array_bytes(
           [0xffffab0000001001, 0xffffab0000002003]))
       == [0xffffab0000001000, 0xffffab0000002000])
+
+check("irp is an accepted capture type",
+      agent.hook_options(capture="1:irp") == ["--capture", "1:irp"],
+      agent.hook_options(capture="1:irp"))
+
+calls.clear()
+text = rpc("tools/call", {"name": "svmhv_watch_ioctls", "arguments": {
+    "name": "victim"}})["result"]["content"][0]["text"]
+check("watching ioctls hooks the DEVICE_CONTROL handler",
+      any(c[0] == "hook-trace" and c[1] == "ffffab0000002000" for c in calls),
+      calls)
+check("watching ioctls captures the IRP, which is argument 1",
+      any("1:irp" in c for c in calls), calls)
+check("watching ioctls says how to read the results",
+      "svmhv_trace" in text and "svmhv_unhook" in text, text)
+check("watching ioctls warns that a shared dispatcher floods the ring",
+      "svmhv_trace_reset" in text, text)
+
+fake_ctl.hook_fails = True
+text = rpc("tools/call", {"name": "svmhv_watch_ioctls", "arguments": {
+    "name": "victim"}})["result"]["content"][0]["text"]
+check("a hook that did not install is not reported as watching",
+      "could not hook" in text and "Read them with" not in text, text)
+fake_ctl.hook_fails = False
+
+text = rpc("tools/call", {"name": "svmhv_watch_ioctls", "arguments": {
+    "name": "onedispatch"}})["result"]["content"][0]["text"]
+check("a driver that does not handle device control is not hooked",
+      "nothing to watch" in text or "hook" in text, text)
 
 probes = agent.probe_addresses(True)
 check("the probe reports one address per kind",

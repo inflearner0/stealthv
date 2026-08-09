@@ -136,6 +136,12 @@ typedef struct _SVMHV_FILTER
 #define SVMHV_CAPTURE_UNICODE   3   /* UNICODE_STRING*                      */
 #define SVMHV_CAPTURE_OBJATTR   4   /* OBJECT_ATTRIBUTES* -> its ObjectName */
 #define SVMHV_CAPTURE_BYTES     5   /* raw, Length bytes                    */
+#define SVMHV_CAPTURE_IRP       6   /* IRP* -> the request it carries       */
+
+/* The highest type the driver will accept; raise it when adding one, or the
+   validator in SvHookInstall rejects the new kind with STATUS_INVALID_PARAMETER
+   and the only clue is that nothing was installed. */
+#define SVMHV_CAPTURE_LAST      SVMHV_CAPTURE_IRP
 
 #define SVMHV_MAX_CAPTURES      2
 #define SVMHV_CAPTURE_MAX       128
@@ -465,6 +471,7 @@ typedef struct _SVMHV_SNAPSHOT
 #define SVMHV_CMD_DEVICES       11
 #define SVMHV_CMD_SYMLINKS      12
 #define SVMHV_CMD_CALLBACK_PROBE 13
+#define SVMHV_CMD_POWER_CYCLE   14
 
 typedef struct _SVMHV_CONTROL
 {

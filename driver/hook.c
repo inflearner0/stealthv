@@ -577,7 +577,7 @@ static NTSTATUS SvHookApplyPolicy(_Inout_ SVM_HOOK* Hook,
     for (i = 0; i < Hook->CaptureCount; i++)
     {
         if (Hook->Captures[i].Argument >= 8 ||
-            Hook->Captures[i].Type > SVMHV_CAPTURE_BYTES)
+            Hook->Captures[i].Type > SVMHV_CAPTURE_LAST)
         {
             return STATUS_INVALID_PARAMETER;
         }

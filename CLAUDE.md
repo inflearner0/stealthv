@@ -51,9 +51,36 @@ used would otherwise inherit an `EVENTINJ` left valid by the last exit and
 deliver it to the guest the moment it starts, out of any context that made
 sense.
 
-**This path is not tested.** A Hyper-V guest does not do S3, so nothing in this
-lab can exercise it; it is written from the architecture and reviewed, not
-observed. If you get this onto bare metal, that is the first thing to try.
+**This path is now partly tested, and it is not right.** `svmhvctl powercycle`
+runs the same two steps the callback does — devirtualise everywhere, then enter
+guest mode again — so the path can be exercised without an S3 a Hyper-V guest
+will never do.
+
+One cycle works, repeatedly: all eight processors come back, `virtualized=8`,
+and the self-test passes 0x0fff on both sides. **Seven to nine cycles kill the
+machine.** Two runs, two different bugchecks:
+
+| spacing | died on | bugcheck |
+|---|---|---|
+| 2 s | cycle 9 | 0xEF `CRITICAL_PROCESS_DIED` (svchost) |
+| 30 s | cycle 7 | 0xB8 `ATTEMPTED_SWITCH_FROM_DPC` |
+
+Spacing made it worse rather than better, which is the point: the damage
+accumulates per cycle, it is not a matter of cycling too fast. Something is left
+behind each time that one cycle's worth of is survivable and eight is not, and
+it is not the obvious candidates — the VMCB is zeroed on every `SvPrepareVmcb`,
+the ASID is flushed on re-entry (`TlbControl = g_TlbControl` in that function,
+not the conditional one the steady-state path uses), and nothing on the path
+allocates.
+
+Read the counters through a **write-through log**: the first attempt at this
+lost the whole run to the file cache and came back as a block of NULs, which
+told me nothing about which step died. `soak.ps1` has the logging helper.
+
+So "resume from sleep works" is not a claim this supports. A real suspend
+happens minutes or days apart and would take a very long time to accumulate
+eight of anything, but that is an argument for it being slow to show, not for it
+being absent.
 
 ## Known open items
 

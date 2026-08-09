@@ -664,7 +664,7 @@ static void ReportHook(const unsigned char* request)
  *   --caller BASE SIZE      only when the return address is inside that range,
  *                           which is how you say "only when this driver calls it"
  *   --filter S:OP:VAL[:MASK]  S is 0-7, or pid/tid/ret/irql
- *   --capture ARG:TYPE[:LEN]  ansi|wide|unicode|objattr|bytes
+ *   --capture ARG:TYPE[:LEN]  ansi|wide|unicode|objattr|bytes|irp
  *   --spoof ARG:VALUE       replace an argument on the way through
  *   --block VALUE           do not call the original; return VALUE
  */
@@ -694,6 +694,7 @@ static unsigned int CaptureFromName(const char* text)
     if (_stricmp(text, "unicode") == 0) { return SVMHV_CAPTURE_UNICODE; }
     if (_stricmp(text, "objattr") == 0) { return SVMHV_CAPTURE_OBJATTR; }
     if (_stricmp(text, "bytes") == 0)   { return SVMHV_CAPTURE_BYTES; }
+    if (_stricmp(text, "irp") == 0)     { return SVMHV_CAPTURE_IRP; }
     return SVMHV_CAPTURE_NONE;
 }
 
@@ -1107,6 +1108,7 @@ static void Usage(void)
         "  svmhvctl devices   <name>\n"
         "  svmhvctl symlinks  [start]\n"
         "  svmhvctl probe     on|off\n"
+        "  svmhvctl powercycle\n"
         "  svmhvctl read  <address> [length] [pid]\n"
         "  svmhvctl dump  <address> <length> [pid]\n"
         "  svmhvctl readphys  <gpa> [length]\n"
@@ -1302,6 +1304,19 @@ int main(int argc, char** argv)
         }
         data[(returned < REQ_MEM_MAX) ? returned : REQ_MEM_MAX - 1] = 0;
         fputs((const char*)data, stdout);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "powercycle") == 0)
+    {
+        unsigned int returned = 0;
+
+        if (!SubmitMemory(SVMHV_CMD_POWER_CYCLE, 0, 8, 0, NULL, NULL,
+                          &returned))
+        {
+            return 2;
+        }
+        printf("virtualized=%u\n", returned);
         return 0;
     }
 

@@ -1065,6 +1065,39 @@ static VOID SvPowerCallback(_In_opt_ PVOID Context, _In_opt_ PVOID Argument1,
     }
 }
 
+ULONG SvCyclePowerTransition(VOID)
+{
+    ULONG virtualized = 0;
+    ULONG i;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    if (g_Cpus == NULL)
+    {
+        return 0;
+    }
+
+    /* The same two steps the callback takes, in the same order, so that what
+       this exercises is the real path and not a rehearsal of it. */
+    DbgPrint("svmhv: power cycle - devirtualising\n");
+    KeGenericCallDpc(SvDevirtualizeDpc, NULL);
+
+    DbgPrint("svmhv: power cycle - revirtualising\n");
+    SvResumeVirtualization();
+
+    for (i = 0; i < g_CpuCount; i++)
+    {
+        if (g_Cpus[i]->Virtualized != 0)
+        {
+            virtualized++;
+        }
+    }
+
+    DbgPrint("svmhv: power cycle - %lu of %lu processors back in guest mode\n",
+             virtualized, g_CpuCount);
+    return virtualized;
+}
+
 static NTSTATUS SvPowerRegister(VOID)
 {
     UNICODE_STRING name;

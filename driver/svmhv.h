@@ -195,3 +195,30 @@ BOOLEAN  SvOwnsPage(_In_ PVOID Address);
 VOID     SvFillStats(_Out_ SVMHV_STATS* Stats);
 VOID     SvFillExitHistogram(_Out_ SVMHV_EXIT_HISTOGRAM* Histogram);
 VOID     SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result);
+
+/*
+ * Leave guest mode on every processor and enter it again, which is exactly what
+ * the power callback does across a suspend.
+ *
+ * Written to test a path that had never run - a Hyper-V guest does not do S3,
+ * so the resume code had only ever been reviewed.  It found something.
+ *
+ * One cycle works, and works repeatedly: all eight processors come back and the
+ * self-test passes on both sides of it.  Seven to nine cycles kill the machine.
+ * Two runs, two different bugchecks - 0xEF CRITICAL_PROCESS_DIED on the ninth
+ * cycle of a run spaced two seconds apart, 0xB8 ATTEMPTED_SWITCH_FROM_DPC on
+ * the seventh of a run spaced thirty seconds apart - which says the damage
+ * accumulates per cycle rather than being a matter of going too fast.  Whatever
+ * is left behind, one cycle's worth of it is survivable and eight is not.
+ *
+ * That is not yet root-caused.  It matters less for real suspends, which happen
+ * minutes or days apart and would have to accumulate over a very long time, but
+ * "resume works" is a claim this cannot support and should not be read as.
+ *
+ * Deliberately not exposed as an MCP tool: it is a diagnostic that is known to
+ * crash the machine if repeated, so reaching it should take a deliberate
+ * svmhvctl invocation.
+ *
+ * Returns how many processors came back virtualised.
+ */
+ULONG    SvCyclePowerTransition(VOID);

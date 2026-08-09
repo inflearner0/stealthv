@@ -124,7 +124,7 @@ def hexarg(text: str) -> str:
 
 # --------------------------------------------------------------- hook options
 
-CAPTURE_TYPES = ("ansi", "wide", "unicode", "objattr", "bytes")
+CAPTURE_TYPES = ("ansi", "wide", "unicode", "objattr", "bytes", "irp")
 
 
 def hook_options(process=None, pid=None, caller_base=None, caller_size=None,
@@ -3586,7 +3586,7 @@ CALLBACK_SLOTS = 64
 RIP_ABSOLUTE = re.compile(r"\[0x([0-9a-f]{6,16})\]")
 
 
-def array_shape(raw: bytes) -> list[int] | None:
+def array_shape(raw: bytes, packed: bool = True) -> list[int] | None:
     """The callback blocks in a candidate array, or None if it is not one.
 
     Decided entirely from the array's own contents, before anything in it is
@@ -3612,8 +3612,12 @@ def array_shape(raw: bytes) -> list[int] | None:
         if value == 0:
             ended = True                # registrations are packed at the front
             continue
-        if ended:
-            return None                 # a gap: not one of these tables
+        if ended and packed:
+            # A gap. For the Ps arrays that means this is not one of them; for
+            # registry callbacks, which are unregistered individually and leave
+            # holes behind, it is normal - so the discovery pass asks for the
+            # relaxed test and keeps every other constraint.
+            return None
         block = value & ~0xF
         if block < 0xFFFF800000000000:
             return None                 # not a kernel pointer: wrong array
@@ -3626,14 +3630,32 @@ def array_shape(raw: bytes) -> list[int] | None:
     return blocks
 
 
-def callback_entries(array: int) -> list[tuple[int, int]] | None:
-    """Decode a candidate array of EX_CALLBACK, or decide it is not one.
+# How far into a callback block to look for the routine. EX_CALLBACK_ROUTINE_BLOCK
+# has it at +0x8, which is what the Ps notification arrays use. Registry
+# callbacks do not: CmpCallBackVector's entries point at a larger block with the
+# routine somewhere else, which is why the first version of this located that
+# array and then failed to identify it.
+CALLBACK_BLOCK_SEARCH = 0x40
 
-    An entry is a pointer to an EX_CALLBACK_ROUTINE_BLOCK with the low four
-    bits used as a reference count, and the routine is at +0x8 in that block.
-    That shape is what identifies the array: it does not have to be found by
-    recognising the right instruction, only by testing every data address the
-    registration function touches and keeping the one whose contents decode.
+
+def block_routine(block: int, offset: int) -> int | None:
+    """The pointer at block+offset, if it is code in a loaded module."""
+    try:
+        value = int.from_bytes(read_bytes(block + offset, 8), "little")
+    except CtlError:
+        return None
+    return value if module_for(value) is not None else None
+
+
+def callback_entries(array: int, offset: int = 8,
+                     packed: bool = True) -> list[tuple[int, int]] | None:
+    """Decode a candidate array of callback blocks, or decide it is not one.
+
+    An entry is a pointer to a block with the low four bits used as a reference
+    count, and a routine somewhere inside it. That shape is what identifies the
+    array: it does not have to be found by recognising the right instruction,
+    only by testing every data address the registration function touches and
+    keeping the one whose contents decode.
 
     Returns (block, routine) pairs, or None when this is not such an array.
     """
@@ -3644,23 +3666,56 @@ def callback_entries(array: int) -> list[tuple[int, int]] | None:
     if len(raw) < CALLBACK_SLOTS * 8:
         return None
 
-    blocks = array_shape(raw)
+    blocks = array_shape(raw, packed)
     if blocks is None:
         return None
 
     entries = []
     for block in blocks:
-        try:
-            routine = int.from_bytes(read_bytes(block + 8, 8), "little")
-        except CtlError:
-            return None
+        routine = block_routine(block, offset)
         # The routine has to be code in something loaded. A stale or wrongly
         # identified array fails here, which is the whole point of checking.
-        if module_for(routine) is None:
+        if routine is None:
             return None
         entries.append((block, routine))
 
     return entries
+
+
+def find_routine_offsets(array: int, wanted: dict[str, int]) -> dict[str, int]:
+    """Where in this array's blocks each probe's address turns up.
+
+    The routine is at +0x8 in an EX_CALLBACK_ROUTINE_BLOCK, which is what the Ps
+    notification arrays hold. Registry callbacks do not use that structure, so
+    looking at +0x8 finds nothing and the array goes unidentified - which is
+    exactly what happened to CmpCallBackVector.
+
+    Rather than hardcode a second offset, ask: the probe was just registered, so
+    its address is somewhere in one of these blocks, and wherever it is is the
+    layout. Each block is read once and every outstanding probe checked against
+    it, because reads are the expensive part.
+    """
+    try:
+        raw = read_bytes(array, CALLBACK_SLOTS * 8)
+    except CtlError:
+        return {}
+
+    blocks = array_shape(raw, packed=False)
+    if blocks is None:
+        return {}
+
+    found: dict[str, int] = {}
+    for block in blocks:
+        try:
+            body = read_bytes(block, CALLBACK_BLOCK_SEARCH)
+        except CtlError:
+            continue
+        for offset in range(0, len(body) - 8, 8):
+            value = int.from_bytes(body[offset:offset + 8], "little")
+            for kind, probe in wanted.items():
+                if value == probe and kind not in found:
+                    found[kind] = offset
+    return found
 
 
 def callback_candidates(export: str) -> list[int]:
@@ -3747,6 +3802,59 @@ def probe_addresses(arm: bool) -> dict[str, int]:
     return found
 
 
+def tool_watch_ioctls(name: str, prolog_length: int | None = None) -> str:
+    """Hook a driver's IRP_MJ_DEVICE_CONTROL and report what really arrives.
+
+    svmhv_ioctls reads the dispatcher and recovers the codes a driver *can*
+    handle. This is the other half: the codes anything actually sends, with the
+    buffer sizes and the calling process, taken from the IRP as it goes past.
+
+    The two disagree usefully. A candidate that never arrives may be a false
+    positive or simply unused; a code that arrives and is not in the static list
+    means the dispatcher reaches it some way the scan cannot see.
+    """
+    address = driver_object(name)
+    raw = read_bytes(address, DRIVER_OBJECT_SIZE)
+
+    def pointer(at):
+        return int.from_bytes(raw[at:at + 8], "little")
+
+    base = pointer(DRIVER_START)
+    size = int.from_bytes(raw[DRIVER_SIZE:DRIVER_SIZE + 4], "little")
+    handlers = [pointer(DRIVER_MAJOR + i * 8) for i in range(len(IRP_NAMES))]
+    default = unset_handler(handlers, base, size)
+
+    handler = handlers[14]
+    if handler == 0 or handler == default:
+        return (f"{name} does not handle IRP_MJ_DEVICE_CONTROL, so there is "
+                "nothing to watch")
+
+    # The IRP is the second argument to a dispatch routine, so RDX - argument 1
+    # counting from zero, which is what the capture syntax uses.
+    result = tool_hook_trace(f"{handler:#x}", prolog_length, capture="1:irp")
+
+    # Say so rather than print the instructions for reading results that will
+    # never arrive. The first version of this reported the failure and then
+    # cheerfully explained what to do next, which reads as success.
+    if "failed" in result or "hook id" not in result:
+        return (f"could not hook {name}'s IRP_MJ_DEVICE_CONTROL at "
+                f"{symbolize(handler)}\n{result}")
+
+    return (f"watching {name}'s IRP_MJ_DEVICE_CONTROL at {symbolize(handler)}\n"
+            f"{result}\n\n"
+            "Every device control request now records its control code, the "
+            "input and output buffer sizes and the device it went to. Compare "
+            "them against svmhv_ioctls to see which recovered codes are real.\n"
+            "\n"
+            "One dispatcher usually serves every major function, so reads and "
+            "writes come through here too and fill the ring - those rows show "
+            "a major and no ioctl, which is the honest answer, since only the "
+            "device control majors put a control code in that field. Call "
+            "svmhv_trace_reset immediately before generating the traffic you "
+            "care about.\n"
+            "Take it off with svmhv_unhook when done.")
+
+
 def tool_callbacks() -> str:
     """Every driver that asked to be told when something happens.
 
@@ -3769,18 +3877,37 @@ def tool_callbacks() -> str:
                 candidates.append(candidate)
 
     probes = probe_addresses(True)
+    layouts: dict[str, int] = {}
     try:
         identified: dict[str, tuple[int, list[tuple[int, int]]]] = {}
+        deferred: list[int] = []
+
         for candidate in candidates:
             if len(identified) == len(probes):
                 break                   # every kind placed; stop reading
             entries = callback_entries(candidate)
             if not entries:
+                # The shape may still be right with the routine somewhere other
+                # than +0x8; that costs a read per block, so it waits until the
+                # cheap pass has placed everything it can.
+                deferred.append(candidate)
                 continue
             routines = {routine for _, routine in entries}
             for kind, probe in probes.items():
                 if probe in routines and kind not in identified:
                     identified[kind] = (candidate, entries)
+
+        for candidate in deferred[:8]:
+            outstanding = {kind: probe for kind, probe in probes.items()
+                           if kind not in identified}
+            if not outstanding:
+                break
+            for kind, offset in find_routine_offsets(candidate,
+                                                     outstanding).items():
+                entries = callback_entries(candidate, offset, packed=False)
+                if entries:
+                    identified[kind] = (candidate, entries)
+                    layouts[kind] = offset
     finally:
         # Whatever happened above, the registry probe must not stay registered:
         # it runs on every registry operation in the system.
@@ -3802,6 +3929,10 @@ def tool_callbacks() -> str:
                   if routine != probes[kind]]
         lines.append(f"  {label} ({what})")
         lines.append(f"    array at {array:#x}, {len(others)} registered")
+        if kind in layouts:
+            lines.append(f"    (its blocks keep the routine at +{layouts[kind]:#x}, "
+                         f"not the +0x8 the others use - found by looking for "
+                         f"the probe rather than assuming)")
         for _, routine in others:
             module = module_for(routine)
             owner = module["name"] if module else "?"
@@ -4642,6 +4773,28 @@ TOOLS = [
         "handler": lambda a: tool_ioctls(a["name"]),
     },
     {
+        "name": "svmhv_watch_ioctls",
+        "description":
+            "Hook a driver's IRP_MJ_DEVICE_CONTROL so every request records the "
+            "control code, buffer sizes and device it carries. This is the "
+            "other half of svmhv_ioctls: that one recovers the codes a driver "
+            "can handle by reading the dispatcher, this one shows which are "
+            "really sent and by whom. Read the results with svmhv_trace, and "
+            "svmhv_unhook when done.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "driver name"},
+                "prolog_length": {"type": "integer", "description":
+                    "bytes of prologue that may be overwritten; decoded "
+                    "automatically when omitted"},
+            },
+            "required": ["name"],
+        },
+        "handler": lambda a: tool_watch_ioctls(
+            a["name"], int(a["prolog_length"]) if a.get("prolog_length") else None),
+    },
+    {
         "name": "svmhv_callbacks",
         "description":
             "Every driver registered for process creation, thread creation, "
@@ -4898,8 +5051,9 @@ TOOLS = [
                 "capture": {"type": "string", "description":
                     "dereference a pointer argument: ARG:TYPE where TYPE is "
                     "ansi, wide, unicode (UNICODE_STRING*), objattr "
-                    "(OBJECT_ATTRIBUTES* -> its ObjectName) or bytes:LEN. "
-                    "Only taken at IRQL <= APC_LEVEL and under SEH"},
+                    "(OBJECT_ATTRIBUTES* -> its ObjectName), bytes:LEN, or irp "
+                    "(IRP* -> the control code, buffer sizes and device it "
+                    "carries). Only taken at IRQL <= APC_LEVEL and under SEH"},
                 "capture2": {"type": "string", "description": "a second capture"},
                 "spoof": {"type": "string", "description":
                     "replace an argument before the original sees it: ARG:VALUE"},
@@ -4946,8 +5100,9 @@ TOOLS = [
                 "capture": {"type": "string", "description":
                     "dereference a pointer argument: ARG:TYPE where TYPE is "
                     "ansi, wide, unicode (UNICODE_STRING*), objattr "
-                    "(OBJECT_ATTRIBUTES* -> its ObjectName) or bytes:LEN. "
-                    "Only taken at IRQL <= APC_LEVEL and under SEH"},
+                    "(OBJECT_ATTRIBUTES* -> its ObjectName), bytes:LEN, or irp "
+                    "(IRP* -> the control code, buffer sizes and device it "
+                    "carries). Only taken at IRQL <= APC_LEVEL and under SEH"},
                 "capture2": {"type": "string", "description": "a second capture"},
                 "spoof": {"type": "string", "description":
                     "replace an argument before the original sees it: ARG:VALUE"},
@@ -5026,8 +5181,9 @@ TOOLS = [
                 "capture": {"type": "string", "description":
                     "dereference a pointer argument: ARG:TYPE where TYPE is "
                     "ansi, wide, unicode (UNICODE_STRING*), objattr "
-                    "(OBJECT_ATTRIBUTES* -> its ObjectName) or bytes:LEN. "
-                    "Only taken at IRQL <= APC_LEVEL and under SEH"},
+                    "(OBJECT_ATTRIBUTES* -> its ObjectName), bytes:LEN, or irp "
+                    "(IRP* -> the control code, buffer sizes and device it "
+                    "carries). Only taken at IRQL <= APC_LEVEL and under SEH"},
                 "capture2": {"type": "string", "description": "a second capture"},
                 "spoof": {"type": "string", "description":
                     "replace an argument before the original sees it: ARG:VALUE"},

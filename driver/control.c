@@ -213,6 +213,15 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
     case SVMHV_CMD_CALLBACK_PROBE:
         return SvObjectsCallbackProbe(&g_Control.Request);
 
+    /*
+     * Answers with the number of processors that came back, in the memory
+     * return field - a partial result is the interesting one, and it is not
+     * something a status code could carry.
+     */
+    case SVMHV_CMD_POWER_CYCLE:
+        g_Control.Request.MemoryReturned = SvCyclePowerTransition();
+        return STATUS_SUCCESS;
+
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
     }
