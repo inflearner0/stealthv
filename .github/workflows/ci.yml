@@ -58,8 +58,13 @@ jobs:
           $output = & .\bin\svmhvctl.exe present 2>&1
           $exitCode = $LASTEXITCODE
           $output | ForEach-Object { Write-Host $_ }
-          if ($exitCode -ne 1 -or $output -notmatch 'present=0') {
-            throw "svmhvctl present did not report a clean non-loaded state (exit $exitCode)"
+          # -match against an array filters it rather than answering yes or no,
+          # and the explanatory line on stderr is one of the elements. Join it
+          # into a single string so this is the boolean it looks like.
+          $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+          if ($exitCode -ne 1 -or $text -notmatch 'present=0') {
+            throw "svmhvctl present did not report a clean non-loaded state " +
+                  "(exit $exitCode, output: $text)"
           }
 
       - uses: actions/upload-artifact@v4
