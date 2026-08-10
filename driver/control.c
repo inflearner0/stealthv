@@ -23,11 +23,49 @@ static volatile LONG g_Stopping;
 static KEVENT        g_StopEvent;
 
 /*
- * 100 ms.  Fast enough that a command feels immediate to somebody typing, slow
- * enough that the wakeups are invisible in the exit counters - and this is a
- * timer wait, so the processor is not being spun.
+ * How often this thread looks at the doorbell, in 100 ns units.
+ *
+ * The idle interval is the wrong one for a client that is working, and it is
+ * wrong by a lot.  A client submits, waits for Completed, submits again - and
+ * by then this thread is back in a 100 ms wait, so every command costs about
+ * fifty milliseconds of nothing happening.  For somebody typing that is
+ * invisible.  For a client instrumenting a driver it is the difference between
+ * a tool you drive and one you batch: "hook every Nt* entry point" is a couple
+ * of hundred commands, and this hypervisor exists to be driven that way.
+ *
+ * Measured in the lab at 100 ms idle: 200 commands took 21.5 seconds, of which
+ * 21 seconds was this thread asleep.
+ *
+ * Three cadences, because there are three situations:
+ *
+ *   burst    A spin, for the few milliseconds right after a command, in case
+ *            the client is one process issuing several in a row.  No timer is
+ *            fast enough for that - a relative wait is rounded up to the system
+ *            clock tick, which is 15.6 ms unless something has raised the
+ *            resolution, and raising it globally is both rude and visible.
+ *
+ *   active   A 1 ms timer for two seconds after the last command.  This is the
+ *            one that matters for svmhvctl.exe, which is a *new process* per
+ *            command and takes about seven milliseconds to start - far longer
+ *            than any affordable spin, and far shorter than the idle interval.
+ *
+ *   idle     100 ms, the original, once nothing has asked for anything for two
+ *            seconds.  Ten wakeups a second, on a timer, as before.
  */
-#define CONTROL_POLL_INTERVAL_MS    100
+#define CONTROL_IDLE_INTERVAL       (100 * 10 * 1000)   /* 100 ms            */
+#define CONTROL_ACTIVE_INTERVAL     (1 * 10 * 1000)     /* 1 ms              */
+#define CONTROL_ACTIVE_WINDOW       (2 * 1000 * 10 * 1000) /* 2 s            */
+#define CONTROL_BURST_STALL_US      50
+#define CONTROL_BURST_STALLS        40
+
+/*
+ * The snapshot and the runaway detector stay on the idle cadence whatever the
+ * loop above is doing.  Both are far more expensive than looking at a doorbell
+ * - a refresh copies the whole hook table - and the detector is a *rate*, so
+ * running it every millisecond would shrink its window a hundredfold and no
+ * hook on earth would trip a twenty-thousand threshold in one millisecond.
+ */
+#define CONTROL_REFRESH_INTERVAL    CONTROL_IDLE_INTERVAL
 
 /*
  * The pages a watchpoint must never be pointed at: this driver's own working
@@ -51,12 +89,28 @@ BOOLEAN SvIsHypervisorMemory(_In_ PVOID Address)
         return TRUE;
     }
 
+    /* The executable memory hook.c hands out - trampolines, stubs, the patched
+       shadow copies - comes from its own allocator and is in none of the ranges
+       SvOwnsPage knows about.  Watching a trampoline means faulting inside the
+       handler that services the fault. */
+    if (SvHookOwnsPage(Address))
+    {
+        return TRUE;
+    }
+
     /* The trace ring is pool, so it is not in any of the ranges above. */
     SvTraceDescribeRing(&ring, &produced, &records, &recordSize);
     if (ring != 0)
     {
         const UINT8* base = (const UINT8*)PAGE_ALIGN((PVOID)ring);
-        if (page >= base && page < (const UINT8*)ring + records * recordSize)
+        /* Rounded up, to match the page-aligned base: the ring's last page is
+           usually a partial one, and comparing an aligned start against an
+           unaligned end let a watch be installed on it. */
+        const UINT8* end  = (const UINT8*)PAGE_ALIGN(
+                                (PVOID)(ring + records * recordSize +
+                                        PAGE_SIZE - 1));
+
+        if (page >= base && page < end)
         {
             return TRUE;
         }
@@ -163,6 +217,48 @@ static VOID SvControlRefresh(VOID)
     SvFillStats(&g_Snapshot.Stats);
     SvFillExitHistogram(&g_Snapshot.Histogram);
     SvHookList(&g_Snapshot.Hooks);
+    SvFillFatalExit(&g_Snapshot.Fatal);
+}
+
+/*
+ * Say out loud that an exit could not be handled.
+ *
+ * This is the other half of SvRecordFatalExit, and the reason it is here rather
+ * than there: the recording happens in the exit handler with GIF clear, where
+ * DbgPrint is not something to be attempting, and the reporting happens on this
+ * thread at PASSIVE_LEVEL where it is ordinary.  Between them they replace a
+ * KeBugCheckEx raised from a context that could not have written a dump.
+ *
+ * The processor named here has left SVM and will not go back on its own.  That
+ * is the intended outcome - the machine keeps running and the evidence survives
+ * - but it does mean the hypervisor is no longer covering every processor, so
+ * it is worth being loud about.
+ */
+static VOID SvControlReportFatalExit(VOID)
+{
+    static const char* const reasons[] =
+    {
+        "none", "guest triple fault (VMEXIT_SHUTDOWN)", "unhandled exit code",
+        "#NPF on an unmapped page", "#NPF retry limit"
+    };
+    SVMHV_FATAL_EXIT fatal;
+    const char* reason;
+
+    if (!SvTakeFatalExitReport(&fatal))
+    {
+        return;
+    }
+
+    reason = (fatal.Reason < RTL_NUMBER_OF(reasons)) ? reasons[fatal.Reason]
+                                                     : "unknown";
+
+    DbgPrint("svmhv: FATAL EXIT #%llu on cpu %lu: %s\n"
+             "svmhv:   exitcode %llx info1 %llx info2 %llx exitintinfo %llx\n"
+             "svmhv:   rip %llx rsp %llx cr2 %llx cr3 %llx\n"
+             "svmhv:   that processor has left SVM and is running natively\n",
+             fatal.Count, fatal.Processor, reason,
+             fatal.ExitCode, fatal.ExitInfo1, fatal.ExitInfo2, fatal.ExitIntInfo,
+             fatal.Rip, fatal.Rsp, fatal.Cr2, fatal.Cr3);
 }
 
 /* -------------------------------------------------------------- commands */
@@ -230,19 +326,27 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
 static VOID SvControlWorker(_In_ PVOID Context)
 {
     LARGE_INTEGER interval;
+    ULONG64 lastCommand = 0;
+    ULONG64 lastRefresh = 0;
+    ULONG burst = 0;
 
     UNREFERENCED_PARAMETER(Context);
 
-    /* Negative means relative, in 100 ns units. */
-    interval.QuadPart = -(LONGLONG)CONTROL_POLL_INTERVAL_MS * 10 * 1000;
-
     while (g_Stopping == 0)
     {
-        const UINT64 sequence = g_Control.Sequence;
+        const ULONG64 now = KeQueryInterruptTime();
+        const UINT64 sequence = *(volatile UINT64*)&g_Control.Sequence;
+        const BOOLEAN active = ((now - lastCommand) < CONTROL_ACTIVE_WINDOW);
 
         g_Control.Polls++;
-        SvControlRefresh();
-        SvControlDisarmRunaways();
+
+        if ((now - lastRefresh) >= CONTROL_REFRESH_INTERVAL)
+        {
+            lastRefresh = now;
+            SvControlRefresh();
+            SvControlDisarmRunaways();
+        }
+        SvControlReportFatalExit();
 
         if (sequence != g_Control.Completed)
         {
@@ -261,9 +365,37 @@ static VOID SvControlWorker(_In_ PVOID Context)
 
             DbgPrint("svmhv: control command %u -> %08X\n", command,
                      g_Control.Status);
+
+            /* A client that sent one command is very likely about to send
+               another; see the cadences above. */
+            lastCommand = KeQueryInterruptTime();
+            burst = CONTROL_BURST_STALLS;
             continue;                   /* do not sleep on a busy client */
         }
 
+        /*
+         * The burst spin.  It looks at the doorbell and nothing else, which is
+         * the point - it has to be cheap enough to be worth doing for two
+         * milliseconds.
+         *
+         * Read through a volatile pointer: nothing in this loop is a compiler
+         * barrier, so a plain read of the field could be hoisted out and the
+         * loop would spin on a stale register forever.
+         */
+        while (burst != 0 && g_Stopping == 0 &&
+               *(volatile UINT64*)&g_Control.Sequence == g_Control.Completed)
+        {
+            burst--;
+            KeStallExecutionProcessor(CONTROL_BURST_STALL_US);
+        }
+        if (*(volatile UINT64*)&g_Control.Sequence != g_Control.Completed)
+        {
+            continue;
+        }
+
+        /* Negative means relative, in 100 ns units. */
+        interval.QuadPart = active ? -(LONGLONG)CONTROL_ACTIVE_INTERVAL
+                                   : -(LONGLONG)CONTROL_IDLE_INTERVAL;
         (VOID)KeWaitForSingleObject(&g_StopEvent, Executive, KernelMode, FALSE,
                                     &interval);
     }

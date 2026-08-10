@@ -95,18 +95,36 @@ being absent.
   load, do not explain this — whatever it is happens with no load to keep up
   with. The reset is silent as always: no bugcheck, no dump, only Kernel-Power
   41 in the guest, and the boot time is the only honest instrument.
+
+  **There is now an instrument for this, and it is the first one.** The exit
+  handler used to answer four situations with `KeBugCheckEx`, from a context
+  that cannot honour one — `GIF` clear, our own host stack, every other
+  processor still inside `VMRUN`. One of those four was the `default:` case, and
+  `VMEXIT_SHUTDOWN` (0x7F) went through it: a guest triple fault under SVM does
+  *not* reset the machine, it exits to the host with the state that killed it.
+  So a triple fault became a bugcheck that could not write a dump, which is
+  exactly "no bugcheck, no dump, Kernel-Power 41, host event 18560". Whether
+  that is *the* cause is not yet established — but all four now record into
+  `SVMHV_FATAL_EXIT` and take that processor out of SVM instead, so `svmhvctl
+  status` reports `fatal_count` and the reason afterwards, and with `kd`
+  attached a triple fault prints one line naming RIP, RSP, CR2, CR3 and
+  EXITINTINFO. Read `fatal_count` before believing any run.
 - The resume-from-sleep path has never run; see above.
 - A processor that comes online *after* load has no per-processor slot and stays
   unvirtualised. It is no longer an out-of-bounds array index, but it is still a
   gap: closing it means `KeRegisterProcessorChangeCallback`.
 - The control channel answers at CPL 3. That is deliberate — `svmhvctl.exe` is a
-  user-mode binary — but it means the magic constant compiled into the driver is
-  a ring-0 execution primitive for anything that knows it.
-- Duplicate hook records can exist for the same GPA when the kind differs: only
-  *active* hooks are checked for GPA collision, so a watch and a retired exec
-  record can share PTE pointers.
+  user-mode binary — but the magic is a constant printed in `svm.h` in this
+  repository, so it is a ring-0 primitive for any process on the machine, not
+  just for "anything that knows it". `STEALTHV_CONTROL_REQUIRE_CPL0` closes it
+  at the cost of the tooling; it is all-or-nothing, because a hook install runs
+  caller-supplied shellcode and gating only the writes would protect nothing.
 - The SVM feature bits are visible to the guest, by design. Closing that means
   virtualising SVM, which is a separate project.
+- A processor that takes a fatal exit stays out of SVM until the next load or
+  `svmhvctl powercycle`. That is the intended trade — the machine survives and
+  the evidence survives — but it means the hypervisor can be covering fewer
+  processors than `virtualized=` claims.
 
 ## How it works
 
@@ -289,6 +307,18 @@ split, which is executable. Bumping a counter only promises a flush at each
 processor's next `#VMEXIT`, which may be a long way off. `SvSyncTlbFlush` now
 drives an exit everywhere with `KeIpiGenericCall` and waits for it.
 
+The instruction it drives that exit *with* matters, and this regressed once
+already. It was `CPUID`, chosen when `CPUID` was intercepted, and it silently
+stopped forcing anything the day that intercept was removed for concealment.
+Hooks kept working anyway, for a reason that is pure luck: a Hyper-V guest
+writes `HV_X64_MSR_EOI` on every interrupt, that MSR is outside all three MSRPM
+ranges, and so the IPI carrying the routine provoked the exit by itself. On bare
+metal, or with `STEALTHV_HIDE_EFER` at 0, there is no MSR intercept and nothing
+would have flushed — a freshly installed hook would simply not fire. It is now
+`VMMCALL` with `SVMHV_HV_NOP`, which is intercepted in every configuration and
+is answered next to the unload doorbell so it works with the control interface
+compiled out. If you ever change what this driver intercepts, check this first.
+
 **The guest's TLB has to be flushed when the guest asks, and only then.** The
 guest shares the host's page tables, but its translations are tagged with our
 ASID, which nothing outside this driver knows about. `INVLPG` and `MOV CR3` are
@@ -425,6 +455,7 @@ in `HKLM` for anyone curious about the machine.
 | `STEALTHV_HIDE_PAGES` | 1 | the driver's own pages read as zeroes |
 | `STEALTHV_ALWAYS_FLUSH_TLB` | 0 | flush the ASID every entry — **leave this off** |
 | `STEALTHV_CONTROL_INTERFACE` | 1 | answer the control leaf and run its worker |
+| `STEALTHV_CONTROL_REQUIRE_CPL0` | 0 | answer the control channel only in ring 0 |
 
 Everything defaults to the most concealed setting it can. Two of them are worth
 understanding before you change anything.
@@ -449,8 +480,13 @@ hypervisor, so the cost is never a mystery later.
 absent.** With it at 1 there is still no device object, no symbolic link and no
 dispatch routine — nothing reachable from user mode without the key, and the
 control leaf passes straight through to the hardware for anyone who does not have
-it. What it does cost is a system thread that wakes ten times a second, which a
-scan of system threads can see, and a `VMMCALL` that answers the magic.
+it. What it does cost is a system thread that wakes ten times a second while
+idle, which a scan of system threads can see, and a `VMMCALL` that answers the
+magic. While a client is issuing commands that thread is deliberately louder —
+a two-millisecond spin and then a one-millisecond timer for two seconds — which
+took a command from ~108 ms to ~32 ms end to end, most of the remainder being
+`svmhvctl.exe` process creation. The burst is a pattern of its own, and it is
+only present while somebody is driving the interface.
 
 Set it to 0 and the driver has no interface of any kind: nothing to open, nothing
 to call, no thread waking up to look at a doorbell. `svmhvctl.exe` and the MCP

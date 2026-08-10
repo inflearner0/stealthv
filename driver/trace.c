@@ -102,12 +102,77 @@ static volatile LONG64     g_Filtered;
 static KSPIN_LOCK          g_DrainLock;
 
 /*
- * A hook whose detour is traced must not be able to trace itself.  One flag per
- * processor is enough: the recorder never blocks, so the only way back into it
- * on the same processor is a hooked function called from inside it.
+ * A hook whose detour is traced must not be able to trace itself.
+ *
+ * This used to be one flag per processor, on the grounds that the recorder
+ * never blocks - and that stopped being true the moment it started
+ * dereferencing arguments.  SvTraceCapture runs at IRQL <= APC_LEVEL precisely
+ * so it *can* take a page fault, and a thread that faults there is descheduled
+ * and can come back on a different processor.  It then holds the flag belonging
+ * to the processor it started on, and a hooked function called after the move
+ * tests the flag of the processor it is on now, which is very likely clear.
+ * The one case the guard exists to catch is the one it could miss.
+ *
+ * Recursion is a property of the call chain, and a call chain belongs to a
+ * thread, so the flag belongs to a thread.  Same shape as the return table
+ * below: open addressed, fixed size, no allocation.  The whole probe window is
+ * always scanned, because a slot is released by writing zero and an early exit
+ * on the first empty entry could step over the entry it was looking for.
  */
-#define TRACE_MAX_CPUS      256
-static volatile LONG g_InRecorder[TRACE_MAX_CPUS];
+#define TRACE_RECORDER_SLOTS    256
+#define TRACE_RECORDER_PROBE    16
+#define TRACE_RECORDER_NONE     TRACE_RECORDER_SLOTS
+
+static volatile LONG64 g_InRecorder[TRACE_RECORDER_SLOTS];
+
+/*
+ * TRUE if this thread was not already inside the recorder, in which case Slot
+ * has to be handed to SvTraceLeaveRecorder on the way out.  FALSE means either
+ * genuine recursion or a full table; both are answered the same way, by not
+ * recording, because guessing wrong in the other direction is a recorder that
+ * calls itself.
+ */
+static BOOLEAN SvTraceEnterRecorder(_Out_ ULONG* Slot)
+{
+    const LONG64 thread = (LONG64)(ULONG_PTR)PsGetCurrentThread();
+    const ULONG start = (ULONG)(((ULONG_PTR)thread >> 4) % TRACE_RECORDER_SLOTS);
+    ULONG spare = TRACE_RECORDER_NONE;
+    ULONG i;
+
+    *Slot = TRACE_RECORDER_NONE;
+
+    for (i = 0; i < TRACE_RECORDER_PROBE; i++)
+    {
+        const ULONG index = (start + i) % TRACE_RECORDER_SLOTS;
+        const LONG64 occupant = g_InRecorder[index];
+
+        if (occupant == thread)
+        {
+            return FALSE;               /* already inside: this is recursion */
+        }
+        if (occupant == 0 && spare == TRACE_RECORDER_NONE)
+        {
+            spare = index;
+        }
+    }
+
+    if (spare == TRACE_RECORDER_NONE ||
+        InterlockedCompareExchange64(&g_InRecorder[spare], thread, 0) != 0)
+    {
+        return FALSE;
+    }
+
+    *Slot = spare;
+    return TRUE;
+}
+
+static VOID SvTraceLeaveRecorder(_In_ ULONG Slot)
+{
+    if (Slot < TRACE_RECORDER_SLOTS)
+    {
+        InterlockedExchange64(&g_InRecorder[Slot], 0);
+    }
+}
 
 /* A snapshot of the last exec trace, for the self-test. */
 static UINT64        g_LastArguments[4];
@@ -555,7 +620,29 @@ static BOOLEAN SvTracePushReturn(_In_ UINT64 HookId, _In_ UINT64 OriginalRsp)
         return FALSE;
     }
 
+    /*
+     * Discard frames belonging to calls that never returned.
+     *
+     * A traced call that is unwound past - an exception caught above it, a
+     * longjmp, a thread killed in the middle of it - never reaches
+     * AsmTraceReturn, so its frame stays here forever.  The stack grows
+     * downwards, so a recorded RSP *below* the one this call was entered with
+     * describes stack that has since been popped and cannot come back: the
+     * frame is provably dead.
+     *
+     * Without this the frames accumulate, depth reaches TRACE_RETURN_DEPTH and
+     * the thread silently stops capturing returns for the rest of its life -
+     * which is a trap, because the code that hits it most is exactly the code
+     * worth tracing.  SvTraceReturnEntry already searches downwards and so
+     * never returned to a stale address; it just had no way to reclaim one.
+     */
     depth = slot->Depth;
+    while (depth > 0 && slot->Frames[depth - 1].Rsp < OriginalRsp)
+    {
+        depth--;
+    }
+    slot->Depth = depth;
+
     if (depth < 0 || depth >= TRACE_RETURN_DEPTH)
     {
         InterlockedIncrement64(&g_ReturnsLost);
@@ -667,6 +754,7 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
     const KIRQL irql = KeGetCurrentIrql();
     const char* imageName;
     ULONG processor;
+    ULONG recorderSlot;
     ULONG i;
     ULONG spoofed = 0;
 
@@ -683,12 +771,8 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
     }
 
     processor = KeGetCurrentProcessorIndex();
-    if (processor >= TRACE_MAX_CPUS)
-    {
-        return info.Trampoline;
-    }
 
-    if (InterlockedCompareExchange(&g_InRecorder[processor], 1, 0) != 0)
+    if (!SvTraceEnterRecorder(&recorderSlot))
     {
         return info.Trampoline;     /* a hooked function called by the recorder */
     }
@@ -720,7 +804,7 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
                       SVMHV_PROCESS_NAME_MAX - 1) != 0)
         {
             InterlockedIncrement64(&g_Filtered);
-            InterlockedExchange(&g_InRecorder[processor], 0);
+            SvTraceLeaveRecorder(recorderSlot);
             return info.Trampoline;
         }
     }
@@ -733,7 +817,7 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
                                  SvTraceSubject(filter, arguments, returnAddress)))
         {
             InterlockedIncrement64(&g_Filtered);
-            InterlockedExchange(&g_InRecorder[processor], 0);
+            SvTraceLeaveRecorder(recorderSlot);
             return info.Trampoline;
         }
     }
@@ -864,7 +948,7 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
         (VOID)SvTracePushReturn(HookId, OriginalRsp);
     }
 
-    InterlockedExchange(&g_InRecorder[processor], 0);
+    SvTraceLeaveRecorder(recorderSlot);
 
     /*
      * Blocking is just a different continuation: a stub that loads RAX and

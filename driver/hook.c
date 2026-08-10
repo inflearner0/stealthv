@@ -63,6 +63,8 @@ typedef struct _SVM_HOOK
     BOOLEAN CaptureStack;
     char    ProcessName[SVMHV_PROCESS_NAME_MAX];
     PVOID   BlockStub;          /* mov rax, imm64; ret - when blocking      */
+    UINT64  BlockValue;         /* what that stub was built to return       */
+    ULONG   TrampolineCapacity; /* bytes reserved, so a re-arm can reuse it */
     UINT8   OriginalProlog[SVMHV_MAX_PROLOG];
 } SVM_HOOK;
 
@@ -72,6 +74,87 @@ static KGUARDED_MUTEX g_HookLock;
 /* One page of executable memory, bump-allocated for trampolines and stubs. */
 static UINT8* g_TrampolinePage;
 static ULONG  g_TrampolineUsed;
+
+/* ---------------------------------------------------------- page index */
+
+/*
+ * What the nested page fault handler looks a guest physical address up in.
+ *
+ * It used to walk all SVMHV_MAX_HOOKS records on every fault, with GIF clear,
+ * comparing a page number against 256 entries most of which are empty.  That is
+ * affordable for a handful of hooks and is exactly the wrong shape for what this
+ * driver is for - instrumenting everything at once - because the cost of the
+ * scan is paid by every fault, including all the hooks that did not match.
+ *
+ * One entry per hooked *page*, sorted, so the handler binary searches it.
+ * Several execution hooks can share a page and they necessarily agree about
+ * what kind it is, so the first of them stands for all of them; the handler only
+ * needs to know that the page traps and why.
+ *
+ * Two buffers, published by an exchange.  The buffer being replaced is the one
+ * the handler stopped reading a generation ago, and a rebuild can only follow
+ * the previous one through SvSyncTlbFlush, which does not return until every
+ * processor has left guest mode - so nothing can still be inside the old one.
+ */
+typedef struct _SVM_HOOK_PAGE_ENTRY
+{
+    UINT64 Gpa;
+    UINT32 HookId;
+    UINT32 Kind;
+} SVM_HOOK_PAGE_ENTRY;
+
+typedef struct _SVM_HOOK_PAGE_INDEX
+{
+    ULONG Count;
+    SVM_HOOK_PAGE_ENTRY Entries[SVMHV_MAX_HOOKS];
+} SVM_HOOK_PAGE_INDEX;
+
+static SVM_HOOK_PAGE_INDEX g_PageIndex[2];
+static volatile LONG       g_PageIndexActive;
+
+/* Caller holds g_HookLock. */
+static VOID SvHookRebuildPageIndex(VOID)
+{
+    const LONG next = 1 - g_PageIndexActive;
+    SVM_HOOK_PAGE_INDEX* index = &g_PageIndex[next];
+    ULONG count = 0;
+    ULONG i;
+
+    for (i = 0; i < SVMHV_MAX_HOOKS; i++)
+    {
+        const SVM_HOOK* hook = &g_Hooks[i];
+        ULONG at;
+
+        if (hook->Active == 0)
+        {
+            continue;
+        }
+
+        /* Insertion sort by GPA; 256 entries at PASSIVE_LEVEL on an operation
+           that already broadcasts an IPI is not worth being clever about. */
+        for (at = 0; at < count && index->Entries[at].Gpa < hook->Gpa; at++)
+        {
+            /* find the slot */
+        }
+        if (at < count && index->Entries[at].Gpa == hook->Gpa)
+        {
+            continue;               /* another hook in a page already listed */
+        }
+
+        RtlMoveMemory(&index->Entries[at + 1], &index->Entries[at],
+                      (count - at) * sizeof(index->Entries[0]));
+        index->Entries[at].Gpa    = hook->Gpa;
+        index->Entries[at].HookId = i;
+        index->Entries[at].Kind   = hook->Kind;
+        count++;
+    }
+
+    index->Count = count;
+
+    /* Published last, and with an interlocked write so the entries above are
+       certainly visible to a handler that sees the new selector. */
+    InterlockedExchange(&g_PageIndexActive, next);
+}
 
 /* ------------------------------------------------------------ executable */
 
@@ -230,6 +313,12 @@ VOID SvHookCleanup(VOID)
         hook->Active = 0;
     }
 
+    /* Nothing is virtualised by the time this runs, so nobody is reading the
+       index - but leaving it describing freed records would be a trap for
+       anyone who changes that ordering later. */
+    RtlZeroMemory(g_PageIndex, sizeof(g_PageIndex));
+    g_PageIndexActive = 0;
+
     if (g_TrampolinePage != NULL)
     {
         SvHookFreeExecutable(g_TrampolinePage);
@@ -242,20 +331,33 @@ VOID SvHookCleanup(VOID)
 BOOLEAN SvHookFindPage(_In_ UINT64 Gpa, _Out_ SVM_HOOK_PAGE* Page)
 {
     const UINT64 page = Gpa & ~(UINT64)(PAGE_SIZE - 1);
-    ULONG i;
+    const SVM_HOOK_PAGE_INDEX* index = &g_PageIndex[g_PageIndexActive];
+    ULONG low = 0;
+    ULONG high = index->Count;
 
     Page->Found = FALSE;
     Page->HookId = 0;
     Page->Kind = 0;
 
-    for (i = 0; i < SVMHV_MAX_HOOKS; i++)
+    while (low < high)
     {
-        if (g_Hooks[i].Active != 0 && g_Hooks[i].Gpa == page)
+        const ULONG middle = low + (high - low) / 2;
+        const SVM_HOOK_PAGE_ENTRY* entry = &index->Entries[middle];
+
+        if (entry->Gpa == page)
         {
-            Page->Found = TRUE;
-            Page->HookId = i;
-            Page->Kind = g_Hooks[i].Kind;
+            Page->Found  = TRUE;
+            Page->HookId = entry->HookId;
+            Page->Kind   = entry->Kind;
             return TRUE;
+        }
+        if (entry->Gpa < page)
+        {
+            low = middle + 1;
+        }
+        else
+        {
+            high = middle;
         }
     }
 
@@ -277,6 +379,47 @@ static ULONG SvHookPageActiveCount(_In_ UINT64 Gpa)
     }
 
     return count;
+}
+
+/*
+ * Executable memory this file owns, which a watchpoint must never be pointed at.
+ *
+ * SvOwnsPage covers the driver image, the per-processor state and the nested
+ * page tables, and missed all of this: the trampolines and stubs, the patched
+ * shadow copies, and any shellcode page a caller supplied.  Watching one of
+ * them means the fault handler faults on the very code it is running to service
+ * the fault - the machine survives it, but only just, and the interface that
+ * could take the watch off again is the thing being starved.
+ *
+ * Deliberately lock-free.  It is a refusal check on a path that may already
+ * hold g_HookLock, and a stale answer is no worse than the check not existing;
+ * taking the lock here would be a self-deadlock waiting for a caller to find.
+ */
+BOOLEAN SvHookOwnsPage(_In_ PVOID Address)
+{
+    const UINT8* page = (const UINT8*)PAGE_ALIGN(Address);
+    ULONG i;
+
+    if (g_TrampolinePage != NULL && page == PAGE_ALIGN(g_TrampolinePage))
+    {
+        return TRUE;
+    }
+
+    for (i = 0; i < SVMHV_MAX_HOOKS; i++)
+    {
+        const SVM_HOOK* hook = &g_Hooks[i];
+
+        if (hook->ShadowVa != NULL && page == PAGE_ALIGN(hook->ShadowVa))
+        {
+            return TRUE;
+        }
+        if (hook->ShellcodePage != NULL && page == PAGE_ALIGN(hook->ShellcodePage))
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 ULONG SvHookActiveCount(VOID)
@@ -485,6 +628,12 @@ static PVOID SvBuildShellcode(_In_ const UINT8* Bytes, _In_ ULONG Size,
 /*
  * The two entries that make a hook or a watch what it is.  Everything the
  * mechanism does follows from these four lines.
+ *
+ * The order inside each case is the whole of the correctness argument, and the
+ * page index is now part of it: the shadow view has to be complete, and the
+ * page has to be findable by the fault handler, *before* the primary view
+ * starts faulting.  Otherwise a fault arrives for a hook the handler cannot
+ * find and is treated as unexplained.
  */
 static VOID SvHookApplyEntries(_Inout_ SVM_HOOK* Hook)
 {
@@ -493,6 +642,7 @@ static VOID SvHookApplyEntries(_Inout_ SVM_HOOK* Hook)
     case SVMHV_HOOK_EXEC:
         *Hook->ShadowPte  = Hook->ShadowPa | NPT_PRESENT | NPT_USER;
         InterlockedExchange(&Hook->Active, 1);
+        SvHookRebuildPageIndex();
         *Hook->PrimaryPte = Hook->Gpa | NPT_PRESENT | NPT_WRITE | NPT_USER |
                             NPT_NO_EXECUTE;
         break;
@@ -502,6 +652,7 @@ static VOID SvHookApplyEntries(_Inout_ SVM_HOOK* Hook)
            anything else runs at full speed. */
         *Hook->ShadowPte  = Hook->Gpa | NPT_PRESENT | NPT_WRITE | NPT_USER;
         InterlockedExchange(&Hook->Active, 1);
+        SvHookRebuildPageIndex();
         *Hook->PrimaryPte = Hook->Gpa | NPT_PRESENT | NPT_USER;
         break;
 
@@ -511,6 +662,7 @@ static VOID SvHookApplyEntries(_Inout_ SVM_HOOK* Hook)
            trap a read on a page it is willing to map. */
         *Hook->ShadowPte  = Hook->Gpa | NPT_PRESENT | NPT_WRITE | NPT_USER;
         InterlockedExchange(&Hook->Active, 1);
+        SvHookRebuildPageIndex();
         *Hook->PrimaryPte = 0;
         break;
     }
@@ -520,13 +672,26 @@ static VOID SvHookRestoreEntries(_Inout_ SVM_HOOK* Hook)
 {
     /*
      * Executable again in the primary view first, so no new faults are
-     * generated, then point the shadow view at the original page as well - a
-     * processor still running in shadow mode then executes the real bytes and
-     * drops back to the primary hierarchy on its next exit.  The shadow page
-     * itself is only freed at unload, when no processor can be using it.
+     * generated, then put the shadow view back to what it is everywhere else:
+     * the original page, not executable.
+     *
+     * That last part used to be omitted, leaving the page executable in the
+     * shadow hierarchy for the rest of the driver's life.  It was survivable -
+     * both views map the same bytes once the hook is gone - but it quietly
+     * eroded the invariant the whole mechanism rests on, that the *only*
+     * executable page in the shadow hierarchy is the one a processor switched
+     * there for.  With enough retired hooks, a processor could wander through
+     * several of them without ever taking the fault that sends it home.
+     *
+     * A processor still executing in this page in shadow mode now faults on its
+     * next fetch, is sent back to the primary hierarchy, and re-executes
+     * against the original page - which is exactly where it should be.
+     *
+     * The shadow page itself is only freed at unload, when no processor can be
+     * using it.
      */
     *Hook->PrimaryPte = Hook->Gpa | NPT_PRESENT | NPT_WRITE | NPT_USER;
-    *Hook->ShadowPte  = Hook->Gpa | NPT_PRESENT | NPT_USER;
+    *Hook->ShadowPte  = Hook->Gpa | NPT_PRESENT | NPT_USER | NPT_NO_EXECUTE;
     InterlockedExchange(&Hook->Active, 0);
 }
 
@@ -593,14 +758,28 @@ static NTSTATUS SvHookApplyPolicy(_Inout_ SVM_HOOK* Hook,
     Hook->CaptureReturn = (Request->CaptureReturn != 0);
     Hook->CaptureStack  = (Request->CaptureStack != 0);
 
-    Hook->BlockStub = NULL;
-    if (Request->Block)
+    /*
+     * Reuse the stub when it already returns the right value.
+     *
+     * Stubs come out of a one-page bump allocator that never frees, so building
+     * a fresh one on every install turned install-and-remove-in-a-loop - which
+     * the rest of this file goes out of its way to make free - into something
+     * that exhausted the page after a few hundred cycles and then failed every
+     * subsequent install with STATUS_INSUFFICIENT_RESOURCES.  A blocked hook
+     * toggled on and off is a completely ordinary thing to want.
+     */
+    if (!Request->Block)
+    {
+        Hook->BlockStub = NULL;
+    }
+    else if (Hook->BlockStub == NULL || Hook->BlockValue != Request->BlockValue)
     {
         Hook->BlockStub = SvBuildBlockStub(Request->BlockValue);
         if (Hook->BlockStub == NULL)
         {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        Hook->BlockValue = Request->BlockValue;
     }
 
     return STATUS_SUCCESS;
@@ -788,14 +967,33 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     {
         SVM_HOOK* neighbour = &g_Hooks[i];
 
-        if (neighbour->Active == 0 || neighbour->Gpa != gpa)
+        /*
+         * Retired records count as occupants.
+         *
+         * This used to skip anything not armed, which let a *second* record be
+         * created for a page a retired one still owns - removal frees nothing,
+         * so that record keeps the MDL, the shadow copy and both page table
+         * entry pointers.  Two records each believing they own one page hand
+         * the fault handler two different descriptions of it, and take two
+         * separate MDL locks on the same physical page.  A record whose
+         * PrimaryPte is NULL has genuinely let go (a user hook, whose pin
+         * cannot outlive it) and is the only kind that may be passed over.
+         */
+        if (neighbour->Gpa != gpa || neighbour->PrimaryPte == NULL)
         {
             continue;
         }
         if (neighbour->TargetVa == target)
         {
-            status = STATUS_ALREADY_REGISTERED;    /* this exact target */
-            goto done;
+            if (neighbour->Active != 0)
+            {
+                status = STATUS_ALREADY_REGISTERED;    /* this exact target */
+                goto done;
+            }
+            /* Retired, and about to be re-armed by the loop below, which knows
+               how to reuse everything this record is still holding - including
+               across a change of kind. */
+            continue;
         }
 
         /*
@@ -836,10 +1034,39 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         SVM_HOOK* previous = &g_Hooks[i];
 
         if (previous->Active != 0 || previous->PrimaryPte == NULL ||
-            previous->TargetVa != target || previous->Gpa != gpa ||
-            previous->Kind != Request->Kind)
+            previous->TargetVa != target || previous->Gpa != gpa)
         {
             continue;
+        }
+
+        /*
+         * The kind may differ from last time, and this record still has to be
+         * the one that is reused: it owns the page, and the neighbour scan
+         * above now refuses to build a second record beside it.  The page table
+         * entries are rewritten from scratch by SvHookApplyEntries, so the only
+         * thing a change of kind actually needs is a shadow copy, which a watch
+         * never had.
+         */
+        if (Request->Kind == SVMHV_HOOK_EXEC && previous->ShadowVa == NULL)
+        {
+            PHYSICAL_ADDRESS highest;
+
+            highest.QuadPart = MAXULONG64;
+            previous->ShadowVa = MmAllocateContiguousMemory(PAGE_SIZE, highest);
+            if (previous->ShadowVa == NULL)
+            {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                goto done;
+            }
+            previous->ShadowPa =
+                (UINT64)MmGetPhysicalAddress(previous->ShadowVa).QuadPart;
+            RtlCopyMemory(previous->ShadowVa, pageVa, PAGE_SIZE);
+            previous->OwnsPage = TRUE;
+        }
+        previous->Kind = Request->Kind;
+        if (!isExec)
+        {
+            previous->PrologLength = 0;
         }
 
         {
@@ -889,15 +1116,37 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
 
             if (previous->PrologLength != Request->PrologLength)
             {
-                PVOID rebuilt = SvBuildTrampoline(previous->OriginalProlog,
-                                                  Request->PrologLength,
-                                                  (UINT8*)target + Request->PrologLength);
-                if (rebuilt == NULL)
+                const ULONG wanted = Request->PrologLength + SVMHV_JMP_LENGTH;
+
+                /*
+                 * Rewrite the trampoline in place when the space it already
+                 * holds is big enough.  Only a shorter or equal prologue can
+                 * do that, and it is the common case; allocating unconditionally
+                 * leaked a trampoline out of the one-page stub allocator on
+                 * every re-arm that changed the length.
+                 */
+                if (previous->Trampoline != NULL &&
+                    wanted <= previous->TrampolineCapacity)
                 {
-                    status = STATUS_INSUFFICIENT_RESOURCES;
-                    goto done;
+                    RtlCopyMemory(previous->Trampoline, previous->OriginalProlog,
+                                  Request->PrologLength);
+                    SvWriteAbsoluteJmp((UINT8*)previous->Trampoline +
+                                       Request->PrologLength,
+                                       (UINT8*)target + Request->PrologLength);
                 }
-                previous->Trampoline = rebuilt;
+                else
+                {
+                    PVOID rebuilt = SvBuildTrampoline(previous->OriginalProlog,
+                                                      Request->PrologLength,
+                                                      (UINT8*)target + Request->PrologLength);
+                    if (rebuilt == NULL)
+                    {
+                        status = STATUS_INSUFFICIENT_RESOURCES;
+                        goto done;
+                    }
+                    previous->Trampoline = rebuilt;
+                    previous->TrampolineCapacity = wanted;
+                }
                 previous->PrologLength = Request->PrologLength;
             }
 
@@ -1039,6 +1288,7 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
             status = STATUS_INSUFFICIENT_RESOURCES;
             goto done;
         }
+        hook->TrampolineCapacity = Request->PrologLength + SVMHV_JMP_LENGTH;
 
         status = SvHookPrepareDetour(hook, Request);
         if (!NT_SUCCESS(status))
@@ -1164,6 +1414,10 @@ NTSTATUS SvHookRemove(_In_ PVOID Target)
         {
             SvHookRestoreEntries(hook);
         }
+
+        /* After the entries, not before: while the page is still trapping, the
+           handler has to be able to find out why. */
+        SvHookRebuildPageIndex();
         SvSyncTlbFlush();
 
         /*

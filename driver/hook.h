@@ -95,3 +95,10 @@ VOID     SvHookCountHit(_In_ UINT32 HookId);
 /* Executable kernel memory, for trampolines, stubs and shellcode. */
 PVOID    SvHookAllocateExecutable(_In_ SIZE_T Size);
 VOID     SvHookFreeExecutable(_In_ PVOID Va);
+
+/*
+ * TRUE if the page holds this file's executable memory - the trampoline and
+ * stub page, a hooked page's patched shadow copy, or a caller's shellcode.
+ * Nothing there may be watched; see SvIsHypervisorMemory.
+ */
+BOOLEAN  SvHookOwnsPage(_In_ PVOID Address);

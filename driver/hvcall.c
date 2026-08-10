@@ -3,6 +3,7 @@
  */
 
 #include "hvcall.h"
+#include "config.h"
 #include "control.h"
 #include "trace.h"
 
@@ -47,12 +48,27 @@ static UINT64 SvReadWindow(_Inout_ GUEST_CONTEXT* Context,
     return SVMHV_HV_STATUS_OK;
 }
 
-VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context)
+VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context, _In_ UINT8 Cpl)
 {
     const UINT64 command = Context->Rbx;
     const UINT64 argument = Context->Rdx;
     const UINT64 argument2 = Context->Rsi;
     UINT64 status = SVMHV_HV_STATUS_OK;
+
+#if STEALTHV_CONTROL_REQUIRE_CPL0
+    /*
+     * See STEALTHV_CONTROL_REQUIRE_CPL0 in config.h.  All or nothing: gating
+     * only the commands that write would be theatre, because installing a hook
+     * takes caller-supplied shellcode and runs it in ring 0.
+     */
+    if (Cpl != 0)
+    {
+        Context->Rax = SVMHV_HV_STATUS_BADCOMMAND;
+        return;
+    }
+#else
+    UNREFERENCED_PARAMETER(Cpl);
+#endif
 
     switch (command)
     {
@@ -66,9 +82,18 @@ VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context)
          * The only writable thing in this channel, and it can only reach the
          * request block - a client cannot use it to poke the rest of the driver,
          * let alone the kernel.
+         *
+         * The bound is written as a subtraction rather than "argument + 8 >
+         * size", which is what it used to say and which wraps: the guest
+         * controls all 64 bits of the offset, and 0xFFFFFFFFFFFFFFF8 is
+         * eight-aligned, so the addition overflowed to zero, the check passed
+         * and the store landed eight bytes *below* the request block.  Size is
+         * a compile-time constant far larger than eight, so the subtraction
+         * cannot underflow.
          */
+        C_ASSERT(sizeof(g_Control.Request) > sizeof(UINT64));
         if ((argument & 7) != 0 ||
-            argument + sizeof(UINT64) > sizeof(g_Control.Request))
+            argument > sizeof(g_Control.Request) - sizeof(UINT64))
         {
             status = SVMHV_HV_STATUS_BADOFFSET;
             break;

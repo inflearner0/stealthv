@@ -263,6 +263,24 @@ AsmUnloadCall PROC
 AsmUnloadCall ENDP
 
 ;
+; UINT64 AsmNopCall(VOID)
+;
+; A hypercall that does nothing.  It exists for its #VMEXIT: VMMCALL is
+; intercepted in every build, so this is the one instruction the driver can rely
+; on to drive a processor out of guest mode when a nested page table edit has to
+; take effect now.  CPUID used to serve here and silently stopped the day its
+; intercept was removed.
+;
+AsmNopCall PROC
+        push    rbx
+        mov     rax, 53564D485643414Ch          ; SVMHV_HYPERCALL_MAGIC
+        mov     rbx, 11                         ; SVMHV_HV_NOP
+        vmmcall
+        pop     rbx
+        ret
+AsmNopCall ENDP
+
+;
 ; VOID AsmSignatureCall(SVMHV_HV_SIGNATURE_RESULT *Out)   -- RCX = Out
 ;
 ; The signature probe, on the same channel.  RBX, RSI and RDI are non-volatile
