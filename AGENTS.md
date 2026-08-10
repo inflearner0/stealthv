@@ -20,6 +20,10 @@ python mcp/test_agent.py  # runs MCP protocol and command-building tests
 
 Run `scripts\runtests.ps1` only inside the isolated guest lab; it loads the driver and records results in `C:\lab\results.log`. Do not treat a short successful run as a stability result; see `CLAUDE.md` for known reset behavior.
 
+## Hyper-V Guest Control
+
+- Use the available MCP servers to operate the Hyper-V lab VM. Use the Hyper-V MCP for VM lifecycle and recovery, and the in-guest `svmhv` MCP service for loading, unloading, and querying the hypervisor; do not substitute direct local or PowerShell Direct control for these tasks.
+
 ## Coding Style & Naming Conventions
 
 Follow the surrounding code. C uses four-space indentation, braces on their own line, descriptive block comments, and Windows kernel naming such as `SvHookInstall`, `SVMHV_CONTROL`, and `g_Control`. Keep driver exit-path code allocation-free and nonpageable where its context requires it. Python uses four spaces, `snake_case`, and standard-library-only behavior; optional capstone/keystone support must retain the fallback path. Build warnings are errors for the driver and control tool.
