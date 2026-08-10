@@ -121,6 +121,11 @@ typedef struct DECLSPEC_ALIGN(PAGE_SIZE) _VIRTUAL_CPU
     UINT64  ExitCodeCounts[256];
     UINT64  InvalidExits;
 
+    /* Exits the handler could not deal with, which now take this processor out
+       of SVM instead of taking the machine down.  Non-zero here means the
+       snapshot's fatal record is worth reading. */
+    UINT64  FatalExits;
+
     /* Interrupts and exceptions this exit interrupted mid-delivery and put back.
        Zero here on a busy guest would mean the re-injection is not working. */
     UINT64  EventsReinjected;
@@ -145,6 +150,9 @@ UINT64   AsmForwardHypercall(_In_ UINT64 Rcx, _In_ UINT64 Rdx, _In_ UINT64 R8,
 
 /* Rings the VMMCALL unload doorbell from CPL 0; returns the hypervisor's status. */
 UINT64   AsmUnloadCall(VOID);
+
+/* A hypercall that does nothing but exit.  See SvSyncTlbFlush. */
+UINT64   AsmNopCall(VOID);
 
 /* The three registers the signature command answers in. */
 typedef struct _SVMHV_HV_SIGNATURE_RESULT
@@ -195,6 +203,20 @@ BOOLEAN  SvOwnsPage(_In_ PVOID Address);
 VOID     SvFillStats(_Out_ SVMHV_STATS* Stats);
 VOID     SvFillExitHistogram(_Out_ SVMHV_EXIT_HISTOGRAM* Histogram);
 VOID     SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result);
+
+/*
+ * The last exit the handler could not deal with, and whether one has arrived
+ * since the caller last asked.
+ *
+ * The reporting is split from the recording because of where each half runs.
+ * Recording happens in the exit handler with GIF clear, where the only safe
+ * thing to do is store a few values; saying so out loud - DbgPrint, and the
+ * decision about whether the machine can carry on - belongs to the control
+ * worker at PASSIVE_LEVEL.  That split is the entire point: it is what replaced
+ * a KeBugCheckEx that could never have produced a dump from where it stood.
+ */
+VOID     SvFillFatalExit(_Out_ SVMHV_FATAL_EXIT* Fatal);
+BOOLEAN  SvTakeFatalExitReport(_Out_ SVMHV_FATAL_EXIT* Fatal);
 
 /*
  * Leave guest mode on every processor and enter it again, which is exactly what

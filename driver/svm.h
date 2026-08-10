@@ -77,9 +77,17 @@
  *
  * This is the only way in.  There is no device object, no IOCTL and no doorbell
  * a debugger could write.  Which also means there is no ACL: the magic is the
- * whole access check, and anything that knows it can install a kernel hook.
- * Every offset a client can pass is bounded against the structure it names, so
- * the channel cannot be turned into an arbitrary kernel read.
+ * whole access check, and it is a constant written out in full a few lines
+ * below, in a repository, so it is not a secret from anyone who can read this.
+ *
+ * Every offset passed to a *hypercall* is bounded against the structure it
+ * names, so the channel itself cannot be walked across driver memory.  That is
+ * a much smaller claim than it sounds, and it used to be written here as though
+ * it were the whole story: the commands the doorbell submits include
+ * SVMHV_CMD_READ_MEMORY, SVMHV_CMD_WRITE_PHYSICAL and SVMHV_CMD_HOOK_INSTALL,
+ * so anything that can reach this channel owns the machine regardless.  By
+ * default that includes ring 3; see STEALTHV_CONTROL_REQUIRE_CPL0 in config.h
+ * for why, and for how to close it.
  */
 #define SVMHV_HYPERCALL_MAGIC   0x53564D485643414CULL   /* "SVMHVCAL" */
 
@@ -94,6 +102,17 @@
 #define SVMHV_HV_UNLOAD         8   /* CPL 0 only -> devirtualise           */
 #define SVMHV_HV_SIGNATURE      9   /* -> rbx/rdx/rsi = "SVMHV-SIMPLE"      */
 #define SVMHV_HV_TRACE_CONSUMED 10  /* rdx = sequence drained up to         */
+
+/*
+ * Do nothing, and do it from CPL 0.  The exit is the entire purpose: nested
+ * page table edits do not take effect on a processor until it next leaves guest
+ * mode, so SvSyncTlbFlush has to be able to make that happen on demand.
+ *
+ * Answered next to the unload doorbell rather than in the control interface,
+ * and for the same reason: a build with STEALTHV_CONTROL_INTERFACE at 0 still
+ * installs hooks, and a hook that is not flushed is a hook that does not fire.
+ */
+#define SVMHV_HV_NOP            11  /* CPL 0 only -> force a #VMEXIT        */
 
 #define SVMHV_HV_STATUS_OK          0
 #define SVMHV_HV_STATUS_BADCOMMAND  1
@@ -115,6 +134,16 @@
 #define VMEXIT_STGI             0x084
 #define VMEXIT_CLGI             0x085
 #define VMEXIT_SKINIT           0x086
+
+/*
+ * A shutdown condition in the guest - a triple fault.  There is no intercept
+ * bit for this one: it always exits, which is the whole point.  A guest that
+ * triple-faults under SVM does *not* reset the machine, it hands the state that
+ * killed it to the host, and dropping that on the floor is how a guest comes to
+ * die leaving no bugcheck, no dump and nothing but a Kernel-Power 41.
+ */
+#define VMEXIT_SHUTDOWN         0x07F
+
 #define VMEXIT_NPF              0x400
 #define VMEXIT_INVALID          (-1LL)
 

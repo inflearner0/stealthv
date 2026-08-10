@@ -421,6 +421,46 @@ typedef struct _SVMHV_SELFTEST
     UINT8  BytesWhileHooked[16];        /* must equal OriginalBytes        */
 } SVMHV_SELFTEST;
 
+/* ------------------------------------------------------------ fatal exits */
+
+/*
+ * An exit the handler could not deal with.
+ *
+ * These used to be KeBugCheckEx calls, which was worse than useless: the exit
+ * handler runs with GIF clear, on a private host stack, with every other
+ * processor still in guest mode under our ASID, and a bugcheck raised from
+ * there cannot be relied upon to produce the dump that would justify it.  What
+ * it produces instead is a machine that dies leaving nothing behind - which is
+ * exactly the shape of the unexplained resets in CLAUDE.md, and exactly the
+ * thing that made them impossible to investigate.
+ *
+ * So the handler records what it saw here and leaves SVM on that processor
+ * instead.  For three of the four reasons below the guest then carries on
+ * natively and a client reads this out of the snapshot afterwards; for a guest
+ * triple fault nothing can carry on, but the state at the moment of death is at
+ * least in memory where a debugger can find it.
+ */
+#define SVMHV_FATAL_NONE            0
+#define SVMHV_FATAL_SHUTDOWN        1   /* guest triple fault, VMEXIT 0x7F   */
+#define SVMHV_FATAL_UNKNOWN_EXIT    2   /* an exit code we do not handle     */
+#define SVMHV_FATAL_NPF_UNMAPPED    3   /* #NPF where the map covers nothing */
+#define SVMHV_FATAL_NPF_LOOP        4   /* same instruction, same page, x16  */
+
+typedef struct _SVMHV_FATAL_EXIT
+{
+    UINT32 Reason;                      /* SVMHV_FATAL_*                     */
+    UINT32 Processor;
+    UINT64 Count;                       /* how many have happened in all     */
+    UINT64 ExitCode;
+    UINT64 ExitInfo1;
+    UINT64 ExitInfo2;
+    UINT64 ExitIntInfo;                 /* an event interrupted mid-delivery */
+    UINT64 Rip;
+    UINT64 Rsp;
+    UINT64 Cr2;
+    UINT64 Cr3;                         /* which address space it was in     */
+} SVMHV_FATAL_EXIT;
+
 /* --------------------------------------------------------------- snapshot */
 
 /*
@@ -436,6 +476,10 @@ typedef struct _SVMHV_SNAPSHOT
     SVMHV_EXIT_HISTOGRAM Histogram;
     SVMHV_HOOK_LIST Hooks;
     SVMHV_SELFTEST SelfTest;
+
+    /* Appended last on purpose: every offset above is hardcoded by clients
+       that have no compiler to compute it, so nothing may move. */
+    SVMHV_FATAL_EXIT Fatal;
 } SVMHV_SNAPSHOT;
 
 /* --------------------------------------------------------------- doorbell */
@@ -522,11 +566,17 @@ C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryAddress) == 1320);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryData)    == 1344);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, CaptureStack)  == 156);
 
+C_ASSERT(sizeof(SVMHV_FATAL_EXIT)      == 80);
+
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Stats)     == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram) == 656);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Hooks)     == 2728);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest)  == 2728 + sizeof(SVMHV_HOOK_LIST));
-C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 2728 + sizeof(SVMHV_HOOK_LIST) + sizeof(SVMHV_SELFTEST));
+C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Fatal)     == 2728 + sizeof(SVMHV_HOOK_LIST) +
+                                                    sizeof(SVMHV_SELFTEST));
+C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 2728 + sizeof(SVMHV_HOOK_LIST) +
+                                                    sizeof(SVMHV_SELFTEST) +
+                                                    sizeof(SVMHV_FATAL_EXIT));
 
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Sequence)             == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Completed)            == 24);

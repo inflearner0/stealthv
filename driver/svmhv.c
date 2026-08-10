@@ -94,10 +94,89 @@ static UINT32 SvOptionBits(VOID)
     if (STEALTHV_HIDE_EFER)     bits |= SVMHV_OPT_HIDE_EFER;
     if (STEALTHV_TSC_OFFSET)    bits |= SVMHV_OPT_TSC_OFFSET;
     if (STEALTHV_HIDE_PAGES)    bits |= SVMHV_OPT_HIDE_PAGES;
+    /* Reported because of what it costs.  A build running with this on behaves
+       so differently that a snapshot which does not say so is misleading. */
+    if (STEALTHV_ALWAYS_FLUSH_TLB) bits |= SVMHV_OPT_ALWAYS_FLUSH;
     if (g_ForwardHypercalls) bits |= SVMHV_OPT_PARENT_HYPERVISOR;
     if (g_1GbPages)        bits |= SVMHV_OPT_1GB_PAGES;
 
     return bits;
+}
+
+/* -------------------------------------------------------- fatal exits */
+
+/*
+ * What the exit handler does when it has nothing sensible left to do.
+ *
+ * Every one of these was a KeBugCheckEx, and every one of them was raised from
+ * a context that cannot honour it: GIF is clear, so this processor can take no
+ * interrupt and no NMI; the stack is our own 24 KiB host stack, not a kernel
+ * stack the crash path knows about; and every other processor is still inside
+ * VMRUN under an ASID nothing outside this driver has heard of.  A bugcheck
+ * from there does not produce a dump, it produces a machine that stops - which
+ * is precisely the failure this driver has been unable to investigate for
+ * months, and it may well have been generating some of them itself.
+ *
+ * So: write down everything the VMCB knows, and hand back TRUE so the caller
+ * leaves SVM on this processor.  The guest then continues natively - without
+ * our nested page tables, the access that could not be explained simply
+ * succeeds - and the control worker reports it from PASSIVE_LEVEL, where
+ * saying so is legal and a bugcheck would actually work.
+ */
+static SVMHV_FATAL_EXIT g_FatalExit;
+static volatile LONG    g_FatalExitPending;
+static volatile LONG64  g_FatalExitCount;
+
+static BOOLEAN SvRecordFatalExit(_Inout_ VIRTUAL_CPU* Cpu, _In_ UINT32 Reason)
+{
+    const VMCB* vmcb = &Cpu->GuestVmcb;
+
+    /*
+     * Last writer wins, and that is deliberate: the first fatal exit is the
+     * interesting one only if the machine survives it, and if it does not, the
+     * last thing that happened is what a debugger will want.  The count says
+     * how many were lost either way.
+     */
+    g_FatalExit.Reason      = Reason;
+    g_FatalExit.Processor   = Cpu->Index;
+    g_FatalExit.ExitCode    = vmcb->Control.ExitCode;
+    g_FatalExit.ExitInfo1   = vmcb->Control.ExitInfo1;
+    g_FatalExit.ExitInfo2   = vmcb->Control.ExitInfo2;
+    g_FatalExit.ExitIntInfo = vmcb->Control.ExitIntInfo;
+    g_FatalExit.Rip         = vmcb->StateSave.Rip;
+    g_FatalExit.Rsp         = vmcb->StateSave.Rsp;
+    g_FatalExit.Cr2         = vmcb->StateSave.Cr2;
+    g_FatalExit.Cr3         = vmcb->StateSave.Cr3;
+    g_FatalExit.Count       = (UINT64)InterlockedIncrement64(&g_FatalExitCount);
+
+    InterlockedExchange(&g_FatalExitPending, 1);
+
+    /*
+     * This processor is about to run without SVM, so it must stop looking
+     * virtualised - otherwise unload would ring the doorbell on it and take a
+     * #UD from a VMMCALL with EFER.SVME already clear.
+     */
+    Cpu->Virtualized = 0;
+    Cpu->FatalExits++;
+
+    return TRUE;
+}
+
+VOID SvFillFatalExit(_Out_ SVMHV_FATAL_EXIT* Fatal)
+{
+    *Fatal = g_FatalExit;
+}
+
+BOOLEAN SvTakeFatalExitReport(_Out_ SVMHV_FATAL_EXIT* Fatal)
+{
+    if (InterlockedExchange(&g_FatalExitPending, 0) == 0)
+    {
+        RtlZeroMemory(Fatal, sizeof(*Fatal));
+        return FALSE;
+    }
+
+    *Fatal = g_FatalExit;
+    return TRUE;
 }
 
 /* --------------------------------------------------------- capability */
@@ -247,12 +326,34 @@ VOID SvSignalTlbFlush(VOID)
     InterlockedIncrement(&g_FlushGeneration);
 }
 
+static VIRTUAL_CPU* SvCurrentCpu(VOID);
+
 static ULONG_PTR SvForceExitIpi(_In_ ULONG_PTR Argument)
 {
-    int regs[4];
+    const VIRTUAL_CPU* cpu = SvCurrentCpu();
 
-    /* Any intercepted instruction will do; the #VMEXIT is the whole point. */
-    __cpuid(regs, 0);
+    /*
+     * Any *intercepted* instruction will do, and which one is not a detail.
+     *
+     * This executed CPUID, with a comment saying exactly that - and it stopped
+     * being true the day the CPUID intercept was removed for concealment.  From
+     * then on this routine forced no exit at all, and the only reason hooks
+     * kept working is an accident of the lab: a Hyper-V guest writes
+     * HV_X64_MSR_EOI on every interrupt, that MSR falls outside all three MSRPM
+     * ranges, and so the IPI used to deliver this routine provoked the exit by
+     * itself.  On bare metal, or with STEALTHV_HIDE_EFER at 0, there is no MSR
+     * intercept and nothing would have flushed - a freshly installed hook would
+     * simply not fire, which is the precise failure this function was written
+     * to prevent.
+     *
+     * VMMCALL is intercepted in every configuration, so use that.  Skipped on a
+     * processor that is not in guest mode, where it would raise #UD.
+     */
+    if (cpu != NULL && cpu->Virtualized != 0)
+    {
+        (VOID)AsmNopCall();
+    }
+
     return Argument;
 }
 
@@ -389,9 +490,23 @@ static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* 
             return TRUE;
         }
 
+        /*
+         * The flush doorbell, and compiled in unconditionally for the same
+         * reason as the one above: SvSyncTlbFlush needs an instruction that is
+         * certain to exit, and a build without the control interface installs
+         * hooks like any other.  Reaching here *is* the exit, so there is
+         * nothing else to do.
+         */
+        if (Context->Rbx == SVMHV_HV_NOP && Cpu->GuestVmcb.StateSave.Cpl == 0)
+        {
+            Context->Rax = SVMHV_HV_STATUS_OK;
+            SvAdvanceRip(&Cpu->GuestVmcb, 3);
+            return FALSE;
+        }
+
         if (STEALTHV_CONTROL_INTERFACE)
         {
-            SvHandleControlCall(Context);
+            SvHandleControlCall(Context, Cpu->GuestVmcb.StateSave.Cpl);
             SvAdvanceRip(&Cpu->GuestVmcb, 3);
             return FALSE;
         }
@@ -473,8 +588,13 @@ static VOID SvNpfExplained(_Inout_ VIRTUAL_CPU* Cpu)
  *
  * RIP is never advanced - the faulting instruction is re-executed against the
  * new view, which is what makes this work without decoding it or single-stepping.
+ *
+ * Returns TRUE only for the two faults that cannot be resolved at all, which
+ * means "take this processor out of SVM" rather than "crash the machine": see
+ * SvRecordFatalExit.  The guest then re-executes the same instruction with no
+ * nested page tables in the way, and it succeeds.
  */
-static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
+static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
 {
     VMCB* vmcb = &Cpu->GuestVmcb;
     const UINT64 info = vmcb->Control.ExitInfo1;
@@ -497,7 +617,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
         {
             SvSwitchNpt(Cpu, FALSE);
             SvNpfExplained(Cpu);
-            return;
+            return FALSE;
         }
         goto unexplained;
     }
@@ -513,7 +633,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
             {
                 SvSwitchNpt(Cpu, TRUE);
                 SvNpfExplained(Cpu);
-                return;
+                return FALSE;
             }
             break;
 
@@ -525,7 +645,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
                 SvHookCountHit(page.HookId);
                 SvSwitchNpt(Cpu, TRUE);
                 SvNpfExplained(Cpu);
-                return;
+                return FALSE;
             }
             break;
 
@@ -537,7 +657,7 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
             SvHookCountHit(page.HookId);
             SvSwitchNpt(Cpu, TRUE);
             SvNpfExplained(Cpu);
-            return;
+            return FALSE;
 
         default:
             break;
@@ -546,11 +666,21 @@ static VOID SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
 
     if ((info & NPF_PRESENT) == 0)
     {
-        /* Nothing is mapped there, it is not a watchpoint, and we cannot
-           allocate a page table with GIF clear.  The identity map covers
-           everything the processor can address, so this is a bug. */
-        KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x4E50460ULL, info, gpa,
-                     (ULONG_PTR)rip);
+        /*
+         * Nothing is mapped there, it is not a watchpoint, and a page table
+         * cannot be allocated with GIF clear.  The identity map is supposed to
+         * cover everything the processor can address, so either it does not -
+         * the 512 GiB fallback in npt.c when 1 GiB pages are unavailable is the
+         * candidate, and MMIO lives above that on real machines - or a table
+         * has been corrupted.
+         *
+         * Either way there is nothing to do here, and crashing from this
+         * context would destroy the evidence rather than record it.  Leave SVM
+         * on this processor: the guest re-executes the access with no nested
+         * paging in the way and it completes, which is much better than the
+         * machine stopping, and the report survives to be read.
+         */
+        return SvRecordFatalExit(Cpu, SVMHV_FATAL_NPF_UNMAPPED);
     }
 
 unexplained:
@@ -570,8 +700,11 @@ unexplained:
     {
         if (++Cpu->SpuriousNpf > 16)
         {
-            KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x4E504601ULL, info, gpa,
-                         (ULONG_PTR)rip);
+            /* Sixteen flushes have not made this instruction complete, so the
+               tables really are wrong and retrying is a livelock.  Leaving SVM
+               ends the loop and keeps the machine, which is the only outcome
+               that can be looked at afterwards. */
+            return SvRecordFatalExit(Cpu, SVMHV_FATAL_NPF_LOOP);
         }
     }
     else
@@ -582,6 +715,7 @@ unexplained:
     }
 
     Cpu->PendingFlush = TRUE;
+    return FALSE;
 }
 
 /* --------------------------------------------------------- exit path */
@@ -620,7 +754,7 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
         break;
 
     case VMEXIT_NPF:
-        SvHandleNestedPageFault(Cpu);
+        devirtualise = SvHandleNestedPageFault(Cpu);
         break;
 
     case VMEXIT_VMMCALL:
@@ -656,12 +790,47 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
         devirtualise = TRUE;
         break;
 
+    case VMEXIT_SHUTDOWN:
+        /*
+         * The guest has triple-faulted, and this is the only moment its state
+         * is still readable.  There is no intercept bit for this exit - it
+         * always happens - so the driver has been receiving these all along and
+         * turning them into an unattributable machine death in the default case
+         * below.  That is the exact signature CLAUDE.md describes: no bugcheck,
+         * no dump, only a Kernel-Power 41 and a host reset.
+         *
+         * Nothing can make the guest survive; what this can do is say what
+         * killed it.  Record the VMCB, print it if - and only if - a debugger
+         * is attached to catch it, and leave SVM.
+         *
+         * One hazard, stated rather than defended against: the devirtualise
+         * tail builds its return frame on the guest's own RSP, and a triple
+         * fault caused by a bad stack leaves RSP unusable.  That path was
+         * already taken by every other exit, and the alternative here is the
+         * bugcheck that has never once produced a dump.
+         */
+        (VOID)SvRecordFatalExit(Cpu, SVMHV_FATAL_SHUTDOWN);
+        if (!KD_DEBUGGER_NOT_PRESENT)
+        {
+            DbgPrint("svmhv: GUEST TRIPLE FAULT on cpu %lu: rip %llx rsp %llx "
+                     "cr2 %llx cr3 %llx exitintinfo %llx\n",
+                     Cpu->Index, vmcb->StateSave.Rip, vmcb->StateSave.Rsp,
+                     vmcb->StateSave.Cr2, vmcb->StateSave.Cr3,
+                     vmcb->Control.ExitIntInfo);
+        }
+        devirtualise = TRUE;
+        break;
+
     default:
-        KeBugCheckEx(MANUALLY_INITIATED_CRASH,
-                     (ULONG_PTR)vmcb->Control.ExitCode,
-                     (ULONG_PTR)vmcb->Control.ExitInfo1,
-                     (ULONG_PTR)vmcb->StateSave.Rip,
-                     (ULONG_PTR)Cpu);
+        /*
+         * An exit nobody asked for.  Adding an intercept without a handler is
+         * the usual way here, and the answer is the same as for a shutdown:
+         * record it and stop being a hypervisor on this processor, rather than
+         * stop being a machine.  The guest carries on natively, and the
+         * snapshot names the exit code.
+         */
+        devirtualise = SvRecordFatalExit(Cpu, SVMHV_FATAL_UNKNOWN_EXIT);
+        break;
     }
 
     vmcb->StateSave.Rax = Context->Rax;

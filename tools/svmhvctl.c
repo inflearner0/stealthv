@@ -36,12 +36,29 @@
 #define HV_ABSENT               0xFFFFFFFFFFFFFFFFULL   /* VMMCALL raised #UD */
 #define HV_READ_WINDOW          48
 
-/* Mirrors svmhvctl.h's view of the driver; see the C_ASSERTs there. */
+/*
+ * Mirrors svmhvctl.h's view of the driver.
+ *
+ * Hardcoded because that is what a client of this channel has to do - it reads
+ * driver memory through a 48-byte window at an offset it names, with no
+ * compiler on the other side to work the offset out.  This file does have a
+ * compiler, though, so the numbers are checked against the structures rather
+ * than trusted: getting one wrong parses the middle of some other field and
+ * prints something plausible.
+ */
 #define SNAP_STATS              16
 #define SNAP_HISTOGRAM          656
 #define SNAP_HOOKS              2728
 #define SNAP_SELFTEST           19120
-#define SNAP_SIZE               19296
+#define SNAP_FATAL              19296
+#define SNAP_SIZE               19376
+
+C_ASSERT(SNAP_STATS     == FIELD_OFFSET(SVMHV_SNAPSHOT, Stats));
+C_ASSERT(SNAP_HISTOGRAM == FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram));
+C_ASSERT(SNAP_HOOKS     == FIELD_OFFSET(SVMHV_SNAPSHOT, Hooks));
+C_ASSERT(SNAP_SELFTEST  == FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest));
+C_ASSERT(SNAP_FATAL     == FIELD_OFFSET(SVMHV_SNAPSHOT, Fatal));
+C_ASSERT(SNAP_SIZE      == sizeof(SVMHV_SNAPSHOT));
 
 #define REQ_TARGET              0
 #define REQ_DETOUR              8
@@ -135,6 +152,29 @@ static int Present(void)
     return regs.Rbx == SVMHV_CONTROL_MAGIC;
 }
 
+/*
+ * How long to wait between asking whether a command is done.
+ *
+ * This used to be a flat Sleep(50) taken *before* the first poll, which put a
+ * fifty-millisecond floor under every command however fast the driver answered
+ * - and the driver now answers a working client in about a millisecond, so the
+ * floor was the whole of the latency.  Two hundred commands is ten seconds of
+ * sleeping for nothing, which is enough to change what a client bothers to ask
+ * for.
+ *
+ * So: poll first, then back off.  Short sleeps while the answer is plausibly
+ * imminent, long ones after that, with the same three-second ceiling as before
+ * so a driver that has genuinely stopped answering is still reported rather
+ * than waited on forever.
+ */
+#define WAIT_SHORT_ATTEMPTS     40
+#define WAIT_ATTEMPTS           (WAIT_SHORT_ATTEMPTS + 60)
+
+static unsigned int WaitBackoffMs(int attempt)
+{
+    return (attempt < WAIT_SHORT_ATTEMPTS) ? 1u : 50u;
+}
+
 /* Read Length bytes from one of the driver's structures, 48 at a time. */
 static int ReadBlock(unsigned __int64 command, unsigned __int64 index,
                      unsigned __int64 offset, unsigned char* out,
@@ -205,10 +245,8 @@ static int Submit(unsigned int command, const unsigned char* request,
     }
     sequence = regs.Rbx;
 
-    /* The worker polls every 100 ms. */
-    for (attempt = 0; attempt < 60; attempt++)
+    for (attempt = 0; attempt < WAIT_ATTEMPTS; attempt++)
     {
-        Sleep(50);
         if (Call(HV_POLL, 0, 0, &regs) == HV_OK && regs.Rbx >= sequence)
         {
             printf("status=0x%08x\n", (unsigned int)regs.Rdx);
@@ -218,6 +256,7 @@ static int Submit(unsigned int command, const unsigned char* request,
             }
             return (unsigned int)regs.Rdx == 0;
         }
+        Sleep(WaitBackoffMs(attempt));
     }
 
     fprintf(stderr, "the control worker never acknowledged the command\n");
@@ -280,11 +319,11 @@ static int SubmitMemoryEx(unsigned int command, unsigned __int64 address,
     }
     sequence = regs.Rbx;
 
-    for (attempt = 0; attempt < 60; attempt++)
+    for (attempt = 0; attempt < WAIT_ATTEMPTS; attempt++)
     {
-        Sleep(50);
         if (Call(HV_POLL, 0, 0, &regs) != HV_OK || regs.Rbx < sequence)
         {
+            Sleep(WaitBackoffMs(attempt));
             continue;
         }
 
@@ -870,6 +909,47 @@ static int ApplyOptions(unsigned char* request, int argc, char** argv, int index
 
 /* ----------------------------------------------------------------- views */
 
+/*
+ * The last exit the hypervisor could not handle.
+ *
+ * fatal_count is the number that matters: anything other than zero means a
+ * processor left SVM on its own and is now running unvirtualised, so the
+ * hypervisor is no longer covering the machine even though everything else here
+ * will look healthy.  Printed as part of the ordinary status because the whole
+ * point of the record is that nobody has to know to go looking for it.
+ */
+static void PrintFatal(void)
+{
+    static const char* const reasons[] =
+    {
+        "none", "guest-triple-fault", "unhandled-exit-code",
+        "npf-unmapped", "npf-retry-limit"
+    };
+    SVMHV_FATAL_EXIT fatal;
+
+    if (!ReadBlock(HV_READ_SNAPSHOT, 0, SNAP_FATAL, (unsigned char*)&fatal,
+                   sizeof(fatal)))
+    {
+        return;
+    }
+
+    printf("fatal_count=%llu\n", fatal.Count);
+    if (fatal.Count == 0)
+    {
+        return;
+    }
+
+    printf("fatal_reason=%s\nfatal_cpu=%u\n"
+           "fatal_exitcode=0x%llx\nfatal_info1=0x%llx\nfatal_info2=0x%llx\n"
+           "fatal_exitintinfo=0x%llx\n"
+           "fatal_rip=0x%llx\nfatal_rsp=0x%llx\nfatal_cr2=0x%llx\n"
+           "fatal_cr3=0x%llx\n",
+           (fatal.Reason < sizeof(reasons) / sizeof(reasons[0]))
+               ? reasons[fatal.Reason] : "unknown",
+           fatal.Processor, fatal.ExitCode, fatal.ExitInfo1, fatal.ExitInfo2,
+           fatal.ExitIntInfo, fatal.Rip, fatal.Rsp, fatal.Cr2, fatal.Cr3);
+}
+
 static void PrintStats(void)
 {
     unsigned char raw[SNAP_SIZE];
@@ -900,6 +980,8 @@ static void PrintStats(void)
     {
         printf("cpu%u_exits=%llu\n", i, stats.PerCpuExits[i]);
     }
+
+    PrintFatal();
 }
 
 static void PrintHooks(void)

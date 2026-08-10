@@ -100,9 +100,15 @@
  * it is the one setting where maximum concealment and a usable tool actually
  * conflict.  What it costs, honestly:
  *
- *   - a system thread that wakes ten times a second.  It is a timer wait, not a
- *     spin, but it is a thread in this driver that a scan of system threads can
- *     see, and a wakeup pattern somebody could correlate.
+ *   - a system thread that wakes ten times a second while nothing is happening.
+ *     It is a timer wait, not a spin, but it is a thread in this driver that a
+ *     scan of system threads can see, and a wakeup pattern somebody could
+ *     correlate.  While a client is actually issuing commands it is louder than
+ *     that on purpose - a couple of milliseconds of spinning and then a
+ *     millisecond timer for two seconds - because a hundred milliseconds of
+ *     latency per command is the difference between a tool that can be driven
+ *     and one that can only be batched.  That burst is itself a pattern, and it
+ *     only appears while somebody is using the interface.
  *   - one more CPUID leaf that answers, though only to a caller who already
  *     knows the key; with the wrong ECX it passes straight through to the
  *     hardware like any other reserved leaf.
@@ -114,3 +120,31 @@
  * stop working, because there is nothing left for them to talk to.
  */
 #define STEALTHV_CONTROL_INTERFACE  1
+
+/*
+ * Answer the control channel only at CPL 0.
+ *
+ * Off, and that is not an oversight - but it is worth being exact about what
+ * the default costs, because svm.h used to describe it as "the magic is the
+ * whole access check", which understates it.  The magic is a constant compiled
+ * into the driver and written out in full in svm.h, in a repository.  It is not
+ * a secret from anybody who can read the source, so with this at 0 the control
+ * channel is a ring-0 primitive available to any user-mode process on the
+ * machine: SVMHV_CMD_WRITE_PHYSICAL writes anywhere in RAM, and
+ * SVMHV_CMD_HOOK_INSTALL takes caller-supplied shellcode and arranges for the
+ * kernel to execute it.
+ *
+ * The default is 0 because svmhvctl.exe and the MCP agent are user-mode
+ * binaries and this is a lab tool on an isolated guest, where that is the
+ * correct trade.  Set it to 1 and only kernel-mode callers are answered, at
+ * which point the tooling needs a ring-0 shim of its own.
+ *
+ * Gating writes but not hook installation was considered and rejected: a hook
+ * install runs arbitrary bytes in ring 0, so a partial gate would protect
+ * nothing while reading as though it did.  It is all or nothing.
+ *
+ * The unload doorbell is not covered by this and never was - it checks CPL 0
+ * unconditionally, in every build, because user mode must not be able to
+ * unload the hypervisor.
+ */
+#define STEALTHV_CONTROL_REQUIRE_CPL0   0
