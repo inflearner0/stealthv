@@ -48,6 +48,20 @@ jobs:
           $driver = Get-Item 'bin\svmhv.sys'
           if ($driver.Length -lt 20kb) { throw "svmhv.sys is suspiciously small" }
 
+      - name: Exercise the non-loaded control probe
+        shell: pwsh
+        run: |
+          # Hosted runners cannot load the driver, but this is still a useful
+          # end-to-end check of the x64 assembly stub and its #UD recovery path.
+          # A non-loaded hypervisor is the expected condition and must report it
+          # cleanly instead of terminating the helper.
+          $output = & .\bin\svmhvctl.exe present 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 1 -or $output -notmatch 'present=0') {
+            throw "svmhvctl present did not report a clean non-loaded state (exit $exitCode)"
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: stealthv-build

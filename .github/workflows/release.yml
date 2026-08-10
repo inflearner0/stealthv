@@ -46,6 +46,38 @@ jobs:
           Copy-Item README.md, LICENSE $stage
           Copy-Item mcp\README.md "$stage\MCP.md"
 
+          # A fatal-exit RIP is only useful when it can be symbolized against the
+          # exact binary that produced it.  Keep symbols in a separate archive so
+          # the ordinary lab package remains small, and record the source and ABI
+          # identity next to both packages.
+          $symbols = "stage\stealthv-$tag-symbols"
+          New-Item -ItemType Directory -Path $symbols -Force | Out-Null
+          Copy-Item bin\svmhv.pdb, bin\svmhvctl.pdb, bin\hvtest.pdb $symbols
+
+          $abiLine = Select-String -Path include\svmhvctl.h `
+              -Pattern '^#define\s+SVMHV_CONTROL_VERSION\s+(\d+)' |
+              Select-Object -First 1
+          if (-not $abiLine) { throw 'could not determine SVMHV_CONTROL_VERSION' }
+          $abiVersion = $abiLine.Matches[0].Groups[1].Value
+          $commit = (git rev-parse HEAD).Trim()
+          $manifest = [ordered]@{
+            tag = $tag
+            commit = $commit
+            control_abi_version = $abiVersion
+            files = @()
+          }
+          foreach ($file in @(
+              'bin\svmhv.sys', 'bin\svmhvctl.exe', 'bin\hvtest.exe',
+              'bin\svmhv.pdb', 'bin\svmhvctl.pdb', 'bin\hvtest.pdb')) {
+            $hash = Get-FileHash $file -Algorithm SHA256
+            $manifest.files += [ordered]@{
+              name = [IO.Path]::GetFileName($file)
+              sha256 = $hash.Hash
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Out-File "$stage\BUILD-MANIFEST.json" -Encoding utf8
+          Copy-Item "$stage\BUILD-MANIFEST.json" "$symbols\BUILD-MANIFEST.json"
+
           # The certificate in here is generated fresh by every build and is
           # worth exactly nothing as a trust anchor - say so where somebody
           # about to install it will read it.
@@ -68,11 +100,16 @@ jobs:
           "@ | Out-File "$stage\RELEASE.txt" -Encoding utf8
 
           Compress-Archive -Path "$stage\*" -DestinationPath "stealthv-$tag.zip"
+          Compress-Archive -Path "$symbols\*" -DestinationPath "stealthv-$tag-symbols.zip"
           Get-FileHash "stealthv-$tag.zip" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  stealthv-$tag.zip" } |
             Out-File "stealthv-$tag.zip.sha256" -Encoding utf8
+          Get-FileHash "stealthv-$tag-symbols.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  stealthv-$tag-symbols.zip" } |
+            Out-File "stealthv-$tag-symbols.zip.sha256" -Encoding utf8
 
           Get-Content "stealthv-$tag.zip.sha256"
+          Get-Content "stealthv-$tag-symbols.zip.sha256"
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -90,6 +127,11 @@ jobs:
             This puts the running kernel inside a hypervisor and can install
             kernel hooks that are invisible to anything reading memory. Run it on
             a machine you own.
+
+            The separate `-symbols` archive contains the matching PDBs and a
+            build manifest with the source commit, control ABI version, and
+            SHA-256 hashes. Keep it with the lab evidence when investigating a
+            fatal RIP or trace.
 
             Long-duration stability under load is **not** verified — see *What is
             and is not tested* in the README before relying on it.
