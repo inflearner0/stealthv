@@ -281,6 +281,26 @@ AsmNopCall PROC
 AsmNopCall ENDP
 
 ;
+; UINT64 AsmStepCall(UINT64 Count)   -- RCX = instructions to step
+;
+; The same doorbell the user-mode stepper rings, from kernel mode, so that
+; call.c can put a step window around the function it is about to invoke.  It
+; has to be a hypercall rather than a call into step.c: arming writes the trap
+; flag into the VMCB state save, and from guest context that buffer is about to
+; be overwritten by the next #VMEXIT.  Only the exit handler can arm a step, so
+; the only way to arm one is to take an exit.
+;
+AsmStepCall PROC
+        push    rbx
+        mov     rax, 53564D485643414Ch          ; SVMHV_HYPERCALL_MAGIC
+        mov     rbx, 13                         ; SVMHV_HV_STEP
+        mov     rdx, rcx                        ; count
+        vmmcall
+        pop     rbx
+        ret
+AsmStepCall ENDP
+
+;
 ; VOID AsmSignatureCall(SVMHV_HV_SIGNATURE_RESULT *Out)   -- RCX = Out
 ;
 ; The signature probe, on the same channel.  RBX, RSI and RDI are non-volatile

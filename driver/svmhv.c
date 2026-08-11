@@ -979,6 +979,21 @@ static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* 
                     Context->Rdi = Cpu->WatchStepsAbandoned;
                     Context->R8  = drained;
                 }
+                else if (Context->Rdx == SVMHV_HV_STEP_DISARM)
+                {
+                    /*
+                     * End the window here rather than letting it run out.
+                     *
+                     * A window is a count of instructions, so a caller that
+                     * arms one around a short function spends the rest of it on
+                     * whatever runs next - which for call.c is its own epilogue,
+                     * and a 120-step window around a four-instruction function
+                     * recorded 116 instructions of this driver zeroing a buffer.
+                     * Closing it explicitly is what makes the record be about
+                     * the target instead of about the instrument.
+                     */
+                    SvStepDisarm(Cpu);
+                }
                 else
                 {
                     SvStepArm(Cpu, (UINT32)Context->Rdx, SVMHV_STEP_TRACE);

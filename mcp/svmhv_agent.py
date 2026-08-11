@@ -66,10 +66,13 @@ PDB_PROVENANCE_SUFFIX = ".provenance.json"
 
 # Subcommand names, hex addresses, lengths, mode words, and the option strings
 # built by hook_options - which is why the dot (notepad.exe) and the colon
-# (1:objattr) are in here.  These go to subprocess as an argv list, so no shell
-# ever sees them; the check is belt and braces against a malformed tool argument
+# (1:objattr) are in here.  The equals sign is for the keyword arguments the
+# call and usercall subcommands take (pid=, steps=, tid=, timeout=), and its
+# absence was a latent bug: every one of those was rejected here before it ever
+# reached svmhvctl.  These go to subprocess as an argv list, so no shell ever
+# sees them; the check is belt and braces against a malformed tool argument
 # reaching svmhvctl as something it would misparse.
-SAFE_ARGUMENT = re.compile(r"\A[0-9A-Za-z_.:-]+\Z")
+SAFE_ARGUMENT = re.compile(r"\A[0-9A-Za-z_.:=-]+\Z")
 
 _lock = threading.Lock()
 
@@ -783,6 +786,23 @@ def tool_sweep(mode: str = "exec", base: str = "0", size: str = "0") -> str:
              f"{int(hexarg(base), 16):#x}",
              f"Every page in the range now faults once, the first time it is "
              f"{what}, and never again. Read the result with svmhv_coverage."]
+
+    # An exec sweep is the cheap one and it is not free.  1 GiB has worked and
+    # has also, on a guest that was already busy, produced a fault storm that
+    # starved the control worker for minutes - and the control worker is the
+    # only thing that can disarm a sweep, so there is no way back except a hard
+    # reset of the machine.  The driver's own limit is about table pages, not
+    # about this, so the warning lives here.
+    if mode == "exec" and armed > (256 << 20):
+        lines += [
+            "",
+            f"That is {armed / (1 << 20):,.0f} MiB, which is past where this "
+            f"has been comfortable. An exec sweep faults once per page ever, "
+            f"but over a range this size the storm can starve the control "
+            f"worker - and that worker is the only thing that can disarm the "
+            f"sweep, so the machine has to be reset to get out of it. Sweep a "
+            f"range you have a reason to suspect.",
+        ]
     if mode == "both":
         lines += [
             "",
@@ -3300,7 +3320,8 @@ def _findings_read() -> dict:
         return {}
 
 
-def tool_note(address: str = "", text: str = "", contains: str = "") -> str:
+def tool_note(address: str = "", text: str = "", contains: str = "",
+              pid: int = 0) -> str:
     """Record what was worked out about an address, or read it back.
 
     Reverse engineering is mostly accumulated conclusions - this offset is the
@@ -3326,7 +3347,7 @@ def tool_note(address: str = "", text: str = "", contains: str = "") -> str:
                   if not wanted or wanted in k.lower()
                   or wanted in str(v).lower()}
         if address:
-            key = _note_key(address)
+            key = _note_key(address, pid)
             chosen = {k: v for k, v in notes.items() if k == key}
         if not chosen:
             return "nothing recorded yet" if not (contains or address) else \
@@ -3335,15 +3356,15 @@ def tool_note(address: str = "", text: str = "", contains: str = "") -> str:
         for key, entries in sorted(chosen.items()):
             lines.append(f"{key}")
             for entry in entries:
-                lines.append(f"    {_note_text(key, entry)}")
+                lines.append(f"    {_note_text(key, entry, pid)}")
         return "\n".join(lines)
 
     if not address:
         return "give an address or symbol to attach the note to"
 
-    key = _note_key(address)
-    notes.setdefault(key, []).append({"text": text, "build": _note_build(address)}
-                                     if _note_build(address) else text)
+    key = _note_key(address, pid)
+    notes.setdefault(key, []).append({"text": text, "build": _note_build(address, pid)}
+                                     if _note_build(address, pid) else text)
     try:
         with open(FINDINGS_PATH, "w", encoding="utf-8") as handle:
             json.dump(notes, handle, indent=1, sort_keys=True)
@@ -3352,17 +3373,45 @@ def tool_note(address: str = "", text: str = "", contains: str = "") -> str:
     return f"noted against {key}: {text}"
 
 
-def _note_key(address: str) -> str:
+# How many bytes of the code itself identify it, when nothing else does.  Enough
+# to be distinctive and short enough to survive the relocations and the one
+# patched byte that a payload picks up between one mapping and the next.
+NOTE_HASH_BYTES = 64
+
+
+def _note_key(address: str, pid: int = 0) -> str:
     """A name that survives a reboot, if one can be had."""
     try:
-        resolved = resolve(address)
+        resolved = resolve(address, pid)
     except CtlError:
         return address
-    named = symbolize(resolved)
-    return named if "!" in named or "+" in named else f"{resolved:#x}"
+
+    named = symbolize(resolved, pid)
+    if "!" in named or "+" in named:
+        return named
+
+    # Nothing declares this address, which is the case that matters most: a
+    # manually mapped payload has no module and no symbol, and it lands
+    # somewhere different every boot - so a note keyed on the address is worth
+    # nothing tomorrow, which is exactly the code worth taking notes about.
+    # Key it on the bytes instead, and it follows the code wherever it is next
+    # mapped.
+    anonymous = _note_content_key(resolved, pid)
+    return anonymous if anonymous else f"{resolved:#x}"
 
 
-def _note_build(address: str) -> str:
+def _note_content_key(resolved: int, pid: int = 0) -> str:
+    """A key made from the code at an address, for code nothing else names."""
+    try:
+        code = read_bytes(resolved, NOTE_HASH_BYTES, pid)
+    except CtlError:
+        return ""
+    if len(code) < 16 or not any(code):
+        return ""                       # all zeroes identifies nothing
+    return "anon:" + hashlib.sha256(code).hexdigest()[:16]
+
+
+def _note_build(address: str, pid: int = 0) -> str:
     """The PDB identity of the module the address is in, or "" if there is none.
 
     Best effort throughout: a manually mapped payload has no debug directory,
@@ -3370,8 +3419,8 @@ def _note_build(address: str) -> str:
     refuse to record a conclusion about it.
     """
     try:
-        resolved = resolve(address)
-        module = module_for(resolved)
+        resolved = resolve(address, pid)
+        module = module_for(resolved, pid)
         if module is None:
             return ""
         return f"{module['name']}/{pdb_info(module['base'])['guid']}"
@@ -3379,7 +3428,7 @@ def _note_build(address: str) -> str:
         return ""
 
 
-def _note_text(key: str, entry) -> str:
+def _note_text(key: str, entry, pid: int = 0) -> str:
     """One stored note, marked when it came from a build that is not loaded now."""
     if not isinstance(entry, dict):
         return str(entry)                   # written before builds were recorded
@@ -3389,7 +3438,7 @@ def _note_text(key: str, entry) -> str:
     if not was:
         return text
 
-    now = _note_build(key)
+    now = _note_build(key, pid)
     if now and now != was:
         return f"{text}   [from {was}; loaded now is {now}]"
     return text
@@ -5257,7 +5306,8 @@ def tool_snapshot(action: str = "query", target: str = "", size: int = 0,
     return _snapshot_report(values, f"snapshot of {target}")
 
 
-def tool_call(target: str, args: list | None = None, pid: int = 0) -> str:
+def tool_call(target: str, args: list | None = None, pid: int = 0,
+              steps: int = 0) -> str:
     """Call a function with arguments of your choosing and report what it returns.
 
     The question a disassembly cannot answer. Everything else here waits for the
@@ -5289,6 +5339,8 @@ def tool_call(target: str, args: list | None = None, pid: int = 0) -> str:
     arguments = ["call", f"{address:x}"] + [f"{v:x}" for v in values]
     if pid:
         arguments.append(f"pid={int(pid)}")
+    if steps:
+        arguments.append(f"steps={int(max(1, min(int(steps), 4096)))}")
 
     result = pairs(ctl(*arguments))
     status = as_int(result, "status", 0) & 0xFFFFFFFF
@@ -5309,7 +5361,97 @@ def tool_call(target: str, args: list | None = None, pid: int = 0) -> str:
     if exception:
         lines.append(f"  raised    {exception:#010x} - the call did not "
                      f"complete and the return value is meaningless")
+    if steps:
+        # Everything from the target's first instruction to its return.  Not
+        # "rip >= address", which was the first attempt and counts this driver's
+        # own code too, because svmhv.sys loads above ntoskrnl.
+        rows = _step_rows(steps)
+        inside, seen = 0, False
+        for row in rows:
+            rip = int(row.get("rip", "0"), 0)
+            if rip == address:
+                seen = True
+            if seen:
+                inside += 1
+        lines.append(f"  stepped   {len(rows)} record(s), {inside} of them from "
+                     f"the target's entry onwards; svmhv_reverse walks them")
     return "\n".join(lines)
+
+
+def tool_usercall(target: str, pid: int, args: list | None = None,
+                  tid: int = 0, timeout: int = 5000) -> str:
+    """Call a function inside a user process by borrowing one of its threads.
+
+    svmhv_call is for kernel functions. This is the same question for an .exe or
+    a .dll, and it needs a user thread with a user stack, so it borrows one:
+    suspends it, saves its whole context, points it at the target with your
+    arguments, catches it when it returns, and puts the context back.
+
+    The thread does not do its own work while this runs. Borrowing one that
+    holds a lock and calling something that wants the same lock deadlocks the
+    process until the timeout - so name a thread that is idle in a wait where
+    you can. Everything the called function does to the process is real and is
+    not undone; snapshot anything it will write to first.
+    """
+    address = resolve(target, pid)
+    values = []
+    for one in (args or []):
+        if isinstance(one, int):
+            values.append(one)
+        else:
+            text = str(one).strip()
+            try:
+                values.append(resolve(text, pid) if "!" in text
+                              else int(text, 16))
+            except (ValueError, CtlError):
+                return f"could not make an argument out of {one!r}"
+    if len(values) > 4:
+        return ("at most four arguments. A fifth goes in the caller's stack "
+                "slots, which needs the callee's expectations about home space "
+                "and alignment - more than a generic mechanism can know.")
+    if not pid:
+        return "a user-mode call needs the process id"
+
+    arguments = (["usercall", f"{address:x}", f"pid={int(pid)}"]
+                 + [f"{v:x}" for v in values])
+    if tid:
+        arguments.append(f"tid={int(tid)}")
+    if timeout:
+        arguments.append(f"timeout={int(timeout)}")
+
+    result = pairs(ctl(*arguments))
+    status = as_int(result, "status", 0) & 0xFFFFFFFF
+
+    if status == 0x00000102:
+        return (f"borrowed thread {as_int(result, 'usercall_thread')} never came "
+                f"back within {timeout} ms.\nIts original context has been put "
+                f"back, so nothing is left running inside the call - but the "
+                f"function either blocked or never returns. Try another thread, "
+                f"a longer timeout, or check that the arguments are what it "
+                f"expects.")
+    if status == 0x8000000B:
+        return ("that thread has no user-mode frame - it is a system thread, or "
+                "one that has never been out to user mode. Name a different "
+                "one.")
+    if status == 0xC000000D and not tid:
+        return "that process has no threads to borrow"
+    if status == 0xC000007A:
+        return ("the thread routines this needs could not be resolved on this "
+                "kernel, so user-mode calls are unavailable here. It needs "
+                "PsSuspendThread, PsResumeThread and PsGetNextProcessThread, "
+                "none of which is in the WDK import library - the driver looks "
+                "them up by name at run time and logs which one was missing.")
+    if status:
+        return f"usercall failed: {status:#010x}"
+
+    returned = as_int(result, "usercall_result")
+    used = as_int(result, "usercall_thread")
+    return "\n".join([
+        f"{symbolize(address, pid)}({', '.join(f'{v:#x}' for v in values)}) "
+        f"in pid {pid}",
+        f"  returned  {returned:#x}  ({returned})",
+        f"  thread    {used}, put back where it was",
+    ])
 
 
 def tool_revive() -> str:
@@ -5340,17 +5482,402 @@ def tool_revive() -> str:
             f"with the exit code that stopped them.")
 
 
+# ------------------------------------------------------- the experiment loop
+
+def _call_once(address: int, values: list[int], pid: int, steps: int = 0) -> dict:
+    """One call, as parsed fields rather than a report."""
+    arguments = ["call", f"{address:x}"] + [f"{v:x}" for v in values]
+    if pid:
+        arguments.append(f"pid={int(pid)}")
+    if steps:
+        arguments.append(f"steps={int(steps)}")
+    result = pairs(ctl(*arguments))
+    return {
+        "status": as_int(result, "status", 0) & 0xFFFFFFFF,
+        "result": as_int(result, "call_result"),
+        "cycles": as_int(result, "call_cycles"),
+        "exception": as_int(result, "call_exception"),
+    }
+
+
+def _parse_inputs(inputs: list, pid: int) -> tuple[list[list[int]], str]:
+    """Each entry is one call's arguments: a list, or a space-separated string."""
+    out = []
+    for entry in inputs:
+        pieces = entry.split() if isinstance(entry, str) else list(entry)
+        values = []
+        for piece in pieces:
+            if isinstance(piece, int):
+                values.append(piece)
+                continue
+            text = str(piece).strip()
+            try:
+                values.append(resolve(text, pid) if "!" in text
+                              else int(text, 16))
+            except (ValueError, CtlError):
+                return [], f"could not make an argument out of {piece!r}"
+        out.append(values)
+    return out, ""
+
+
+def tool_explore(target: str, inputs: list, snapshot_target: str = "",
+                 snapshot_size: int = 0, pid: int = 0,
+                 store_pages: int = 0) -> str:
+    """Call a function once per input, and report which inputs reached new code.
+
+    This is the loop the other tools were built for. Snapshot the memory the
+    function works on, then for each input: restore, call, collect the coverage
+    the call produced. What comes back is not a hundred traces, it is the short
+    list of inputs that reached somewhere the others did not - which is the
+    whole question when you are looking for the branch that matters.
+
+    Arm a coverage sweep first with svmhv_sweep, or there is nothing to collect
+    and this degrades to a list of return values (still useful, and said so).
+
+    A sweep reports each page ONCE for its lifetime. That is exactly right here:
+    the pages an input is credited with are pages no earlier input reached, so
+    the report is genuinely "new ground" and not "everything this input
+    touched". It also means order matters and the first input looks the most
+    interesting - run a warm-up input first if that would mislead you.
+    """
+    address = resolve(target, pid)
+    values, problem = _parse_inputs(inputs or [], pid)
+    if problem:
+        return problem
+    if not values:
+        return "give at least one input: a list of argument lists"
+    if len(values) > 64:
+        return "at most 64 inputs in one run; split it"
+
+    snapshotting = bool(snapshot_target and snapshot_size)
+    if snapshotting:
+        taken = tool_snapshot("take", snapshot_target, snapshot_size, pid,
+                              store_pages)
+        if "armed" not in taken:
+            return "could not take the snapshot, so nothing was run:\n" + taken
+
+    # Only pages the TARGET's module reached are credited.
+    #
+    # A sweep is armed over physical memory, not over a function, so it reports
+    # every page anything on the machine touches - and a call that takes 165
+    # cycles is bracketed by seconds of ambient activity, which buries it. The
+    # first run of this credited every input with the same 88 pages of graphics
+    # and shell code. Filtering by the module the target lives in is what makes
+    # the answer about the target.
+    home = module_for(address, pid)
+    low = home["base"] if home else 0
+    high = (home["base"] + home["size"]) if home else 0
+
+    def mine(found):
+        if not low:
+            return found, 0
+        kept, dropped = {}, 0
+        for page, entry in found.items():
+            rip = int(entry["rip"], 0)
+            if low <= rip < high:
+                kept[page] = entry
+            else:
+                dropped += 1
+        return kept, dropped
+
+    # A running set, because reads do not consume: without it every input is
+    # credited with every earlier input's records as well as its own.
+    spent = _ring_sequences()
+    _coverage_now(spent)
+
+    rows = []
+    ambient = 0
+    try:
+        for index, one in enumerate(values):
+            if snapshotting and index != 0:
+                restored = tool_snapshot("restore")
+                if "refused" in restored or "overflow" in restored:
+                    rows.append({"input": one, "failed": "snapshot overflowed"})
+                    break
+
+            outcome = _call_once(address, one, pid)
+            found, dropped = mine(_coverage_now(spent))
+            ambient += dropped
+            rows.append({
+                "input": one,
+                "result": outcome["result"],
+                "cycles": outcome["cycles"],
+                "exception": outcome["exception"],
+                "status": outcome["status"],
+                "new": found,
+            })
+    finally:
+        if snapshotting:
+            tool_snapshot("restore")
+            tool_snapshot("release")
+
+    lines = [f"{symbolize(address, pid)} over {len(rows)} input(s)"
+             + (f", snapshotting {snapshot_size:#x} bytes at {snapshot_target}"
+                if snapshotting else ", WITHOUT a snapshot - anything the calls "
+                                     "wrote is still written"),
+             ""]
+
+    interesting = [r for r in rows if r.get("new")]
+    by_result: dict[int, int] = {}
+    for row in rows:
+        if "failed" not in row:
+            by_result[row["result"]] = by_result.get(row["result"], 0) + 1
+
+    for index, row in enumerate(rows):
+        shown = " ".join(f"{v:#x}" for v in row["input"]) or "(no arguments)"
+        if "failed" in row:
+            lines.append(f"  [{index:>2}] {shown}  -- {row['failed']}")
+            continue
+        note = ""
+        if row["exception"]:
+            note = f"  RAISED {row['exception']:#010x}"
+        elif row["status"]:
+            note = f"  refused {row['status']:#010x}"
+        lines.append(f"  [{index:>2}] {shown}  -> {row['result']:#x}"
+                     f"  {row['cycles']:>8,} cycles"
+                     + (f"  {len(row['new'])} NEW page(s)" if row["new"] else "")
+                     + note)
+
+    lines += ["", f"{len(by_result)} distinct return value(s): "
+              + ", ".join(f"{v:#x} x{n}" for v, n in sorted(by_result.items()))]
+    if ambient:
+        lines.append(f"{ambient} page(s) reached by the rest of the machine "
+                     f"during the run were dropped; only pages entered from "
+                     f"{home['name'] if home else 'the target'} are credited.")
+    if not low:
+        lines.append("No module claims the target, so nothing could be "
+                     "filtered - the pages below include everything the "
+                     "machine did while this ran.")
+
+    if not interesting:
+        lines += ["",
+                  "No input reached a page another had not. Either the sweep is "
+                  "not armed - svmhv_sweep exec over the module first - or every "
+                  "input takes the same path, which is itself an answer: the "
+                  "branch you are looking for is not decided by these arguments."]
+    else:
+        lines += ["", "inputs that reached new code, and what entered it:"]
+        for index, row in enumerate(rows):
+            if not row.get("new"):
+                continue
+            shown = " ".join(f"{v:#x}" for v in row["input"]) or "(none)"
+            lines.append(f"  [{index}] {shown}")
+            for page, entry in sorted(row["new"].items(),
+                                      key=lambda kv: int(kv[0], 16))[:8]:
+                rip = int(entry["rip"], 0)
+                state = int(entry["state"], 0)
+                mark = "  WRITTEN-THEN-EXECUTED" if state & 0x04 else ""
+                lines.append(f"        {int(page, 16):#014x} from "
+                             f"{symbolize(rip, pid)}{mark}")
+            if len(row["new"]) > 8:
+                lines.append(f"        ... and {len(row['new']) - 8} more")
+
+    return "\n".join(lines)
+
+
+def tool_diverge(target: str, input_a: str, input_b: str, steps: int = 2000,
+                 pid: int = 0, snapshot_target: str = "",
+                 snapshot_size: int = 0) -> str:
+    """Run a function under two inputs and report where the paths part.
+
+    The canonical question in front of a licence check, a signature check or an
+    anti-debug branch: not what the function does, but where the good input and
+    the bad one stop agreeing. That single address is usually the whole answer,
+    and finding it by reading two thousand-instruction traces is exactly what a
+    reader should not have to do.
+
+    Both runs are single-stepped into the trace ring and the two RIP sequences
+    are compared. The first place they differ is reported with the instruction
+    before it, which is the branch that decided.
+    """
+    address = resolve(target, pid)
+    parsed, problem = _parse_inputs([input_a, input_b], pid)
+    if problem:
+        return problem
+    steps = max(64, min(int(steps), 4096))
+
+    snapshotting = bool(snapshot_target and snapshot_size)
+    if snapshotting:
+        taken = tool_snapshot("take", snapshot_target, snapshot_size, pid)
+        if "armed" not in taken:
+            return "could not take the snapshot, so nothing was run:\n" + taken
+
+    paths = []
+    try:
+        for index, values in enumerate(parsed):
+            if snapshotting and index != 0:
+                tool_snapshot("restore")
+            # Reset AND drain. The reset empties the ring; the drain moves this
+            # reader's cursor past anything already in it, which a reset alone
+            # does not do - and a leftover run from an earlier call is
+            # indistinguishable from this one once both are in the list, which
+            # is how the first version reported a divergence seven instructions
+            # into a five-instruction function.
+            ctl("trace-reset")
+            spent = _ring_sequences()
+            outcome = _call_once(address, values, pid, steps)
+            rows = _step_rows(steps, spent)
+            paths.append({"values": values, "rows": rows,
+                          "result": outcome["result"]})
+    finally:
+        if snapshotting:
+            tool_snapshot("restore")
+            tool_snapshot("release")
+
+    first, second = paths
+
+    # The window covers this driver's own code at both ends - the instructions
+    # between arming and the call, and everything after the return until the
+    # window is closed.  Neither is the subject.  So: start at the target's
+    # entry, and stop as soon as execution leaves the module the target is in,
+    # which is the return.
+    #
+    # Bounded by the TARGET's module rather than by looking up this driver's,
+    # because that lookup failing is silent and produces a comparison over
+    # hundreds of instructions of instrument - which is what it did.  A target
+    # that calls out into another module is cut short here, and that is the
+    # right trade: the divergence being looked for is nearly always in the
+    # function itself, and a wrong answer is worse than a short one.
+    home = module_for(address, pid)
+    low = home["base"] if home else 0
+    high = (home["base"] + home["size"]) if home else 0
+
+    def from_target(rows):
+        trimmed = []
+        started = False
+        for row in rows:
+            rip = int(row.get("rip", "0"), 0)
+            if not started:
+                if rip != address:
+                    continue
+                started = True
+            elif low and not (low <= rip < high):
+                break
+            trimmed.append(rip)
+        return trimmed
+
+    left = from_target(first["rows"])
+    right = from_target(second["rows"])
+
+    header = [
+        f"{symbolize(address, pid)}"
+        + (f", bounded to {home['name']}" if home
+           else ", UNBOUNDED - no module claims this address, so the counts "
+                "below include whatever ran after the return"),
+        f"  A  {' '.join(f'{v:#x}' for v in first['values']) or '(none)'}"
+        f"  -> {first['result']:#x}   {len(left)} instruction(s)",
+        f"  B  {' '.join(f'{v:#x}' for v in second['values']) or '(none)'}"
+        f"  -> {second['result']:#x}   {len(right)} instruction(s)",
+        "",
+    ]
+
+    if not left or not right:
+        return "\n".join(header + [
+            "One of the runs recorded nothing at the target's own address. The "
+            "step window is a count of instructions and it is spent on whatever "
+            "runs, so a preempted worker thread can burn it before reaching the "
+            "call. Try again, or with more steps.",
+        ])
+
+    def head(path, count=10):
+        return ["    " + ", ".join(
+            (f"+{r - address:#x}" if low <= r < high else f"{r:#x}")
+            for r in path[:count]) + (" ..." if len(path) > count else "")]
+
+    for position, (one, other) in enumerate(zip(left, right)):
+        if one == other:
+            continue
+        previous = left[position - 1] if position else None
+        lines = header + [
+            f"the paths part at instruction {position} into the function:",
+            f"  A goes to {symbolize(one, pid)}",
+            f"  B goes to {symbolize(other, pid)}",
+            "",
+            "  A ran:",
+        ] + head(left) + ["  B ran:"] + head(right) + [""]
+        if previous is not None:
+            code = ""
+            for row in first["rows"]:
+                if int(row.get("rip", "0"), 0) == previous and row.get("code"):
+                    try:
+                        _, code, _ = disassemble_one(
+                            bytes.fromhex(row["code"]), 0, previous)
+                    except (ValueError, IndexError):
+                        code = ""
+                    break
+            lines += ["",
+                      f"the branch that decided it is at {symbolize(previous, pid)}"
+                      + (f"   {code}" if code else ""),
+                      "",
+                      "That is the instruction to look at. svmhv_reverse will "
+                      "say which register it tested and where that register got "
+                      "its value."]
+        return "\n".join(lines)
+
+    if len(left) == len(right):
+        return "\n".join(header + [
+            "The two runs executed the same instructions in the same order for "
+            "the whole window. Either the inputs do not reach a branch that "
+            "distinguishes them, or the branch is beyond the window - raise "
+            "steps.",
+        ])
+    return "\n".join(header + [
+        f"identical for the first {min(len(left), len(right))} instruction(s), "
+        f"then one run kept going. The shorter one returned early; the extra "
+        f"instructions in the longer are what it did instead.",
+    ])
+
+
 # ------------------------------------------------------------ reverse window
 
 REGISTER_NAMES = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                   "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
 
 
-def _step_rows(count: int) -> list[dict]:
-    """The stepped records in the ring, oldest first, with registers parsed."""
-    text = ctl("trace", str(min(max(int(count), 1), 200)))
+def _read_ring(wanted: int, skip: set | None = None) -> list[dict]:
+    """Records from the ring, de-duplicated by sequence.
+
+    A read is NOT consuming: "trace 200" hands back the newest two hundred every
+    time it is asked, so a loop that reads until it has enough gets the same two
+    hundred over and over. That is not a hypothetical - it produced a comparison
+    whose first seven entries were the same instruction seven times, once per
+    read, which read exactly like a function looping.
+
+    So the loop stops when a read brings nothing new rather than when it brings
+    nothing, and `skip` carries the sequences a caller already considers spent.
+    """
+    seen = set(skip or ())
     out = []
-    for row in records(text, "trace"):
+    for _ in range(COVERAGE_MAX_READS):
+        fresh = 0
+        for row in records(ctl("trace", "200"), "trace"):
+            sequence = row.get("seq")
+            if sequence in seen:
+                continue
+            seen.add(sequence)
+            out.append(row)
+            fresh += 1
+        if fresh == 0 or len(out) >= wanted:
+            break
+    return out
+
+
+def _ring_sequences() -> set:
+    """Every sequence currently visible, so a later read can ignore them."""
+    return {row.get("seq") for row in records(ctl("trace", "200"), "trace")}
+
+
+def _step_rows(count: int, skip: set | None = None) -> list[dict]:
+    """The stepped records in the ring, oldest first, with registers parsed.
+
+    Read across several passes, because one read returns at most 200 records and
+    a step window can be twenty times that; see _read_ring for why that loop is
+    not the obvious one. `skip` is what a caller already saw before it did the
+    thing it is now measuring.
+    """
+    rows = _read_ring(max(int(count), 1), skip)
+    out = []
+    for row in rows:
         if int(row.get("type", "0"), 0) != 4:       # SVMHV_TRACE_STEP
             continue
         registers = []
@@ -5559,6 +6086,198 @@ def tool_provenance(target: str, size: int = 8, pid: int = 0,
     return "\n".join(lines)
 
 
+# ----------------------------------------------------------- what a buffer is
+
+# "mov qword ptr [rcx], rdx" - the operand keyword is where the access width
+# is, and it is the only place: the trace record's own width field says how much
+# of the watched qword was inside the page, not how much the instruction moved.
+# Longest first, and it matters: "word ptr" is a substring of "qword ptr", so
+# checking in the obvious order calls every eight-byte store two bytes wide.
+ACCESS_WIDTHS = (("xmmword", 16), ("qword", 8), ("dword", 4),
+                 ("word", 2), ("byte", 1))
+
+
+def _access_width(text: str) -> int:
+    for keyword, width in ACCESS_WIDTHS:
+        if f"{keyword} ptr" in text:
+            return width
+    return 0
+
+
+def _name_or_address(address: int, pid: int = 0) -> str:
+    """symbolize, but a failure to name something is not a failure to report it.
+
+    symbolize reaches for export tables and PDBs, so it reads guest memory, and
+    a read that fails raises. That is right for a tool whose whole job is the
+    name and wrong here: losing an entire structure layout because one
+    instruction could not be attributed is a bad trade.
+    """
+    try:
+        return symbolize(address, pid)
+    except (CtlError, ValueError, KeyError, IndexError):
+        return f"{address:#x}"
+
+
+def tool_struct(target: str, size: int = 64, pid: int = 0, seconds: int = 15,
+                mode: str = "access") -> str:
+    """Watch a buffer and infer what shape it is from how it is used.
+
+    A structure with no symbols is recovered from the accesses to it: something
+    that is always read four bytes at a time at +0x10 is a field, something read
+    eight bytes at a time and then dereferenced is a pointer, and an offset
+    nothing ever touches is padding. Doing that by hand from a trace is the most
+    tedious job in reverse engineering and the most mechanical, which is a good
+    reason for it not to be done by hand.
+
+    What comes back is a candidate layout: offset, the width the instructions
+    actually used, whether it is read or written and by what. It is evidence,
+    not a declaration - a field only appears if something touched it while this
+    was watching, so drive the code that uses the buffer during the window.
+    """
+    if mode not in ("write", "access"):
+        return "mode must be 'write' or 'access'"
+
+    start = resolve(target, pid)
+    size = max(1, min(int(size), 4096))
+    seconds = max(1, min(int(seconds), 120))
+
+    first = start & ~0xFFF
+    last = (start + size - 1) & ~0xFFF
+    pages = list(range(first, last + 0x1000, 0x1000))
+
+    ctl("trace-reset")
+
+    # Offsets are computed from the faulting guest physical address, so the base
+    # has to be physical too - and it comes from the watch install rather than
+    # from a separate translate. Installing a watch necessarily resolves the
+    # page, so asking twice is both redundant and a second thing that can
+    # disagree: translate refused an address that read and watch both handled
+    # perfectly well, and the layout came back empty with the base at zero.
+    armed = []
+    base_gpa = 0
+    extra = hook_options(in_process=pid) if pid else []
+    for page in pages:
+        values = pairs(ctl("watch", f"{page:x}", mode, *extra))
+        if as_int(values, "status", -1) & 0xFFFFFFFF:
+            continue
+        armed.append(page)
+        if page == first:
+            base_gpa = as_int(values, "gpa") + (start - first)
+
+    if not armed:
+        return f"could not watch any of the {len(pages)} page(s) covering {target}"
+    if not base_gpa:
+        for page in armed:
+            try:
+                ctl("unhook", f"{page:x}")
+            except CtlError:
+                pass
+        return (f"the watch on {target} did not report a physical page, so "
+                f"offsets cannot be worked out. Nothing is left armed.")
+
+    try:
+        time.sleep(seconds)
+        text = ctl("trace", "200")
+    finally:
+        for page in armed:
+            try:
+                ctl("unhook", f"{page:x}")
+            except CtlError:
+                pass
+
+    hits = [r for r in records(text, "trace")
+            if int(r.get("type", "0"), 0) in (1, 2)]
+    if not hits:
+        return (f"nothing touched {target} in {seconds}s. A layout is inferred "
+                f"from accesses, so something has to make them - run the code "
+                f"that uses this buffer while the window is open.")
+
+    fields: dict[int, dict] = {}
+    outside = 0
+    for hit in hits:
+        gpa = int(hit.get("gpa", "0"), 0)
+        offset = gpa - base_gpa
+        if offset < 0 or offset >= size:
+            outside += 1
+            continue
+
+        rip = int(hit.get("rip", "0"), 0)
+        code = hit.get("code", "")
+        text_of = ""
+        if code:
+            try:
+                _, text_of, _ = disassemble_one(bytes.fromhex(code), 0, rip)
+            except (ValueError, IndexError):
+                text_of = ""
+
+        entry = fields.setdefault(offset, {
+            "reads": 0, "writes": 0, "width": 0, "by": {}, "last": None,
+        })
+        width = _access_width(text_of)
+        entry["width"] = max(entry["width"], width)
+
+        before, after = hit.get("before"), hit.get("after")
+
+        # Direction comes from the fault, not from whether the value changed.
+        # Comparing before and after is the obvious test and it is wrong: code
+        # that stores the same bytes it found there is still storing, and the
+        # first version of this reported a buffer of pure writes as read-only
+        # because the writer happened to write a constant. NPF_WRITE is bit 1
+        # of the nested-page-fault error code and says what the processor was
+        # actually doing.
+        if as_int(hit, "err") & 0x2:
+            entry["writes"] += 1
+            entry["last"] = after if after is not None else before
+        else:
+            entry["reads"] += 1
+            if entry["last"] is None:
+                entry["last"] = after or before
+        entry["by"].setdefault(rip, text_of or "?")
+
+    if not fields:
+        sample = sorted({int(h.get("gpa", "0"), 0) for h in hits})[:6]
+        return "\n".join([
+            f"{len(hits)} hit(s), none of them inside the {size} bytes asked "
+            f"about. The watch traps whole pages, so neighbours on the same "
+            f"page report too - but if these look like they should have "
+            f"counted, the base is what to check:",
+            f"  {target} is guest physical {base_gpa:#x}",
+            "  hits landed at " + ", ".join(f"{g:#x}" for g in sample)
+            + (" ..." if len(sample) == 6 else ""),
+        ])
+
+    lines = [f"{target} ({start:#x}, {size} bytes) over {seconds}s: "
+             f"{len(hits)} access(es), {len(fields)} offset(s) touched", ""]
+
+    covered = 0
+    previous_end = 0
+    for offset in sorted(fields):
+        entry = fields[offset]
+        width = entry["width"] or 8
+        if offset > previous_end:
+            lines.append(f"  +{previous_end:#06x}  {offset - previous_end:>3} "
+                         f"byte(s) untouched")
+        kind = ("read/write" if entry["reads"] and entry["writes"]
+                else "written" if entry["writes"] else "read")
+        lines.append(f"  +{offset:#06x}  {width} byte(s)  {kind:<10}"
+                     f"  {entry['reads']}r {entry['writes']}w"
+                     + (f"  = {entry['last']}" if entry["last"] else ""))
+        for rip, what in list(entry["by"].items())[:3]:
+            lines.append(f"            {_name_or_address(rip, pid)}"
+                         + (f"   {what}" if what and what != "?" else ""))
+        covered += width
+        previous_end = offset + width
+
+    lines += ["",
+              f"{covered} of {size} bytes accounted for. An offset that never "
+              f"appears is not necessarily padding - it is only an offset "
+              f"nothing touched while this was watching."]
+    if outside:
+        lines.append(f"{outside} hit(s) landed outside the range, on the rest "
+                     f"of the page(s) the watch necessarily covers.")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------- dumping an image
 
 DUMP_DIRECTORY = r"C:\lab\dumps"
@@ -5753,8 +6472,13 @@ def _coverage_store() -> dict:
         return {}
 
 
-def _coverage_now() -> dict[str, dict]:
+def _coverage_now(skip: set | None = None) -> dict[str, dict]:
     """The coverage records the ring has produced since it was last read.
+
+    `skip` is a caller-owned set of sequences already accounted for, and it is
+    added to. Without it, repeated calls return the same records over and over -
+    reads do not consume - which made every input in an explore run look as
+    though it had reached exactly the same pages.
 
     Since, not in total - the reader holds a cursor, so each call consumes what
     has appeared since the previous one. That turns out to be exactly the right
@@ -5767,21 +6491,24 @@ def _coverage_now() -> dict[str, dict]:
     sweep over a gigabyte produces thousands, so a single read saturates - which
     made every window come back as exactly 200 pages, a number that is the shape
     of a bug rather than of an answer.
+
+    Through _read_ring, which de-duplicates: reads are not consuming, so the
+    obvious drain loop re-reads the same tail. This one got away with it because
+    a dict keyed by page collapses the repeats, which is luck rather than
+    design and is worth not relying on twice.
     """
     out = {}
-    for _ in range(COVERAGE_MAX_READS):
-        rows = records(ctl("trace", "200"), "trace")
-        if not rows:
-            break
-        for row in rows:
-            if int(row.get("type", "0"), 0) != 7:    # SVMHV_TRACE_COVER
-                continue
-            gpa = int(row.get("a0", "0"), 0)
-            out[f"{gpa:x}"] = {
-                "rip": row.get("rip", "0"),
-                "state": row.get("a1", "0"),
-                "cr3": row.get("cr3", "0"),
-            }
+    for row in _read_ring(COVERAGE_MAX_READS * 200, skip):
+        if skip is not None:
+            skip.add(row.get("seq"))
+        if int(row.get("type", "0"), 0) != 7:        # SVMHV_TRACE_COVER
+            continue
+        gpa = int(row.get("a0", "0"), 0)
+        out[f"{gpa:x}"] = {
+            "rip": row.get("rip", "0"),
+            "state": row.get("a1", "0"),
+            "cr3": row.get("cr3", "0"),
+        }
     return out
 
 
@@ -6180,12 +6907,17 @@ TOOLS = [
                             "description": "hex address or module!symbol"},
                 "text": {"type": "string",
                          "description": "what you concluded; omit to read"},
+                "pid": {"type": "integer",
+                        "description": "the process a user-mode address is in. "
+                                       "Needed for code no module claims: those "
+                                       "notes are keyed on a hash of the bytes, "
+                                       "so the bytes have to be readable"},
                 "contains": {"type": "string",
                              "description": "search existing notes"},
             },
         },
         "handler": lambda a: tool_note(a.get("address", ""), a.get("text", ""),
-                                       a.get("contains", "")),
+                                       a.get("contains", ""), a.get("pid", 0)),
     },
     {
         "name": "svmhv_processes",
@@ -7087,9 +7819,14 @@ TOOLS += [
                         "description": "make the call in this address space, "
                                        "so user pointers in the arguments mean "
                                        "something"},
+                "steps": {"type": "integer",
+                          "description": "single-step this many instructions "
+                                         "around the call into the trace ring, "
+                                         "so svmhv_reverse can walk it"},
             },
         },
-        "handler": lambda a: tool_call(a["target"], a.get("args"), a.get("pid", 0)),
+        "handler": lambda a: tool_call(a["target"], a.get("args"),
+                                       a.get("pid", 0), a.get("steps", 0)),
     },
     {
         "name": "svmhv_reverse",
@@ -7232,6 +7969,136 @@ TOOLS += [
             "usually still there.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": lambda a: tool_revive(),
+    },
+]
+
+TOOLS += [
+    {
+        "name": "svmhv_explore",
+        "description":
+            "Call a function once per input and report which inputs reached new "
+            "code. The loop the rest of this was built for: snapshot, call, "
+            "collect coverage, restore, repeat. What comes back is not a "
+            "hundred traces but the short list of inputs that got somewhere the "
+            "others did not, which is the question when you are hunting the "
+            "branch that matters. Arm a coverage sweep first with svmhv_sweep, "
+            "and give it a snapshot range or the calls are not undone.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target", "inputs"],
+            "properties": {
+                "target": {"type": "string",
+                           "description": "hex address or module!symbol"},
+                "inputs": {"type": "array", "items": {"type": "string"},
+                           "description": "one entry per call: the arguments, "
+                                          "space-separated hex, e.g. \"1 ff 0\""},
+                "snapshot_target": {"type": "string",
+                                    "description": "memory the calls write to, "
+                                                   "restored between them"},
+                "snapshot_size": {"type": "integer", "description": "bytes"},
+                "pid": {"type": "integer", "description": "address space"},
+                "store_pages": {"type": "integer",
+                                "description": "snapshot store capacity"},
+            },
+        },
+        "handler": lambda a: tool_explore(
+            a["target"], a.get("inputs") or [], a.get("snapshot_target", ""),
+            a.get("snapshot_size", 0), a.get("pid", 0), a.get("store_pages", 0)),
+    },
+    {
+        "name": "svmhv_diverge",
+        "description":
+            "Run a function under two inputs and report the exact instruction "
+            "where the paths part. The question in front of a licence check, a "
+            "signature check or an anti-debug branch is not what the function "
+            "does, it is where the good input and the bad one stop agreeing - "
+            "and that one address is usually the whole answer. Both runs are "
+            "single-stepped and compared; the branch that decided is reported "
+            "with its disassembly.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target", "input_a", "input_b"],
+            "properties": {
+                "target": {"type": "string",
+                           "description": "hex address or module!symbol"},
+                "input_a": {"type": "string",
+                            "description": "arguments, space-separated hex"},
+                "input_b": {"type": "string", "description": "the other input"},
+                "steps": {"type": "integer",
+                          "description": "instructions to record, 64-4096"},
+                "pid": {"type": "integer", "description": "address space"},
+                "snapshot_target": {"type": "string",
+                                    "description": "memory to restore between "
+                                                   "the two runs"},
+                "snapshot_size": {"type": "integer", "description": "bytes"},
+            },
+        },
+        "handler": lambda a: tool_diverge(
+            a["target"], a["input_a"], a["input_b"], a.get("steps", 2000),
+            a.get("pid", 0), a.get("snapshot_target", ""),
+            a.get("snapshot_size", 0)),
+    },
+    {
+        "name": "svmhv_usercall",
+        "description":
+            "Call a function inside a user process by borrowing one of its "
+            "threads. svmhv_call is for kernel functions; this is the same "
+            "question for an .exe or a .dll. It suspends a thread, saves its "
+            "whole context, points it at the target with your arguments, "
+            "catches it when it returns and puts the context back. The thread "
+            "does not do its own work meanwhile, so borrowing one that holds a "
+            "lock the target wants deadlocks the process until the timeout - "
+            "name an idle thread where you can. Four arguments maximum.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target", "pid"],
+            "properties": {
+                "target": {"type": "string",
+                           "description": "user-mode address or module!symbol"},
+                "pid": {"type": "integer", "description": "the process"},
+                "args": {"type": "array", "items": {"type": "string"},
+                         "description": "up to four, hex"},
+                "tid": {"type": "integer",
+                        "description": "thread to borrow; 0 takes the first, "
+                                       "which for a GUI process is usually the "
+                                       "message pump and the worst choice"},
+                "timeout": {"type": "integer",
+                            "description": "milliseconds to wait (default 5000)"},
+            },
+        },
+        "handler": lambda a: tool_usercall(
+            a["target"], a["pid"], a.get("args"), a.get("tid", 0),
+            a.get("timeout", 5000)),
+    },
+    {
+        "name": "svmhv_struct",
+        "description":
+            "Watch a buffer and infer what shape it is from how it is used. A "
+            "structure with no symbols is recovered from its accesses: four "
+            "bytes always read at +0x10 is a field, eight bytes read and then "
+            "dereferenced is a pointer, an offset nothing touches is padding. "
+            "Returns a candidate layout - offset, the width the instructions "
+            "actually used, read or written, and by what. Drive the code that "
+            "uses the buffer while the window is open or there is nothing to "
+            "infer from.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target"],
+            "properties": {
+                "target": {"type": "string",
+                           "description": "hex address or module!symbol"},
+                "size": {"type": "integer",
+                         "description": "bytes of the structure, up to 4096"},
+                "pid": {"type": "integer", "description": "for a user address"},
+                "seconds": {"type": "integer", "description": "1-120, default 15"},
+                "mode": {"type": "string", "enum": ["access", "write"],
+                         "description": "access catches reads too, which is "
+                                        "what tells a field from a written one"},
+            },
+        },
+        "handler": lambda a: tool_struct(
+            a["target"], a.get("size", 64), a.get("pid", 0),
+            a.get("seconds", 15), a.get("mode", "access")),
     },
 ]
 

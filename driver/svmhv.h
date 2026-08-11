@@ -199,6 +199,14 @@ UINT64   AsmUnloadCall(VOID);
 /* A hypercall that does nothing but exit.  See SvSyncTlbFlush. */
 UINT64   AsmNopCall(VOID);
 
+/*
+ * Arm a single-step window on this processor from kernel mode, the same way
+ * the user-mode stepper does.  See the comment on the routine itself: arming
+ * writes the trap flag into the VMCB state save, which from guest context is a
+ * buffer about to be overwritten, so taking an exit is the only way to do it.
+ */
+UINT64   AsmStepCall(_In_ UINT64 Count);
+
 /* The three registers the signature command answers in. */
 typedef struct _SVMHV_HV_SIGNATURE_RESULT
 {

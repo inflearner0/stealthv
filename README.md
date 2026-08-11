@@ -48,7 +48,7 @@ Each tool is `svmhv_` plus the name below:
 | **symbols** | `symbols_auto` `symbols_load` `symbol` `exports` `imports` `pdb_info` `syscalls` |
 | **modules and processes** | `modules` `sections` `processes` `process_modules` `verify` |
 | **drivers** | `driver` `devices` `symlinks` `ioctl` `ioctls` `watch_ioctls` `callbacks` |
-| **experiments** | `snapshot` `call` `reverse` `provenance` |
+| **experiments** | `snapshot` `call` `explore` `diverge` `reverse` `provenance` `struct` |
 | **finding code** | `sweep` `coverage` `coverage_diff` `dump` `ibs` |
 | **notes** | `note` `revive` |
 
@@ -80,6 +80,13 @@ choose and reports what it returns. A stepped run records all sixteen registers
 per instruction, so **reverse** answers "which instruction gave this register
 that value" by walking backwards instead of running again. **provenance** watches
 a buffer and reports its writers grouped by instruction.
+
+Three tools compose those into the questions you actually have. **diverge** runs
+a function under two inputs and reports the one instruction where the paths
+part — the branch the input decided. **explore** calls it once per input and
+reports which inputs reached code the others did not. **struct** watches a
+buffer and infers a field layout from the width and direction of the accesses to
+it.
 
 The snapshot restores *memory in one range* and nothing else — not registers,
 not devices — and a range another processor is using gets restored underneath

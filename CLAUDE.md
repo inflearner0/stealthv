@@ -170,6 +170,97 @@ them with host context instead is worse: the exit handler reads the watched page
 itself. If this is ever wanted, the swap has to be conditional on a watch being
 armed, and it should not be attempted while the reset is still unexplained.
 
+## Composing the primitives: explore, diverge, struct
+
+Three tools that are made of the others rather than of new mechanism, and each
+of them found a bug in the plumbing underneath.
+
+**`diverge` is the one that pays.** It runs a function twice with different
+inputs, single-steps both, and reports the first instruction where the two paths
+part. On `KeQueryActiveProcessorCountEx` that is the `jne` at +0x8 comparing the
+group argument against `ALL_PROCESSOR_GROUPS`, with the fast path five
+instructions long and the popcount path twenty-eight - which is the whole
+function understood from one command.
+
+Making it work needed three things that are not obvious:
+
+*A step window has to be closed, not left to expire.* A window is a count of
+instructions, so one armed around a five-instruction function spends the other
+395 on whatever runs next - which is `call.c`'s own epilogue. The first attempt
+recorded 116 instructions of this driver zeroing a buffer and 5 of the target.
+`SVMHV_HV_STEP_DISARM` ends it at the return.
+
+*The thread has to be pinned.* `SvStepArm` writes the trap flag into the VMCB of
+the processor it runs on, and the control worker is an ordinary PASSIVE_LEVEL
+thread the scheduler can move. Without `KeSetSystemAffinityThreadEx` the arm can
+land on one processor and the disarm on another, leaving the first stepping
+whatever runs on it until the count expires.
+
+*Reads of the trace ring do not consume.* `trace 200` hands back the newest two
+hundred every time it is asked. A drain loop that reads until it gets nothing
+therefore reads the same two hundred over and over - which produced a comparison
+whose first seven entries were the same instruction seven times, and which read
+exactly like a function looping. Everything that drains now de-duplicates by
+sequence. The coverage reader had the same bug and got away with it because a
+dict keyed by page collapses the repeats; that was luck, not design.
+
+**`explore` needs its coverage filtered to the target's module.** A sweep is
+armed over physical memory, not over a function, and a call that takes 165
+cycles is bracketed by seconds of ambient activity. The first run credited every
+input with the same 88 pages of graphics and shell code.
+
+**`struct` takes its base from the watch, not from `translate`.** Installing a
+watch already resolves the page, so asking twice is redundant - and the two
+disagreed: `translate` refused an address that `read` and `watch` both handled,
+and the layout came back empty. Two further mistakes worth not repeating: the
+access width comes from the disassembly, where `"word ptr"` is a substring of
+`"qword ptr"` and so matched every eight-byte store as two bytes; and the
+direction has to come from `NPF_WRITE` in the fault, not from whether the value
+changed, because code that stores the same bytes it found there is still
+storing.
+
+## Calling into user mode, and why it does not work yet
+
+`usercall.c` borrows a thread of the target process: suspend it, save its whole
+`CONTEXT`, point it at the function with a page containing `jmp $` as the return
+address, poll until it parks there, read RAX, put the context back. The design
+is sound and the code is written; **it has never completed a call.**
+
+It needs `PsSuspendThread`, `PsResumeThread` and `PsGetNextProcessThread`, none
+of which is in the WDK import library - naming them produces unresolved `__imp_`
+symbols - so they are resolved by name with `MmGetSystemRoutineAddress` on first
+use. On this kernel at least one of those lookups fails and the command returns
+`STATUS_PROCEDURE_NOT_FOUND` without touching anything. Which one is not yet
+established: the driver logs it, and the export enumeration that would have
+answered it from the agent side took the guest down before it finished.
+
+So the failure is clean - nothing is suspended, no thread is left redirected -
+but the feature is absent rather than working. Finding out which symbol is
+missing is the next step, and if it is `PsGetNextProcessThread` the fix is
+cheap, because that one is only used to pick a thread when the caller does not
+name one.
+
+## A sweep you cannot disarm
+
+`SVMHV_SWEEP_BOTH` is capped at 64 MiB in the driver and the reason is written
+down next to the cap. **The same failure reaches `exec` mode, which is
+uncapped**, and it was reached in the lab: an exec sweep over 1 GiB on a guest
+that was already busy made the control channel unanswerable for several minutes
+and the machine had to be hard reset. The same sweep over the same range had
+worked twenty minutes earlier, so it is marginal rather than fatal — which is
+worse, because it means it passes when tried.
+
+The trap is structural and applies to every mode: **the control worker is the
+only thing that can disarm a sweep, and the fault storm is what starves it.**
+There is no way out from inside once that happens. `Stop-VM` will not work
+either — the integration services are starved along with everything else, which
+is the same shape as the Defender/`ERESOURCE` problem in the soak notes.
+
+The agent warns above 256 MiB of exec sweep rather than the driver refusing,
+because the driver's own limit is about table pages and this one is about
+whether the guest can keep up. If a bigger range is genuinely needed, arm it in
+pieces and read the coverage between them.
+
 ## Known open items
 
 - Long-duration stability under concurrent load is unverified; `soak.ps1` has

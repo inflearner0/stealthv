@@ -1647,7 +1647,8 @@ static void Usage(void)
         "  svmhvctl sweep exec|write|both <base> <size> | sweep off\n"
         "  svmhvctl snapshot take <address> <size> [pid] [store pages]\n"
         "  svmhvctl snapshot restore | release | query\n"
-        "  svmhvctl call <address> [arg ...] [pid=<n>]\n"
+        "  svmhvctl call <address> [arg ...] [pid=<n>] [steps=<n>]\n"
+        "  svmhvctl usercall <address> pid=<n> [arg ...] [tid=<n>] [timeout=<ms>]\n"
         "  svmhvctl revive\n"
         "  svmhvctl ibs <interval in micro-ops, 0 to stop>\n"
         "  svmhvctl unhook <target>\n\n"
@@ -2067,6 +2068,82 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    /*
+     * Call a user-mode function by borrowing a thread of its process.
+     * "usercall <address> pid=<n> [arg ...] [tid=<n>] [timeout=<ms>]"
+     */
+    if (_stricmp(argv[1], "usercall") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned __int64 arguments[SVMHV_USERCALL_MAX_ARGS];
+        unsigned __int64 target = strtoull(argv[2], NULL, 16);
+        unsigned __int64 threadId = 0;
+        unsigned __int64 returnValue = 0;
+        unsigned __int64 usedThread = 0;
+        unsigned __int64 park = 0;
+        unsigned int returned = 0;
+        unsigned int count = 0;
+        unsigned int pid = 0;
+        unsigned int timeout = 0;
+        int i;
+
+        memset(arguments, 0, sizeof(arguments));
+
+        for (i = 3; i < argc; i++)
+        {
+            if (_strnicmp(argv[i], "pid=", 4) == 0)
+            {
+                pid = (unsigned int)strtoul(argv[i] + 4, NULL, 0);
+                continue;
+            }
+            if (_strnicmp(argv[i], "tid=", 4) == 0)
+            {
+                threadId = strtoull(argv[i] + 4, NULL, 0);
+                continue;
+            }
+            if (_strnicmp(argv[i], "timeout=", 8) == 0)
+            {
+                timeout = (unsigned int)strtoul(argv[i] + 8, NULL, 0);
+                continue;
+            }
+            if (count >= SVMHV_USERCALL_MAX_ARGS)
+            {
+                fprintf(stderr, "at most %u arguments\n",
+                        SVMHV_USERCALL_MAX_ARGS);
+                return 2;
+            }
+            arguments[count++] = strtoull(argv[i], NULL, 16);
+        }
+
+        if (pid == 0)
+        {
+            fprintf(stderr, "usercall needs pid=<n>\n");
+            return 2;
+        }
+
+        memset(data, 0, sizeof(data));
+        memcpy(data, arguments, sizeof(arguments));
+        memcpy(data + 32, &count, sizeof(count));
+        memcpy(data + 36, &timeout, sizeof(timeout));
+        memcpy(data + 40, &threadId, sizeof(threadId));
+
+        if (!SubmitMemory(SVMHV_CMD_USERCALL, target, SVMHV_USERCALL_ARGS, pid,
+                          data, data, &returned))
+        {
+            return 2;
+        }
+
+        memcpy(&returnValue, data,      sizeof(returnValue));
+        memcpy(&usedThread,  data + 8,  sizeof(usedThread));
+        memcpy(&park,        data + 16, sizeof(park));
+
+        printf("usercall_target=0x%llx\nusercall_args=%u\n"
+               "usercall_result=0x%llx\nusercall_thread=%llu\n"
+               "usercall_park=0x%llx\n",
+               target, count, returnValue, usedThread, park);
+        return 0;
+    }
+
     /* Instruction-based sampling.  "ibs <interval>" in decimal, 0 to stop. */
     if (_stricmp(argv[1], "ibs") == 0 && argc >= 3)
     {
@@ -2130,6 +2207,7 @@ int main(int argc, char** argv)
         unsigned int exception = 0;
         unsigned int count = 0;
         unsigned int pid = 0;
+        unsigned int steps = 0;
         int i;
 
         memset(arguments, 0, sizeof(arguments));
@@ -2139,6 +2217,11 @@ int main(int argc, char** argv)
             if (_strnicmp(argv[i], "pid=", 4) == 0)
             {
                 pid = (unsigned int)strtoul(argv[i] + 4, NULL, 0);
+                continue;
+            }
+            if (_strnicmp(argv[i], "steps=", 6) == 0)
+            {
+                steps = (unsigned int)strtoul(argv[i] + 6, NULL, 0);
                 continue;
             }
             if (count >= SVMHV_CALL_MAX_ARGS)
@@ -2152,6 +2235,7 @@ int main(int argc, char** argv)
         memset(data, 0, sizeof(data));
         memcpy(data, arguments, sizeof(arguments));
         memcpy(data + sizeof(arguments), &count, sizeof(count));
+        memcpy(data + sizeof(arguments) + 4, &steps, sizeof(steps));
 
         if (!SubmitMemory(SVMHV_CMD_CALL, target, SVMHV_CALL_ARGS, pid,
                           data, data, &returned))

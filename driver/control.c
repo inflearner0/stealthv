@@ -10,6 +10,7 @@
 #include "objects.h"
 #include "snapshot.h"
 #include "call.h"
+#include "usercall.h"
 #include "ibs.h"
 
 /*
@@ -447,6 +448,9 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
 
     case SVMHV_CMD_CALL:
         return SvCallFunction(&g_Control.Request);
+
+    case SVMHV_CMD_USERCALL:
+        return SvUserCall(&g_Control.Request);
 
     case SVMHV_CMD_IBS:
     {

@@ -125,6 +125,16 @@
 #define SVMHV_HV_STEP           13  /* rdx = count, or 0 to report instead  */
 
 /*
+ * rdx for SVMHV_HV_STEP meaning "end the window now".
+ *
+ * A window is a count of instructions, so one armed around a short function
+ * spends the remainder on whatever runs next - which is the caller's own
+ * epilogue, and made a stepped call record far more of this driver than of the
+ * function it was asked about.  Not a count anybody would ask for.
+ */
+#define SVMHV_HV_STEP_DISARM    0xFFFFFFFFFFFFFFFFULL
+
+/*
  * A user-mode execution hook reporting that its target was called.
  *
  * Its own magic in RAX rather than a command under the ordinary one, because

@@ -130,7 +130,7 @@ $kmDefs = @(
 
 $kmSources = @("svmhv.c", "npt.c", "hook.c", "trace.c", "step.c", "control.c",
                "hvcall.c", "memory.c", "objects.c", "snapshot.c", "call.c",
-               "ibs.c")
+               "ibs.c", "usercall.c")
 
 foreach ($src in $kmSources) {
     $obj = [IO.Path]::ChangeExtension($src, ".obj")

@@ -33,9 +33,11 @@ NTSTATUS SvCallFunction(_Inout_ SVMHV_HOOK_REQUEST* Request)
     UINT64 started;
     UINT64 elapsed = 0;
     UINT32 count = 0;
+    UINT32 steps = 0;
     UINT32 exception = 0;
     NTSTATUS status = STATUS_SUCCESS;
     BOOLEAN attached = FALSE;
+    BOOLEAN pinned = FALSE;
     ULONG i;
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL)
@@ -46,9 +48,15 @@ NTSTATUS SvCallFunction(_Inout_ SVMHV_HOOK_REQUEST* Request)
     RtlCopyMemory(arguments, Request->MemoryData, sizeof(arguments));
     RtlCopyMemory(&count, Request->MemoryData + sizeof(arguments),
                   sizeof(count));
+    RtlCopyMemory(&steps, Request->MemoryData + sizeof(arguments) + 4,
+                  sizeof(steps));
     if (count > SVMHV_CALL_MAX_ARGS)
     {
         count = SVMHV_CALL_MAX_ARGS;
+    }
+    if (steps > SVMHV_STEP_MAX)
+    {
+        steps = SVMHV_STEP_MAX;
     }
     for (i = count; i < SVMHV_CALL_MAX_ARGS; i++)
     {
@@ -86,6 +94,36 @@ NTSTATUS SvCallFunction(_Inout_ SVMHV_HOOK_REQUEST* Request)
     }
 
     InterlockedIncrement64(&g_Calls);
+
+    /*
+     * Pin to one processor before arming, and stay pinned until after the
+     * window is closed.
+     *
+     * A step window belongs to the processor it was armed on: SvStepArm writes
+     * the trap flag and the #DB intercept into that processor's VMCB.  This
+     * thread is an ordinary PASSIVE_LEVEL worker and the scheduler is free to
+     * move it, so without this the arm can land on one processor and the disarm
+     * on another - leaving the first one stepping whatever runs on it until the
+     * count expires, and disarming a window on the second that was never there.
+     * Bounded, because the count still runs out, but it is a burst of exits on
+     * an unrelated processor and a trace full of code nobody asked about.
+     */
+    if (steps != 0)
+    {
+        KeSetSystemAffinityThreadEx((KAFFINITY)1
+                                    << (KeGetCurrentProcessorNumberEx(NULL) & 0x3F));
+        pinned = TRUE;
+
+        /*
+         * Arm as late as possible.  Everything between here and the call is
+         * this function's own epilogue and gets stepped too - unavoidable,
+         * since a window is a count of instructions and not a range - but it is
+         * a dozen records at the front that a reader skips by looking for the
+         * target's address.
+         */
+        (VOID)AsmStepCall(steps);
+    }
+
     started = __rdtsc();
 
     __try
@@ -102,6 +140,20 @@ NTSTATUS SvCallFunction(_Inout_ SVMHV_HOOK_REQUEST* Request)
     }
 
     elapsed = __rdtsc() - started;
+
+    /*
+     * Close the window immediately.  Left to expire it records this function's
+     * own epilogue, which is both useless and the majority of a short call's
+     * records; see SVMHV_HV_STEP_DISARM.
+     */
+    if (steps != 0)
+    {
+        (VOID)AsmStepCall(SVMHV_HV_STEP_DISARM);
+    }
+    if (pinned)
+    {
+        KeRevertToUserAffinityThreadEx(0);
+    }
 
     if (attached)
     {

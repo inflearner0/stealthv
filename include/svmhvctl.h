@@ -762,7 +762,13 @@ typedef struct _SVMHV_SNAPSHOT
  * the call in, 0 for system context.
  *
  *   in    +0   eight arguments, one qword each    +64  how many are meaningful
+ *         +68  single-step this many instructions around the call, 0 for none
  *   out   +0   return value    +8  cycles elapsed  +16 exception code, or 0
+ *
+ * The step count is what makes two calls comparable.  A window armed around the
+ * call records every instruction it executed into the trace ring, so the same
+ * function under two different inputs produces two instruction sequences and
+ * the first place they part is the branch the input decided.
  */
 #define SVMHV_CMD_CALL          19
 #define SVMHV_CALL_MAX_ARGS     8
@@ -786,6 +792,21 @@ typedef struct _SVMHV_SNAPSHOT
  */
 #define SVMHV_CMD_IBS           21
 #define SVMHV_IBS_ARGS          16      /* MemoryLength for the above */
+
+/*
+ * Call a function in a user-mode process by borrowing one of its threads.  See
+ * driver\usercall.h; this is more invasive than SVMHV_CMD_CALL, not less, and
+ * the thread it borrows stops doing its own work while the call runs.
+ *
+ * MemoryAddress is the user-mode function and MemoryProcessId the process.
+ *
+ *   in    +0  four arguments, one qword each   +32 how many are meaningful
+ *         +36 timeout in milliseconds          +40 thread to borrow, 0 = first
+ *   out   +0  return value   +8 thread used    +16 the parking page
+ */
+#define SVMHV_CMD_USERCALL      22
+#define SVMHV_USERCALL_MAX_ARGS 4
+#define SVMHV_USERCALL_ARGS     48      /* MemoryLength for the above */
 
 /* How many of each can be armed at once. */
 #define SVMHV_MAX_MSR_WATCHES   16
