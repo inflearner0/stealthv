@@ -124,6 +124,7 @@ static UINT32 SvOptionBits(VOID)
  * saying so is legal and a bugcheck would actually work.
  */
 static SVMHV_FATAL_EXIT g_FatalExit;
+static SVMHV_FATAL_EXIT g_FatalRing[SVMHV_FATAL_RING_ENTRIES];
 static volatile LONG    g_FatalExitPending;
 static volatile LONG64  g_FatalExitCount;
 
@@ -132,22 +133,33 @@ static BOOLEAN SvRecordFatalExit(_Inout_ VIRTUAL_CPU* Cpu, _In_ UINT32 Reason)
     const VMCB* vmcb = &Cpu->GuestVmcb;
 
     /*
-     * Last writer wins, and that is deliberate: the first fatal exit is the
-     * interesting one only if the machine survives it, and if it does not, the
-     * last thing that happened is what a debugger will want.  The count says
-     * how many were lost either way.
+     * Claim a slot before filling it.  Eight processors are inside VMRUN at
+     * once, so two of them can get here together, and the whole reason for
+     * keeping more than one record is to be able to see that happen - a shared
+     * "most recent" slot written by both would show one of them and lose the
+     * fact that there were two.
      */
-    g_FatalExit.Reason      = Reason;
-    g_FatalExit.Processor   = Cpu->Index;
-    g_FatalExit.ExitCode    = vmcb->Control.ExitCode;
-    g_FatalExit.ExitInfo1   = vmcb->Control.ExitInfo1;
-    g_FatalExit.ExitInfo2   = vmcb->Control.ExitInfo2;
-    g_FatalExit.ExitIntInfo = vmcb->Control.ExitIntInfo;
-    g_FatalExit.Rip         = vmcb->StateSave.Rip;
-    g_FatalExit.Rsp         = vmcb->StateSave.Rsp;
-    g_FatalExit.Cr2         = vmcb->StateSave.Cr2;
-    g_FatalExit.Cr3         = vmcb->StateSave.Cr3;
-    g_FatalExit.Count       = (UINT64)InterlockedIncrement64(&g_FatalExitCount);
+    const UINT64 index = (UINT64)InterlockedIncrement64(&g_FatalExitCount) - 1;
+    SVMHV_FATAL_EXIT* entry = &g_FatalRing[index % SVMHV_FATAL_RING_ENTRIES];
+
+    entry->Reason      = Reason;
+    entry->Processor   = Cpu->Index;
+    entry->ExitCode    = vmcb->Control.ExitCode;
+    entry->ExitInfo1   = vmcb->Control.ExitInfo1;
+    entry->ExitInfo2   = vmcb->Control.ExitInfo2;
+    entry->ExitIntInfo = vmcb->Control.ExitIntInfo;
+    entry->Rip         = vmcb->StateSave.Rip;
+    entry->Rsp         = vmcb->StateSave.Rsp;
+    entry->Cr2         = vmcb->StateSave.Cr2;
+    entry->Cr3         = vmcb->StateSave.Cr3;
+    entry->Count       = index + 1;
+
+    /*
+     * And a copy in the single slot clients already know about.  Last writer
+     * wins there, which is what "the most recent one" means; the ring is where
+     * the ones it overwrote still are.
+     */
+    g_FatalExit = *entry;
 
     InterlockedExchange(&g_FatalExitPending, 1);
 
@@ -165,6 +177,19 @@ static BOOLEAN SvRecordFatalExit(_Inout_ VIRTUAL_CPU* Cpu, _In_ UINT32 Reason)
 VOID SvFillFatalExit(_Out_ SVMHV_FATAL_EXIT* Fatal)
 {
     *Fatal = g_FatalExit;
+}
+
+VOID SvFillFatalRing(_Out_ SVMHV_FATAL_RING* Ring)
+{
+    ULONG i;
+
+    Ring->Produced = (UINT64)InterlockedCompareExchange64(&g_FatalExitCount,
+                                                          0, 0);
+    Ring->Reserved = 0;
+    for (i = 0; i < SVMHV_FATAL_RING_ENTRIES; i++)
+    {
+        Ring->Entries[i] = g_FatalRing[i];
+    }
 }
 
 BOOLEAN SvTakeFatalExitReport(_Out_ SVMHV_FATAL_EXIT* Fatal)

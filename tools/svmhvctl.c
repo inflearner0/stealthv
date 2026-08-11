@@ -54,14 +54,16 @@
 #define SNAP_HOOKS              2728
 #define SNAP_SELFTEST           19120
 #define SNAP_FATAL              19296
-#define SNAP_PUBLISH            19376
-#define SNAP_SIZE               19384
+#define SNAP_FATAL_RING         19376
+#define SNAP_PUBLISH            20032
+#define SNAP_SIZE               20040
 
 C_ASSERT(SNAP_STATS     == FIELD_OFFSET(SVMHV_SNAPSHOT, Stats));
 C_ASSERT(SNAP_HISTOGRAM == FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram));
 C_ASSERT(SNAP_HOOKS     == FIELD_OFFSET(SVMHV_SNAPSHOT, Hooks));
 C_ASSERT(SNAP_SELFTEST  == FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest));
 C_ASSERT(SNAP_FATAL     == FIELD_OFFSET(SVMHV_SNAPSHOT, Fatal));
+C_ASSERT(SNAP_FATAL_RING == FIELD_OFFSET(SVMHV_SNAPSHOT, FatalRing));
 C_ASSERT(SNAP_PUBLISH   == FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence));
 C_ASSERT(SNAP_SIZE      == sizeof(SVMHV_SNAPSHOT));
 
@@ -1015,13 +1017,23 @@ static int ApplyOptions(unsigned char* request, int argc, char** argv, int index
  * will look healthy.  Printed as part of the ordinary status because the whole
  * point of the record is that nobody has to know to go looking for it.
  */
-static void PrintFatal(const SVMHV_FATAL_EXIT* fatal)
+static const char* FatalReason(unsigned int reason)
 {
     static const char* const reasons[] =
     {
         "none", "guest-triple-fault", "unhandled-exit-code",
         "npf-unmapped", "npf-retry-limit"
     };
+    return (reason < sizeof(reasons) / sizeof(reasons[0]))
+               ? reasons[reason] : "unknown";
+}
+
+static void PrintFatal(const SVMHV_FATAL_EXIT* fatal,
+                       const SVMHV_FATAL_RING* ring)
+{
+    unsigned __int64 first;
+    unsigned __int64 n;
+
     printf("fatal_count=%llu\n", fatal->Count);
     if (fatal->Count == 0)
     {
@@ -1033,20 +1045,46 @@ static void PrintFatal(const SVMHV_FATAL_EXIT* fatal)
            "fatal_exitintinfo=0x%llx\n"
            "fatal_rip=0x%llx\nfatal_rsp=0x%llx\nfatal_cr2=0x%llx\n"
            "fatal_cr3=0x%llx\n",
-           (fatal->Reason < sizeof(reasons) / sizeof(reasons[0]))
-               ? reasons[fatal->Reason] : "unknown",
+           FatalReason(fatal->Reason),
            fatal->Processor, fatal->ExitCode, fatal->ExitInfo1, fatal->ExitInfo2,
            fatal->ExitIntInfo, fatal->Rip, fatal->Rsp, fatal->Cr2, fatal->Cr3);
+
+    /*
+     * And the ones before it, oldest first.  Printed in order of when they
+     * happened rather than in slot order, because "which processor went first"
+     * is the question, and a raw ring answers it only after arithmetic the
+     * reader should not have to do.
+     */
+    printf("fatal_produced=%llu\nfatal_ring=%u\n",
+           ring->Produced, SVMHV_FATAL_RING_ENTRIES);
+
+    first = (ring->Produced > SVMHV_FATAL_RING_ENTRIES)
+                ? ring->Produced - SVMHV_FATAL_RING_ENTRIES : 0;
+
+    for (n = first; n < ring->Produced; n++)
+    {
+        const SVMHV_FATAL_EXIT* e =
+            &ring->Entries[n % SVMHV_FATAL_RING_ENTRIES];
+
+        printf("fatalN seq=%llu reason=%s cpu=%u exitcode=0x%llx "
+               "info1=0x%llx info2=0x%llx exitintinfo=0x%llx "
+               "rip=0x%llx rsp=0x%llx cr2=0x%llx cr3=0x%llx\n",
+               e->Count, FatalReason(e->Reason), e->Processor, e->ExitCode,
+               e->ExitInfo1, e->ExitInfo2, e->ExitIntInfo, e->Rip, e->Rsp,
+               e->Cr2, e->Cr3);
+    }
 }
 
 static void PrintStats(void)
 {
     SVMHV_STATS stats;
     SVMHV_FATAL_EXIT fatal;
-    SNAPSHOT_PART parts[2] =
+    SVMHV_FATAL_RING ring;
+    SNAPSHOT_PART parts[3] =
     {
         { SNAP_STATS, (unsigned char*)&stats, sizeof(stats) },
-        { SNAP_FATAL, (unsigned char*)&fatal, sizeof(fatal) }
+        { SNAP_FATAL, (unsigned char*)&fatal, sizeof(fatal) },
+        { SNAP_FATAL_RING, (unsigned char*)&ring, sizeof(ring) }
     };
     unsigned int i;
 
@@ -1073,7 +1111,7 @@ static void PrintStats(void)
         printf("cpu%u_exits=%llu\n", i, stats.PerCpuExits[i]);
     }
 
-    PrintFatal(&fatal);
+    PrintFatal(&fatal, &ring);
 }
 
 static void PrintHooks(void)

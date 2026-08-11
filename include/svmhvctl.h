@@ -511,7 +511,7 @@ typedef struct _SVMHV_FATAL_EXIT
 {
     UINT32 Reason;                      /* SVMHV_FATAL_*                     */
     UINT32 Processor;
-    UINT64 Count;                       /* how many have happened in all     */
+    UINT64 Count;                       /* this one's position in the run    */
     UINT64 ExitCode;
     UINT64 ExitInfo1;
     UINT64 ExitInfo2;
@@ -521,6 +521,32 @@ typedef struct _SVMHV_FATAL_EXIT
     UINT64 Cr2;
     UINT64 Cr3;                         /* which address space it was in     */
 } SVMHV_FATAL_EXIT;
+
+/*
+ * The last few, not just the last one.
+ *
+ * One slot was enough only for the case where a single processor dies and the
+ * machine survives to be asked about it.  It is the wrong shape for what this
+ * is actually for: eight processors are inside VMRUN at once, so fatal exits
+ * arrive concurrently, and the interesting question - did one processor die and
+ * take the others with it, or did three die in a row, and in what order - is
+ * exactly the question a single overwritten slot cannot answer.  The reset this
+ * record exists to explain is still open, and it had one sample per run.
+ *
+ * Entries are claimed with an interlocked increment, so concurrent exits land
+ * in different slots rather than on top of each other.  Slot (Produced - 1) %
+ * SVMHV_FATAL_RING_ENTRIES is the newest; Produced keeps counting past the end,
+ * so a client can tell a wrapped ring from a short one and knows how many it
+ * never saw.
+ */
+#define SVMHV_FATAL_RING_ENTRIES    8
+
+typedef struct _SVMHV_FATAL_RING
+{
+    UINT64 Produced;                    /* total ever recorded               */
+    UINT64 Reserved;
+    SVMHV_FATAL_EXIT Entries[SVMHV_FATAL_RING_ENTRIES];
+} SVMHV_FATAL_RING;
 
 /* --------------------------------------------------------------- snapshot */
 
@@ -541,6 +567,14 @@ typedef struct _SVMHV_SNAPSHOT
     /* Appended last on purpose: every offset above is hardcoded by clients
        that have no compiler to compute it, so nothing may move. */
     SVMHV_FATAL_EXIT Fatal;
+
+    /*
+     * The same thing with history.  Fatal above is kept, and kept where it is,
+     * because clients hardcode its offset and "the last fatal exit" is still
+     * the first question anybody asks; this is what to read when the answer is
+     * not "none" and the run is worth reconstructing.
+     */
+    SVMHV_FATAL_RING FatalRing;
 
     /*
      * Snapshot seqlock.  The control worker makes it odd before updating the
@@ -636,6 +670,7 @@ C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, MemoryData)    == 1344);
 C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, CaptureStack)  == 156);
 
 C_ASSERT(sizeof(SVMHV_FATAL_EXIT)      == 80);
+C_ASSERT(sizeof(SVMHV_FATAL_RING)      == 16 + 80 * SVMHV_FATAL_RING_ENTRIES);
 
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Stats)     == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram) == 656);
@@ -643,9 +678,13 @@ C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Hooks)     == 2728);
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest)  == 2728 + sizeof(SVMHV_HOOK_LIST));
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Fatal)     == 2728 + sizeof(SVMHV_HOOK_LIST) +
                                                     sizeof(SVMHV_SELFTEST));
+C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, FatalRing) == 2728 + sizeof(SVMHV_HOOK_LIST) +
+                                                    sizeof(SVMHV_SELFTEST) +
+                                                    sizeof(SVMHV_FATAL_EXIT));
 C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 2728 + sizeof(SVMHV_HOOK_LIST) +
                                                     sizeof(SVMHV_SELFTEST) +
                                                     sizeof(SVMHV_FATAL_EXIT) +
+                                                    sizeof(SVMHV_FATAL_RING) +
                                                     sizeof(UINT64));
 
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Sequence)             == 16);
@@ -676,4 +715,4 @@ C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CommitSequence)  ==
          432 + 8 + 8 * SVMHV_MAX_FRAMES + 48 + sizeof(UINT64));
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence)     ==
          2728 + sizeof(SVMHV_HOOK_LIST) + sizeof(SVMHV_SELFTEST) +
-         sizeof(SVMHV_FATAL_EXIT));
+         sizeof(SVMHV_FATAL_EXIT) + sizeof(SVMHV_FATAL_RING));

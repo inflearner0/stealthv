@@ -294,12 +294,42 @@ def hook_result(text: str, what: str) -> str:
 # -------------------------------------------------------------------- tools
 
 def tool_status() -> str:
-    values = pairs(ctl("status"))
+    text = ctl("status")
+    values = pairs(text)
     options = as_int(values, "options")
     exits = as_int(values, "exits")
     overhead = as_int(values, "overhead_cycles")
 
-    lines = [
+    lines = []
+
+    # First, and unprompted. A processor that took a fatal exit left SVM and is
+    # running unvirtualised, so every other number below is describing fewer
+    # processors than it claims - and nothing else here would ever say so.
+    fatal_count = as_int(values, "fatal_count")
+    if fatal_count:
+        lines += [
+            f"!! {fatal_count} FATAL EXIT(S). That many processors have left "
+            f"SVM and are running unvirtualised; the counters below cover the "
+            f"rest. Reload the driver to bring them back.",
+            "",
+        ]
+        for row in records(text, "fatalN"):
+            lines.append(
+                f"  #{row.get('seq')} cpu{row.get('cpu')} "
+                f"{row.get('reason')} exit {row.get('exitcode')} "
+                f"rip {symbolize(int(row.get('rip', '0'), 0))}")
+            lines.append(
+                f"       info1 {row.get('info1')} info2 {row.get('info2')} "
+                f"exitintinfo {row.get('exitintinfo')} "
+                f"cr2 {row.get('cr2')} cr3 {row.get('cr3')}")
+        produced = as_int(values, "fatal_produced")
+        kept = as_int(values, "fatal_ring")
+        if produced > kept:
+            lines.append(f"  ({produced - kept} older one(s) have been "
+                         f"overwritten; the ring keeps {kept})")
+        lines.append("")
+
+    lines += [
         f"processors      : {as_int(values, 'cpus')}",
         f"options         : "
         f"{', '.join(n for b, n in OPTION_BITS if options & b) or 'none'} "

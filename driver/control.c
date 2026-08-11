@@ -237,6 +237,7 @@ static VOID SvControlRefresh(VOID)
     SvFillExitHistogram(&g_Snapshot.Histogram);
     SvHookList(&g_Snapshot.Hooks);
     SvFillFatalExit(&g_Snapshot.Fatal);
+    SvFillFatalRing(&g_Snapshot.FatalRing);
     SvSnapshotEndUpdate();
 }
 

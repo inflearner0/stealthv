@@ -244,6 +244,9 @@ VOID     SvRunSelfTest(_Out_ SVMHV_SELFTEST* Result);
  * a KeBugCheckEx that could never have produced a dump from where it stood.
  */
 VOID     SvFillFatalExit(_Out_ SVMHV_FATAL_EXIT* Fatal);
+
+/* The last SVMHV_FATAL_RING_ENTRIES of them, with the total ever recorded. */
+VOID     SvFillFatalRing(_Out_ SVMHV_FATAL_RING* Ring);
 BOOLEAN  SvTakeFatalExitReport(_Out_ SVMHV_FATAL_EXIT* Fatal);
 
 /*
