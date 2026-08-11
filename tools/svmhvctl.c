@@ -1605,6 +1605,7 @@ static void Usage(void)
         "  svmhvctl watch <target> write|access\n"
         "  svmhvctl watchmsr <msr> [on|off]\n"
         "  svmhvctl watchio  <port> [on|off]\n"
+        "  svmhvctl sweep exec|write <base> <size> | sweep off\n"
         "  svmhvctl unhook <target>\n\n"
         "Hook options, after the positional arguments:\n"
         "  --process NAME        only when NAME is the current process\n"
@@ -1964,6 +1965,60 @@ int main(int argc, char** argv)
             return 2;
         }
         printf("%s=0x%llx\narmed=%u\n", isMsr ? "msr" : "port", which, on);
+        return 0;
+    }
+
+    /*
+     * Coverage sweep.  "sweep off", or "sweep exec|write <base> <size>".
+     * The size does not fit alongside the base and the mode in the two fields
+     * the other memory commands use, so it travels in the data block.
+     */
+    if (_stricmp(argv[1], "sweep") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned int returned = 0;
+        unsigned __int64 base = 0;
+        unsigned __int64 size = 0;
+        unsigned int mode = 0;
+
+        if (_stricmp(argv[2], "exec") == 0)       { mode = 1; }
+        else if (_stricmp(argv[2], "write") == 0) { mode = 2; }
+        else if (_stricmp(argv[2], "off") != 0)
+        {
+            fprintf(stderr, "sweep takes exec, write or off\n");
+            return 2;
+        }
+
+        if (mode != 0 && argc >= 5)
+        {
+            base = strtoull(argv[3], NULL, 16);
+            size = strtoull(argv[4], NULL, 16);
+        }
+        else if (mode != 0)
+        {
+            fprintf(stderr, "sweep %s needs <base> <size> in hex\n", argv[2]);
+            return 2;
+        }
+
+        /*
+         * Both arguments in the payload.  MemoryLength is the payload length
+         * as far as SubmitMemory is concerned, so it cannot also carry the
+         * mode - doing that sent one byte of an eight-byte size and armed
+         * nothing, with the driver correctly reporting an invalid parameter.
+         */
+        memset(data, 0, sizeof(data));
+        memcpy(data, &size, sizeof(size));
+        memcpy(data + 8, &mode, sizeof(mode));
+
+        if (!SubmitMemory(SVMHV_CMD_SWEEP, base, SVMHV_SWEEP_ARGS, 0,
+                          data, data, &returned))
+        {
+            return 2;
+        }
+
+        memcpy(&size, data, sizeof(size));
+        printf("sweep_mode=%u\nsweep_base=0x%llx\nsweep_size=0x%llx\n"
+               "sweep_granted=%u\n", mode, base, size, returned);
         return 0;
     }
 

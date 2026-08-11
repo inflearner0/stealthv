@@ -355,6 +355,31 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
         return SvWatchIoPort((UINT32)g_Control.Request.MemoryAddress,
                              g_Control.Request.MemoryLength != 0);
 
+    case SVMHV_CMD_SWEEP:
+    {
+        UINT64 size = 0;
+        ULONG mode = 0;
+        UINT64 base = 0;
+        UINT64 armed = 0;
+        UINT64 granted = 0;
+        NTSTATUS status;
+
+        RtlCopyMemory(&size, g_Control.Request.MemoryData, sizeof(size));
+        RtlCopyMemory(&mode, g_Control.Request.MemoryData + 8, sizeof(mode));
+        status = SvNptSweepArm(g_Control.Request.MemoryAddress, size, mode);
+
+        /* Report what is actually armed, which after a partial failure is not
+           what was asked for. */
+        SvNptSweepState(&mode, &base, &armed, &granted);
+        RtlCopyMemory(g_Control.Request.MemoryData, &armed, sizeof(armed));
+        g_Control.Request.MemoryReturned = (UINT32)granted;
+
+        /* Every processor has to leave guest mode before the permissions it
+           cached stop being the ones it is using. */
+        SvSyncTlbFlush();
+        return status;
+    }
+
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
     }

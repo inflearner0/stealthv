@@ -93,3 +93,47 @@ VOID     SvNptQuery(_In_ const NPT_HIERARCHY* Npt, _In_ UINT64 Gpa,
 /* Size of the identity map, for the statistics interface. */
 UINT64   SvNptCoverage(VOID);
 ULONG    SvNptSplitPagesUsed(VOID);
+
+/* ------------------------------------------------------------- coverage */
+
+/*
+ * Take a permission away from every page in a range and give it back one page
+ * at a time, recording the first time each is used.
+ *
+ * This is the thing a hypervisor can do that a debugger cannot.  A module list
+ * describes the code somebody declared; it says nothing about code that was
+ * mapped by hand and never written to disk, which is where anything worth
+ * reverse-engineering has been hiding for a decade.  Marking every page
+ * non-executable and watching which ones fault answers "what code has actually
+ * run" from underneath the guest, with no cooperation from it - and everything
+ * in the answer that no module claims is, by construction, code nobody wanted
+ * found.  Marking every page read-only instead answers the other half: which
+ * pages were written to, which is where an unpacker shows itself.
+ *
+ * Cost is bounded and one-way.  A page faults once, is granted the permission
+ * for good, and never faults again, so the total is one exit per distinct page
+ * ever touched rather than one per access.
+ *
+ * The range is split to 4 KiB *before* the sweep is armed, because a nested
+ * page fault must never have to allocate a page table - see the fault handler.
+ * That is also what bounds the range: splitting costs one table page per 2 MiB,
+ * out of a pool allocated for the purpose when the sweep starts.
+ */
+#define SVMHV_SWEEP_OFF         0
+#define SVMHV_SWEEP_EXECUTE     1   /* which pages have run                 */
+#define SVMHV_SWEEP_WRITE       2   /* which pages have been written         */
+
+NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode);
+VOID     SvNptSweepDisarm(VOID);
+
+/*
+ * Exit-handler side.  TRUE if Gpa is inside an armed sweep and still faulting,
+ * in which case the permission has been granted and the caller should record
+ * the page and re-execute.  No allocation: every table it touches already
+ * exists.
+ */
+BOOLEAN  SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo);
+
+/* Pages granted so far, and how many the range holds. */
+VOID     SvNptSweepState(_Out_ ULONG* Mode, _Out_ UINT64* Base, _Out_ UINT64* Size,
+                         _Out_ UINT64* Granted);

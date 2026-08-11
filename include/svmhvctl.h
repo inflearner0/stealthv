@@ -359,6 +359,15 @@ typedef struct _SVMHV_HOOK_LIST
  */
 #define SVMHV_TRACE_IO          6
 
+/*
+ * The first time a guest physical page was executed, or written, during a
+ * coverage sweep.  Arguments[0] is the page, Rip is what was running, and
+ * ErrorCode the #NPF information.  One record per page for the life of the
+ * sweep - the permission is granted after the first fault, so the page never
+ * reports again.
+ */
+#define SVMHV_TRACE_COVER       7
+
 typedef struct _SVMHV_TRACE_RECORD
 {
     UINT64 Sequence;
@@ -650,6 +659,22 @@ typedef struct _SVMHV_SNAPSHOT
  */
 #define SVMHV_CMD_WATCH_MSR     15
 #define SVMHV_CMD_WATCH_IO      16
+
+/*
+ * Arm or disarm a coverage sweep.
+ *
+ * MemoryAddress is the base guest physical address.  The size and the mode
+ * both travel in MemoryData - size at 0, mode at 8 - because MemoryLength is
+ * not free: the client's transfer helper reads it as the length of the payload
+ * and copies exactly that many bytes, so a command that puts anything else
+ * there silently sends one byte of its arguments and no more.
+ *
+ * On the way back MemoryData holds the size actually armed, which after a
+ * partial failure is not the size asked for, and MemoryReturned the number of
+ * pages granted so far.
+ */
+#define SVMHV_CMD_SWEEP         17
+#define SVMHV_SWEEP_ARGS        16      /* MemoryLength for the above */
 
 /* How many of each can be armed at once. */
 #define SVMHV_MAX_MSR_WATCHES   16

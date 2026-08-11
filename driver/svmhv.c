@@ -1118,6 +1118,25 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
         }
     }
 
+    /*
+     * A coverage sweep: this page is faulting because we took the permission
+     * away, not because anything is wrong with it.  Grant it for good, record
+     * that it was reached, and re-execute - so a page costs one exit the first
+     * time it is used and nothing ever after.
+     *
+     * Checked after the hooks, because a hooked page is a more specific answer
+     * and has to win, and before the unmapped case, because a swept page is
+     * present and would otherwise look like a fault nobody can explain.
+     */
+    if (SvNptSweepGrant(gpa, info))
+    {
+        SvTraceRegister(SVMHV_TRACE_COVER, rip, vmcb->StateSave.Cr3,
+                        Cpu->Index, gpa, 0, 0, 0, info);
+        Cpu->PendingFlush = TRUE;
+        SvNpfExplained(Cpu);
+        return FALSE;
+    }
+
     if ((info & NPF_PRESENT) == 0)
     {
         /*

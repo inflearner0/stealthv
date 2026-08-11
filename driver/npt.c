@@ -124,9 +124,44 @@ static UINT64* SvNptTableVa(_In_ UINT64 PhysicalAddress)
     return NULL;
 }
 
+/*
+ * A second pool, allocated only while a coverage sweep is armed.
+ *
+ * Splitting a range to 4 KiB costs a table page per 2 MiB, which for anything
+ * bigger than a few hundred megabytes is far more than the standing pool holds
+ * - and carrying that much permanently for a feature that is off almost all the
+ * time would be a waste of a dozen megabytes.  So the sweep brings its own,
+ * sized to the range it was asked for, and the allocator prefers it while it
+ * exists.
+ */
+static UINT8*        g_SweepPool;
+static UINT64        g_SweepPoolPa;
+static ULONG         g_SweepPoolPages;
+static volatile LONG g_SweepPoolNext;
+
+/* What is armed, if anything.  Written by the control worker, read by every
+   processor's fault handler; see the coverage section below. */
+static ULONG           g_SweepMode;
+static UINT64          g_SweepBase;
+static UINT64          g_SweepSize;
+static volatile LONG64 g_SweepGranted;
+
 static UINT64* SvNptAllocTable(_Out_ UINT64* PhysicalAddress)
 {
-    LONG index = InterlockedIncrement(&g_SplitPoolNext) - 1;
+    LONG index;
+
+    if (g_SweepPool != NULL)
+    {
+        index = InterlockedIncrement(&g_SweepPoolNext) - 1;
+        if (index >= 0 && (ULONG)index < g_SweepPoolPages)
+        {
+            *PhysicalAddress = g_SweepPoolPa + (UINT64)index * PAGE_SIZE;
+            return (UINT64*)(g_SweepPool + (SIZE_T)index * PAGE_SIZE);
+        }
+        /* Exhausted; fall through to the standing pool rather than fail. */
+    }
+
+    index = InterlockedIncrement(&g_SplitPoolNext) - 1;
 
     if (index < 0 || (ULONG)index >= NPT_SPLIT_POOL_PAGES)
     {
@@ -300,12 +335,237 @@ VOID SvNptFree(VOID)
     RtlZeroMemory(&g_NptPrimary, sizeof(g_NptPrimary));
     RtlZeroMemory(&g_NptShadow, sizeof(g_NptShadow));
     RtlZeroMemory(&g_NptPermissive, sizeof(g_NptPermissive));
+
+    /* Freed with the rest of g_Blocks above; only the bookkeeping is here. */
+    g_SweepPool = NULL;
+    g_SweepPoolPa = 0;
+    g_SweepPoolPages = 0;
+    g_SweepPoolNext = 0;
+    g_SweepMode = SVMHV_SWEEP_OFF;
     g_BlockCount = 0;
     g_SplitPool = NULL;
     g_SplitPoolNext = 0;
     g_HidePool = NULL;
     g_HidePoolPages = 0;
     g_HidePoolNext = 0;
+}
+
+/* ------------------------------------------------------------- coverage */
+
+/*
+ * At most 16 MiB of table pages, which at one page per 2 MiB covers 8 GiB of
+ * guest physical memory in one sweep.  A cap rather than a limit of the design:
+ * a caller who wants more can arm the ranges in turn, and a caller who asks for
+ * all 48 bits by accident gets told no instead of getting the machine killed.
+ */
+#define NPT_SWEEP_MAX_TABLES    4096
+
+VOID SvNptSweepDisarm(VOID)
+{
+    UINT64 gpa;
+
+    if (g_SweepMode == SVMHV_SWEEP_OFF)
+    {
+        return;
+    }
+
+    /*
+     * Give the permission back everywhere before letting go of the tables.
+     * The pages stay split - undoing that would mean rebuilding large leaves
+     * underneath processors that may be using them - which costs nothing but
+     * the table pages already spent.
+     */
+    for (gpa = g_SweepBase; gpa < g_SweepBase + g_SweepSize; gpa += PAGE_SIZE)
+    {
+        UINT64* pte = SvNptSplitTo4Kb(&g_NptPrimary, gpa);
+
+        if (pte != NULL)
+        {
+            *pte = (*pte & ~NPT_NO_EXECUTE) | NPT_WRITE;
+        }
+    }
+
+    g_SweepMode = SVMHV_SWEEP_OFF;
+    g_SweepBase = 0;
+    g_SweepSize = 0;
+}
+
+NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode)
+{
+    UINT64 gpa;
+    UINT64 tables;
+
+    if (Mode != SVMHV_SWEEP_EXECUTE && Mode != SVMHV_SWEEP_WRITE)
+    {
+        SvNptSweepDisarm();
+        return STATUS_SUCCESS;
+    }
+
+    Base &= ~(UINT64)(PAGE_SIZE - 1);
+    Size = (Size + PAGE_SIZE - 1) & ~(UINT64)(PAGE_SIZE - 1);
+
+    if (Size == 0 || Base + Size > SvNptCoverage() || Base + Size < Base)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    tables = (Size + NPT_2MB - 1) / NPT_2MB + 1;
+    if (tables > NPT_SWEEP_MAX_TABLES)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    SvNptSweepDisarm();
+
+    /*
+     * The pool has to come from SvNptAllocBlock rather than straight from the
+     * allocator, because every table page has to be findable by physical
+     * address: the splitter walks down into a table it has just installed, and
+     * SvNptTableVa resolves that by subtracting within the registered blocks.
+     * A pool outside them produces tables the walker cannot see, and the split
+     * fails halfway with the range already half armed.
+     *
+     * Allocated once, sized to the first request, and kept until unload.  It is
+     * physically contiguous, so asking for the maximum up front is a large
+     * contiguous allocation that a 6 GiB guest will simply refuse - taking what
+     * this sweep needs is far more likely to succeed and costs a reload if a
+     * later sweep wants a bigger range.
+     */
+    if (g_SweepPool == NULL)
+    {
+        /*
+         * At least enough for 2 GiB, so that arming a small range first does
+         * not leave the pool too small for the real one afterwards - which is
+         * a trap, because the small range is exactly what somebody tries
+         * first.  A bigger first request still gets what it asks for.
+         */
+        ULONG want = (ULONG)tables;
+
+        if (want < 1024)
+        {
+            want = 1024;
+        }
+        g_SweepPool = (UINT8*)SvNptAllocBlock(want, &g_SweepPoolPa);
+        if (g_SweepPool == NULL && want > tables)
+        {
+            /* A 4 MiB contiguous block is not always available on a small
+               guest; fall back to exactly what this sweep needs. */
+            want = (ULONG)tables;
+            g_SweepPool = (UINT8*)SvNptAllocBlock(want, &g_SweepPoolPa);
+        }
+        if (g_SweepPool == NULL)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        g_SweepPoolPages = want;
+    }
+    else if (tables > g_SweepPoolPages)
+    {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    g_SweepPoolNext = 0;
+
+    /*
+     * Split first, then take the permission away, and only then arm - so that
+     * by the time a fault can happen, every table the handler could need is
+     * already there.  A split that fails leaves the range partly armed, which
+     * is why the pool is sized from the range before any of this starts.
+     */
+    for (gpa = Base; gpa < Base + Size; gpa += PAGE_SIZE)
+    {
+        UINT64* pte = SvNptSplitTo4Kb(&g_NptPrimary, gpa);
+
+        if (pte == NULL)
+        {
+            g_SweepBase = Base;
+            g_SweepSize = gpa - Base;
+            g_SweepMode = Mode;
+            SvNptSweepDisarm();
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        if (Mode == SVMHV_SWEEP_EXECUTE)
+        {
+            *pte |= NPT_NO_EXECUTE;
+        }
+        else
+        {
+            *pte &= ~NPT_WRITE;
+        }
+    }
+
+    g_SweepBase = Base;
+    g_SweepSize = Size;
+    g_SweepGranted = 0;
+    g_SweepMode = Mode;       /* last: the handler reads this to decide */
+    return STATUS_SUCCESS;
+}
+
+BOOLEAN SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo)
+{
+    const ULONG mode = g_SweepMode;
+    const UINT64 page = Gpa & ~(UINT64)(PAGE_SIZE - 1);
+    UINT64* pte;
+
+    if (mode == SVMHV_SWEEP_OFF ||
+        page < g_SweepBase || page >= g_SweepBase + g_SweepSize)
+    {
+        return FALSE;
+    }
+
+    /* Only the fault this sweep is about; a write fault on an execute sweep
+       belongs to something else and must keep going down the normal path. */
+    if (mode == SVMHV_SWEEP_EXECUTE)
+    {
+        if ((FaultInfo & NPF_EXECUTE) == 0)
+        {
+            return FALSE;
+        }
+    }
+    else if ((FaultInfo & NPF_WRITE) == 0)
+    {
+        return FALSE;
+    }
+
+    /*
+     * The table is already there - the range was split before the sweep was
+     * armed - so this only rewrites one entry.  Nothing here allocates, which
+     * is the whole reason the splitting happens up front.
+     */
+    pte = SvNptSplitTo4Kb(&g_NptPrimary, page);
+    if (pte == NULL)
+    {
+        return FALSE;
+    }
+
+    if (mode == SVMHV_SWEEP_EXECUTE)
+    {
+        if ((*pte & NPT_NO_EXECUTE) == 0)
+        {
+            return FALSE;               /* another processor got here first */
+        }
+        *pte &= ~NPT_NO_EXECUTE;
+    }
+    else
+    {
+        if ((*pte & NPT_WRITE) != 0)
+        {
+            return FALSE;
+        }
+        *pte |= NPT_WRITE;
+    }
+
+    InterlockedIncrement64(&g_SweepGranted);
+    return TRUE;
+}
+
+VOID SvNptSweepState(_Out_ ULONG* Mode, _Out_ UINT64* Base, _Out_ UINT64* Size,
+                     _Out_ UINT64* Granted)
+{
+    *Mode = g_SweepMode;
+    *Base = g_SweepBase;
+    *Size = g_SweepSize;
+    *Granted = (UINT64)InterlockedCompareExchange64(&g_SweepGranted, 0, 0);
 }
 
 UINT64 SvNptCoverage(VOID)

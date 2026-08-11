@@ -251,7 +251,7 @@ OPTION_BITS = [
 KIND_NAMES = {0: "exec", 1: "write-watch", 2: "access-watch"}
 ACTION_NAMES = {0: "trace", 1: "detour", 2: "shellcode"}
 TRACE_TYPES = {0: "exec", 1: "write", 2: "access", 3: "return", 4: "step",
-               5: "msr", 6: "io"}
+               5: "msr", 6: "io", 7: "coverage"}
 
 # The model-specific registers worth naming on sight. Not a complete list and
 # not meant to be: these are the ones that turn up when something is looking
@@ -516,6 +516,13 @@ def tool_trace(count: int = 40) -> str:
                 f"[{row.get('seq')}] hook {row.get('hook')} cpu{row.get('cpu')} "
                 f"RETURNED {row.get('a0')} after {cycles:,} cycles, "
                 f"to {symbolize(int(row.get('ret', '0'), 0))}")
+        elif kind == 7:
+            raw = int(row.get("err", "0"), 0)
+            lines.append(
+                f"[{row.get('seq')}] cpu{row.get('cpu')} coverage: gpa "
+                f"{int(row.get('a0', '0'), 0):#014x} first "
+                f"{'executed' if raw & 16 else 'written'} from "
+                f"{symbolize(int(row.get('rip', '0'), 0))}")
         elif kind == 5:
             written = int(row.get("a2", "0"), 0)
             lines.append(
@@ -711,6 +718,127 @@ def tool_trace_summary(count: int = 200) -> str:
 def tool_trace_reset() -> str:
     status = as_int(pairs(ctl("trace-reset")), "status", -1)
     return "trace ring reset" if status == 0 else f"failed: {status:#010x}"
+
+
+def tool_sweep(mode: str = "exec", base: str = "0", size: str = "0") -> str:
+    """Arm or disarm a coverage sweep over guest physical memory."""
+    mode = mode.lower()
+    if mode not in ("exec", "write", "off"):
+        return "mode must be exec, write or off"
+    if mode == "off":
+        result = pairs(ctl("sweep", "off"))
+        status = as_int(result, "status", 0)
+        return ("sweep disarmed; every page has its permission back"
+                if not status else f"failed: {status & 0xFFFFFFFF:#010x}")
+
+    result = pairs(ctl("sweep", mode, hexarg(base), hexarg(size)))
+    status = as_int(result, "status", 0)
+    if status:
+        code = status & 0xFFFFFFFF
+        why = ""
+        if code == 0xC000000D:
+            why = (" - the range needs one table page per 2 MiB and one "
+                   "arming covers at most 8 GiB; do it in pieces")
+        elif code == 0xC0000023:
+            why = (" - the table pool was sized by the first sweep of this "
+                   "load and this range needs more. Reload the driver and arm "
+                   "the largest range first.")
+        elif code == 0xC000009A:
+            why = (" - no contiguous block that size. Ask for less, or reload "
+                   "the driver when the guest is less fragmented.")
+        return f"failed: {code:#010x}{why}"
+
+    armed = as_int(result, "sweep_size")
+    return (f"sweeping {mode} over {armed / (1 << 20):,.0f} MiB from "
+            f"{int(hexarg(base), 16):#x}\n"
+            f"Every page in the range now faults once, the first time it is "
+            f"{'executed' if mode == 'exec' else 'written'}, and never again. "
+            f"Read the result with svmhv_coverage.")
+
+
+def tool_coverage(limit: int = 400, unknown_only: bool = True) -> str:
+    """What the sweep found, with the pages no module accounts for first.
+
+    The whole point is the last column. A page that falls inside a loaded
+    module is code somebody declared; a page that falls in none is either a
+    manual map, a JIT, or a page of data that happened to be jumped to - and
+    those three are exactly what is worth looking at next.
+    """
+    text = ctl("trace", str(min(limit, 200)))
+    produced = as_int(pairs(text), "produced")
+    rows = [row for row in records(text, "trace")
+            if int(row.get("type", "0"), 0) == 7]
+    if not rows:
+        return ("no coverage records. Either nothing has run in the range "
+                "yet, or the sweep is not armed - svmhv_sweep arms it.")
+
+    # Three buckets, not two. The module list this agent can see is the KERNEL
+    # module list, so testing a user-mode RIP against it says "unknown" for
+    # every thread in every process - which would bury the one answer the tool
+    # exists to give under all of ordinary user-mode execution.
+    known, unknown, user = [], [], []
+    for row in rows:
+        gpa = int(row.get("a0", "0"), 0)
+        rip = int(row.get("rip", "0"), 0)
+        cr3 = int(row.get("cr3", "0"), 0)
+        if rip < 0xFFFF800000000000:
+            user.append((gpa, rip, cr3))
+        elif module_for(rip) is not None:
+            known.append((gpa, rip, cr3))
+        else:
+            unknown.append((gpa, rip, cr3))
+
+    lines = [f"{len(rows)} page(s) in the most recent records: {len(unknown)} "
+             f"run from kernel addresses no loaded module accounts for, "
+             f"{len(known)} from inside a known module, {len(user)} from user "
+             f"mode"]
+    if produced > len(rows):
+        # A sweep over a live range produces thousands of these, and this reads
+        # only the newest slice of the ring. Say so rather than let a sample
+        # read as a total.
+        lines.append(f"This is a SAMPLE: {produced:,} records have been "
+                     f"produced in all and only the newest are read here. "
+                     f"Narrow the swept range, or reset the ring before "
+                     f"arming, to see a whole run.")
+    lines.append("")
+
+    if unknown:
+        lines.append("KERNEL pages no module claims - the interesting ones:")
+        for gpa, rip, cr3 in unknown[:limit]:
+            lines.append(f"  gpa {gpa:#014x}  first run from rip {rip:#018x}"
+                         f"  cr3 {cr3:#x}")
+        lines.append("")
+        lines.append("Read one with svmhv_read_physical, or svmhv_disassemble "
+                     "at the RIP if it is still mapped. A kernel address in no "
+                     "module is either a manual map or a pool allocation "
+                     "somebody jumped to.")
+
+    if user:
+        # Grouping by CR3 is the only attribution available from here: the
+        # recorder runs with GIF clear and does not call Ps* to name a process.
+        spaces = {}
+        for gpa, rip, cr3 in user:
+            spaces.setdefault(cr3, 0)
+            spaces[cr3] += 1
+        lines.append("")
+        lines.append(f"user-mode pages, by address space ({len(spaces)} "
+                     f"distinct CR3s):")
+        for cr3, count in sorted(spaces.items(), key=lambda kv: -kv[1])[:16]:
+            lines.append(f"  cr3 {cr3:#014x}  {count} page(s)")
+        lines.append("  Not attributed to a process: that would need a Ps* "
+                     "call from the exit handler, which this driver does not "
+                     "do. Two records with the same CR3 are the same process.")
+
+    if known and not unknown_only:
+        lines.append("")
+        lines.append("pages inside a loaded module:")
+        for gpa, rip, _ in known[:limit]:
+            lines.append(f"  gpa {gpa:#014x}  {symbolize(rip)}")
+    elif known:
+        lines.append("")
+        lines.append(f"({len(known)} pages inside loaded modules not shown; "
+                     f"pass unknown_only=false for those)")
+    return "\n".join(lines)
 
 
 def tool_watch_msr(msr: str, enabled: bool = True) -> str:
@@ -5557,6 +5685,52 @@ TOOLS = [
                 "description": "how many newest records to summarise, 1-200"}},
         },
         "handler": lambda a: tool_trace_summary(int(a.get("count", 200))),
+    },
+    {
+        "name": "svmhv_sweep",
+        "description":
+            "Mark every guest physical page in a range non-executable (or "
+            "read-only) and record the first time each one runs, or is "
+            "written. This is the thing a hypervisor can do that a debugger "
+            "cannot: a module list describes code somebody declared, and says "
+            "nothing about code that was mapped by hand and never written to "
+            "disk. A page faults once and is then granted for good, so the "
+            "cost is one exit per distinct page ever touched. Needs one table "
+            "page per 2 MiB, and the pool covers 8 GiB in one arming.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["exec", "write", "off"],
+                         "description":
+                             "exec finds code that has run; write finds pages "
+                             "something modified, which is where an unpacker "
+                             "shows itself"},
+                "base": {"type": "string",
+                         "description": "guest physical base, hex"},
+                "size": {"type": "string", "description": "bytes, hex"},
+            },
+        },
+        "handler": lambda a: tool_sweep(a.get("mode", "exec"),
+                                        a.get("base", "0"),
+                                        a.get("size", "0")),
+    },
+    {
+        "name": "svmhv_coverage",
+        "description":
+            "What a sweep found, with the pages no loaded module accounts for "
+            "listed first - those are the manual maps, the JIT pages and the "
+            "data somebody jumped to.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "unknown_only": {"type": "boolean",
+                                 "description": "false to also list pages "
+                                                "inside known modules"},
+            },
+        },
+        "handler": lambda a: tool_coverage(int(a.get("limit", 400)),
+                                           a.get("unknown_only", True)),
     },
     {
         "name": "svmhv_watch_msr",
