@@ -22,10 +22,11 @@ AMD counterpart to the Intel VT-x/EPT projects.
 ## Driven over MCP
 
 An [MCP server](mcp/svmhv_agent.py) runs **inside the guest** and exposes the
-whole instrument as 47 tools, so what drives it can be a model rather than a
+whole instrument as 60 tools, so what drives it can be a model rather than a
 person at a console. Ask what a driver's IOCTL interface is, hook the handler,
 watch the arguments arrive, patch one in flight, read the original bytes back to
-confirm the page never changed.
+confirm the page never changed — then snapshot the memory it works on, call it
+again with a different argument, and put the memory back.
 
 ```
 client  --HTTP-->  svmhv_agent.py (guest)  -->  svmhvctl.exe  -->  CPUID
@@ -47,7 +48,9 @@ Each tool is `svmhv_` plus the name below:
 | **symbols** | `symbols_auto` `symbols_load` `symbol` `exports` `imports` `pdb_info` `syscalls` |
 | **modules and processes** | `modules` `sections` `processes` `process_modules` `verify` |
 | **drivers** | `driver` `devices` `symlinks` `ioctl` `ioctls` `watch_ioctls` `callbacks` |
-| **notes** | `note` |
+| **experiments** | `snapshot` `call` `reverse` `provenance` |
+| **finding code** | `sweep` `coverage` `coverage_diff` `dump` `ibs` |
+| **notes** | `note` `revive` |
 
 Symbols download themselves on first use. Disassembly and assembly use capstone
 and keystone when installed and a built-in decoder and assembler when not.
@@ -68,6 +71,31 @@ place.
 - **watch** — fault on write or on any access, code or data
 - **filters** — only this process, only this caller, only when an argument is
   above a value; and **spoof** an argument or **block** the call
+
+**Experiments, not only observation.** A copy-on-write **snapshot** over a range
+of memory: every page loses write permission, the first store to each faults and
+the original is copied aside, and restore puts them back — so the same code can
+be run twice with one input changed. **call** runs a function with arguments you
+choose and reports what it returns. A stepped run records all sixteen registers
+per instruction, so **reverse** answers "which instruction gave this register
+that value" by walking backwards instead of running again. **provenance** watches
+a buffer and reports its writers grouped by instruction.
+
+The snapshot restores *memory in one range* and nothing else — not registers,
+not devices — and a range another processor is using gets restored underneath
+it. `call` runs the target: called with arguments it was not written for it
+takes the guest down, and no exception handler can prevent that.
+
+**Finding code nothing declared.** The coverage sweep takes a permission away
+from every page in a range and gives it back one fault at a time, so a page
+costs one exit ever. In `both` mode it remembers the *order*: a page written and
+then executed had its code arrive after its mapping did, which is a manual map,
+an unpacker or a JIT and very little else. **coverage_diff** brackets an action
+with two windows and reports only what the second reached. **dump** turns one of
+those pages into a file with its section table rewritten to the memory layout,
+so a disassembler opens it at the right addresses; a payload that erased its own
+MZ header is dumped flat rather than refused. **ibs** samples through the
+processor's own instruction-based sampling where the hardware exposes it.
 
 **Virtualisation.** Every logical processor taken with `VMRUN` while Windows is
 running on it. Nested page tables identity-map the whole 48-bit guest physical

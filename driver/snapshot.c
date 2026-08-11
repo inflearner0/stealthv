@@ -39,6 +39,7 @@ static PVOID         g_MappedVa;
 
 static UINT64        g_Base;
 static UINT64        g_Size;
+static BOOLEAN       g_ReadOnly;
 
 /*
  * Read by every processor's fault handler, written by the control worker.
@@ -48,6 +49,24 @@ static UINT64        g_Size;
  * still be inside an exit handler that read the flag as armed.
  */
 static volatile LONG g_Armed;
+
+/*
+ * Set while SvSnapshotRestore is copying pages back.
+ *
+ * The restore's own copies are guest-physical writes to pages this snapshot has
+ * write-protected, so without this they fault into SvSnapshotSaveOnWrite, which
+ * dutifully saves the *modified* page it was about to overwrite and grants
+ * write permission for good.  The first restore then works and every one after
+ * it silently does nothing, because the page it was watching is writable and no
+ * longer being tracked.  That is exactly what happened the first time this was
+ * tested, and it is invisible from the outside: the restore reports success and
+ * the memory does not change.
+ *
+ * With the flag set the handler grants and returns without saving, so the copy
+ * completes without consuming a store slot or disturbing the bookkeeping the
+ * restore is in the middle of resetting.
+ */
+static volatile LONG g_Restoring;
 
 /* ------------------------------------------------------------------ sort */
 
@@ -169,6 +188,7 @@ static VOID SvSnapshotTearDown(_In_ BOOLEAN RestorePermission)
     g_Overflowed = 0;
     g_Base = 0;
     g_Size = 0;
+    g_ReadOnly = FALSE;
 }
 
 VOID SvSnapshotRelease(VOID)
@@ -203,6 +223,7 @@ NTSTATUS SvSnapshotTake(_In_ UINT64 Address, _In_ UINT64 Size,
     PMDL mdl = NULL;
     PVOID mapped = NULL;
     BOOLEAN attached = FALSE;
+    BOOLEAN readOnly = FALSE;
 
     base  = Address & ~(UINT64)(PAGE_SIZE - 1);
     Size  = (Size + (Address - base) + PAGE_SIZE - 1) & ~(UINT64)(PAGE_SIZE - 1);
@@ -237,24 +258,45 @@ NTSTATUS SvSnapshotTake(_In_ UINT64 Address, _In_ UINT64 Size,
         goto done;
     }
 
+    /*
+     * IoModifyAccess first, and it matters: a user range may be mapped
+     * copy-on-write, and locking it for reading would leave the guest's first
+     * store breaking the sharing and landing on a *different* physical page
+     * from the one this snapshot pinned and protected.  Nothing would fault,
+     * nothing would be saved, and the restore would put the original back into
+     * a page the process had stopped looking at - a snapshot that silently did
+     * nothing, which is the worst of the available failures.
+     *
+     * But a great many interesting ranges are not writable: any code page, and
+     * anything read-only in an image.  Asking for modify access on one of those
+     * fails the probe outright, which is how this first refused to snapshot
+     * .text at all.  Falling back to a read lock is correct for exactly those
+     * pages - a page the guest cannot write cannot break its sharing under us,
+     * so the thing the modify lock was protecting against cannot happen.
+     */
     __try
     {
-        /*
-         * IoModifyAccess, not IoReadAccess: a user range may be mapped
-         * copy-on-write, and locking it for reading would leave the guest's
-         * first store breaking the sharing and landing on a *different*
-         * physical page from the one this snapshot pinned and recorded.  The
-         * restore would then write the original back into a page nothing is
-         * looking at any more.
-         */
         MmProbeAndLockPages(mdl, KernelMode, IoModifyAccess);
+        readOnly = FALSE;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        IoFreeMdl(mdl);
-        mdl = NULL;
-        status = STATUS_INVALID_ADDRESS;
-        goto done;
+        readOnly = TRUE;
+    }
+
+    if (readOnly)
+    {
+        __try
+        {
+            MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            IoFreeMdl(mdl);
+            mdl = NULL;
+            status = STATUS_INVALID_ADDRESS;
+            goto done;
+        }
     }
 
     mapped = MmGetSystemAddressForMdlSafe(
@@ -347,6 +389,7 @@ done:
 
     g_Base = base;
     g_Size = Size;
+    g_ReadOnly = readOnly;
     InterlockedExchange(&g_Armed, 1);
 
     /* Nothing is protected until every processor has left the translations it
@@ -379,6 +422,15 @@ BOOLEAN SvSnapshotSaveOnWrite(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo)
     if (pte == NULL)
     {
         return FALSE;
+    }
+
+    if (g_Restoring != 0)
+    {
+        /* Almost certainly the restore's own copy; see g_Restoring.  Let it
+           through without saving - the page is being overwritten with the
+           original anyway, so there is nothing here worth keeping. */
+        *pte |= NPT_WRITE;
+        return TRUE;
     }
 
     if ((*pte & NPT_WRITE) != 0)
@@ -444,48 +496,65 @@ NTSTATUS SvSnapshotRestore(_Out_ UINT64* Restored)
     }
 
     /*
-     * Protect first, flush, and only then copy back.  The other order looks
-     * equivalent and is not: a page put back while it is still writable can be
-     * dirtied again during the copy without faulting, so the restore would
-     * finish leaving a page that is half of one run and half of another, marked
-     * clean.
+     * Our own copies are writes to protected pages, so tell the fault handler
+     * to let them through untracked for the duration; see g_Restoring.
      */
-    for (i = 0; i < g_PageCount; i++)
-    {
-        if (g_Pages[i].StoreIndex >= 0)
-        {
-            UINT64* pte = SvNptSplitTo4Kb(&g_NptPrimary, g_Pages[i].Gpa);
-
-            if (pte != NULL)
-            {
-                *pte &= ~NPT_WRITE;
-            }
-        }
-    }
-    SvSyncTlbFlush();
+    InterlockedExchange(&g_Restoring, 1);
 
     for (i = 0; i < g_PageCount; i++)
     {
         const LONG slot = g_Pages[i].StoreIndex;
+        UINT64* pte;
 
         if (slot < 0)
         {
             continue;
         }
 
+        /* Grant it here as well as in the handler.  A processor whose cached
+           translation is already writable will not fault at all, and one whose
+           is not will fault into the handler and be granted there; both have to
+           end up writing the page rather than looping on it. */
+        pte = SvNptSplitTo4Kb(&g_NptPrimary, g_Pages[i].Gpa);
+        if (pte != NULL)
+        {
+            *pte |= NPT_WRITE;
+        }
+
         RtlCopyMemory(g_Pages[i].SysVa, g_Store + (SIZE_T)slot * PAGE_SIZE,
                       PAGE_SIZE);
-        InterlockedExchange(&g_Pages[i].StoreIndex, -1);
         count++;
     }
 
     /*
-     * The store is empty again, so the whole capacity is available for the next
-     * run.  Reset after the copies, not before: a slot handed out again while
-     * its contents were still being read back would be written by another
-     * processor's save.
+     * Re-arm: protect the whole range again, not just what was dirty.  The
+     * clean pages are already protected and rewriting the bit costs nothing,
+     * and doing all of them is what makes this identical to the state
+     * SvSnapshotTake leaves behind - so a restore can be followed by another
+     * run and another restore, indefinitely.
      */
+    for (i = 0; i < g_PageCount; i++)
+    {
+        UINT64* pte = SvNptSplitTo4Kb(&g_NptPrimary, g_Pages[i].Gpa);
+
+        if (pte != NULL)
+        {
+            *pte &= ~NPT_WRITE;
+        }
+        InterlockedExchange(&g_Pages[i].StoreIndex, -1);
+    }
+
+    /* The store is empty again, so the whole capacity is available next time. */
     InterlockedExchange(&g_StoreNext, 0);
+
+    /*
+     * Clear the flag before the flush, not after.  A write that slips through
+     * on a stale writable translation during the flush is one page's worth of
+     * lost tracking that the next fault corrects; a fault taken while the flag
+     * is still set would be granted permanently and never tracked again.
+     */
+    InterlockedExchange(&g_Restoring, 0);
+    SvSyncTlbFlush();
 
     *Restored = count;
     return STATUS_SUCCESS;
@@ -498,6 +567,10 @@ VOID SvSnapshotState(_Out_ ULONG* State, _Out_ UINT64* Base, _Out_ UINT64* Size,
 
     *State = (g_Armed == 0) ? SVMHV_SNAP_IDLE
            : (g_Overflowed != 0) ? SVMHV_SNAP_OVERFLOWED : SVMHV_SNAP_ARMED;
+    if (g_Armed != 0 && g_ReadOnly)
+    {
+        *State |= SVMHV_SNAP_READ_ONLY;
+    }
     *Base = g_Base;
     *Size = g_Size;
     *Dirty = (used < 0) ? 0 : (UINT64)used;

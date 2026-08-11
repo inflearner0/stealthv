@@ -47,6 +47,19 @@
 #define SVMHV_SNAP_OVERFLOWED   2
 
 /*
+ * Flagged into the state word: the range could only be locked for reading.
+ *
+ * That happens for any page the guest cannot write - a code page, anything
+ * read-only in an image - and for those it is not a limitation, because a page
+ * the guest cannot write cannot break its copy-on-write sharing underneath the
+ * snapshot either.  It is reported rather than hidden because it also means
+ * something else: on a range locked this way, a page that turns out to be
+ * writable after all would relocate on its first store and this snapshot would
+ * quietly stop describing it.
+ */
+#define SVMHV_SNAP_READ_ONLY    0x100
+
+/*
  * Take a snapshot of Size bytes at Address, in ProcessId (0 for kernel space).
  *
  * The range is pinned with an MDL and aliased into system space for the

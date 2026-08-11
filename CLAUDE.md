@@ -82,6 +82,94 @@ happens minutes or days apart and would take a very long time to accumulate
 eight of anything, but that is an argument for it being slow to show, not for it
 being absent.
 
+## Running an experiment rather than watching one
+
+Everything above observes. `snapshot.c`, `call.c` and the reverse walk exist so
+a client can change something and put it back, which is the difference between
+reading what a program did once and finding out what it does.
+
+**The snapshot is copy-on-write over one range, and its limits are the
+interesting part.** Arming splits the range to 4 KiB, drops `NPT_WRITE` and
+flushes; the first store to each page faults into `SvSnapshotSaveOnWrite`, which
+copies the original aside and grants the write. So the cost is one exit and one
+4 KiB copy per page *actually modified* and nothing for a range that is only
+read, which is why this is affordable where copying the range up front is not.
+
+It restores memory in one range. Not registers, not devices, not the pages
+outside the range that the same code touched. A range another processor is
+actively using is restored underneath it, and for ordinary kernel data that is a
+bugcheck rather than an experiment. `SvSnapshotTake` refuses this driver's own
+pages and nothing else, because there is no way for it to know what else on the
+machine cares about the range it was handed.
+
+Three things here were got wrong and are worth not repeating.
+
+*The restore's own copies are guest-physical writes to pages the snapshot has
+write-protected.* Without `g_Restoring` they fault into the save path, which
+dutifully saves the **modified** page it was about to overwrite and grants write
+permission for good. The first restore then works and every one after it
+silently does nothing — the report says success and the memory does not change.
+That is exactly what the first test showed: round one restored, round two did
+not.
+
+*`IoModifyAccess` fails outright on a page the guest cannot write*, which is any
+code page and anything read-only in an image, so the first version could not
+snapshot `.text` at all. It falls back to a read lock and says so. The fallback
+is sound for exactly those pages: a page the guest cannot write cannot break its
+copy-on-write sharing underneath the snapshot either, which is the only thing
+the modify lock was protecting against.
+
+*Overflow is refused, not approximated.* The store is fixed at arm time because
+a nested page fault cannot allocate, so a range that dirties more pages than the
+store holds cannot be fully restored — and half a restore is a state the program
+was never in. `SvSnapshotRestore` returns `STATUS_BUFFER_OVERFLOW` rather than
+putting back a mixture of two runs.
+
+**`call.c`'s `__try` buys less than it looks like it does.** A reference to an
+invalid *kernel* address is not an exception Windows raises, it is
+`MiSystemFault` deciding the reference is invalid and calling `KeBugCheckEx` —
+the same lesson `capture_stack` learned, in a place where it is inherent rather
+than fixable. So the guard is deliberately shallow (kernel address, currently
+valid, not one of ours) because a deeper one would be a promise it cannot keep.
+The thing that makes a bad call survivable is the snapshot next door.
+
+**Step records carry all sixteen registers**, in x86-64 encoding order so an
+index is the number the ModRM byte uses. They went in *ahead* of
+`CommitSequence`, which is the only direction that layout can grow: the
+publication protocol needs that field written last, so anything appended after
+it would be visible to a reader before it had been written.
+
+## Instruction-based sampling, and what is not here
+
+`ibs.c` samples through the processor rather than by instrumenting anything: one
+micro-op in every N, with the instruction's address and the linear address it
+touched. It is polled at the top of the exit handler instead of raising an
+interrupt, which means no LVT entry, no vector and no ISR — this driver already
+takes about 200 000 exits a second under Hyper-V, so samples are collected on
+the way past. A sample that ripens and is overwritten between two exits is lost,
+which for a sampling facility lowers the rate rather than being an error.
+
+**The CPUID gate is the entire safety story.** Writing `IBS_OP_CTL` where IBS is
+unsupported is a `#GP` in host context with `GIF` clear, which is not
+survivable, so both `CPUID.8000_0001:ECX[10]` and `CPUID.8000_001B:EAX[2]` are
+checked once at load and nothing touches those MSRs otherwise.
+
+**In this lab it does not arm, and that is the expected answer.** IBS is
+optional on AMD and Hyper-V does not pass it through, so `svmhv_ibs` reports
+that plainly and nothing is written. The gate has therefore been tested and the
+sampling path has not: it compiles, it refuses correctly, and it has never taken
+a sample here. Do not describe it as working until it has run on bare metal.
+
+**DR0–3 hardware watchpoints were considered and deliberately left out.** `VMRUN`
+saves and restores `DR6` and `DR7` through the VMCB but *not* `DR0–3`, so a
+guest-only hardware watchpoint means swapping those four registers around
+`VMRUN` in `svmasm.asm` — a change to the assembly hot path, in a driver that
+still has one unexplained triple fault to its name, for a gain over the existing
+nested-paging watchpoints that amounts to "cheaper on one hot address". Sharing
+them with host context instead is worse: the exit handler reads the watched page
+itself. If this is ever wanted, the swap has to be conditional on a watch being
+armed, and it should not be attempted while the reset is still unexplained.
+
 ## Known open items
 
 - Long-duration stability under concurrent load is unverified; `soak.ps1` has
@@ -155,10 +243,15 @@ being absent.
   caller-supplied shellcode and gating only the writes would protect nothing.
 - The SVM feature bits are visible to the guest, by design. Closing that means
   virtualising SVM, which is a separate project.
-- A processor that takes a fatal exit stays out of SVM until the next load or
-  `svmhvctl powercycle`. That is the intended trade — the machine survives and
-  the evidence survives — but it means the hypervisor can be covering fewer
-  processors than `virtualized=` claims.
+- A processor that takes a fatal exit stays out of SVM until it is put back.
+  That is the intended trade — the machine survives and the evidence survives —
+  but it means the hypervisor can be covering fewer processors than
+  `virtualized=` claims. `svmhvctl revive` now brings back only the processors
+  that are out, without the reload that used to be the only way and that threw
+  away every hook and the trace ring along with the problem. It is deliberately
+  not automatic: whatever caused the exit is usually still there, so a worker
+  that revived on sight would report one fatal exit per poll and would be
+  resetting the counter that says how bad things are.
 
 ## How it works
 

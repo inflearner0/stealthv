@@ -1386,6 +1386,36 @@ static void PrintTraceRecord(const SVMHV_TRACE_RECORD* record)
         }
     }
 
+    /*
+     * Every register, for a step record.  Printed as one comma-separated run
+     * in encoding order rather than as sixteen named fields: the reader that
+     * wants them wants all of them, to compare one record against the next,
+     * and sixteen "rax=0x..." on every line of a four-thousand-instruction
+     * window is most of the output.
+     *
+     * Tested by looking for any non-zero: only SVMHV_TRACE_STEP fills these in,
+     * and testing the type here instead would mean this printer knowing which
+     * types those are.
+     */
+    {
+        unsigned int r;
+        int any = 0;
+
+        for (r = 0; r < 16; r++)
+        {
+            if (record->Registers[r] != 0) { any = 1; break; }
+        }
+        if (any)
+        {
+            printf(" regs=");
+            for (r = 0; r < 16; r++)
+            {
+                printf("%s%llx", (r != 0) ? "," : "",
+                       (unsigned long long)record->Registers[r]);
+            }
+        }
+    }
+
     /* The stack, when the walk managed one. */
     if (record->FrameCount != 0)
     {
@@ -2203,10 +2233,11 @@ int main(int argc, char** argv)
         memcpy(&dirty,    data + 24, sizeof(dirty));
         memcpy(&capacity, data + 32, sizeof(capacity));
 
-        printf("snapshot_state=%s\nsnapshot_base=0x%llx\nsnapshot_size=0x%llx\n"
-               "snapshot_dirty=%llu\nsnapshot_capacity=%llu\n"
-               "snapshot_restored=%u\n",
-               (state < 3) ? states[state] : "unknown",
+        printf("snapshot_state=%s\nsnapshot_readonly=%u\nsnapshot_base=0x%llx\n"
+               "snapshot_size=0x%llx\nsnapshot_dirty=%llu\n"
+               "snapshot_capacity=%llu\nsnapshot_restored=%u\n",
+               ((state & 0xFF) < 3) ? states[state & 0xFF] : "unknown",
+               (state & 0x100) ? 1u : 0u,
                base, armed, dirty, capacity, restored);
         return 0;
     }
