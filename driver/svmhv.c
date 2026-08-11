@@ -317,6 +317,292 @@ static VOID SvSetMsrIntercept(_Inout_ UINT8* Msrpm, _In_ UINT32 Msr)
     Msrpm[base + bit / 8] |= (UINT8)(3u << (bit % 8));  /* read + write */
 }
 
+static VOID SvClearMsrIntercept(_Inout_ UINT8* Msrpm, _In_ UINT32 Msr)
+{
+    UINT32 base;
+    UINT32 bit;
+
+    if (Msr < 0x2000)
+    {
+        base = 0x000;
+        bit = Msr * 2;
+    }
+    else if (Msr >= 0xC0000000 && Msr < 0xC0002000)
+    {
+        base = 0x800;
+        bit = (Msr - 0xC0000000) * 2;
+    }
+    else if (Msr >= 0xC0010000 && Msr < 0xC0012000)
+    {
+        base = 0x1000;
+        bit = (Msr - 0xC0010000) * 2;
+    }
+    else
+    {
+        return;
+    }
+
+    Msrpm[base + bit / 8] &= (UINT8)~(3u << (bit % 8));
+}
+
+/* --------------------------------------------------- MSR and I/O watches */
+
+/*
+ * Registers and ports somebody asked to be told about.
+ *
+ * Small fixed arrays, scanned linearly from the exit handler.  Sixteen of each
+ * is enough for the question these answer - "what does this driver actually
+ * talk to" - and a linear scan of sixteen entries is cheaper than anything
+ * cleverer at this size, in a path that must not allocate or take a lock.
+ *
+ * Read from guest and host context on every processor, written only by the
+ * control worker, and every entry is a single aligned UINT32 - so a reader sees
+ * either the old value or the new one, which is all this needs.
+ */
+static volatile LONG  g_MsrWatch[SVMHV_MAX_MSR_WATCHES];
+static volatile LONG  g_MsrWatchCount;
+static volatile LONG  g_IoWatch[SVMHV_MAX_IO_WATCHES];
+static volatile LONG  g_IoWatchCount;
+
+static BOOLEAN SvIsMsrWatched(_In_ UINT32 Msr)
+{
+    const LONG count = g_MsrWatchCount;
+    LONG i;
+
+    for (i = 0; i < count && i < SVMHV_MAX_MSR_WATCHES; i++)
+    {
+        if ((UINT32)g_MsrWatch[i] == Msr)
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOLEAN SvIsPortWatched(_In_ UINT32 Port)
+{
+    const LONG count = g_IoWatchCount;
+    LONG i;
+
+    for (i = 0; i < count && i < SVMHV_MAX_IO_WATCHES; i++)
+    {
+        if ((UINT32)g_IoWatch[i] == Port)
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* One bit per port, three pages of them; the IOPM has been allocated and
+   zeroed since the driver was written and never had anything set in it. */
+static VOID SvSetPortIntercept(_In_ UINT32 Port, _In_ BOOLEAN On)
+{
+    UINT8* iopm = (UINT8*)g_Iopm;
+
+    if (iopm == NULL || Port > 0xFFFF)
+    {
+        return;
+    }
+    if (On)
+    {
+        iopm[Port / 8] |= (UINT8)(1u << (Port % 8));
+    }
+    else
+    {
+        iopm[Port / 8] &= (UINT8)~(1u << (Port % 8));
+    }
+}
+
+/*
+ * An intercepted IN or OUT.
+ *
+ * The instruction has not run, and it is not going to be emulated: INS and OUTS
+ * with a REP prefix are a memory copy and a loop, and an emulator that gets
+ * either wrong writes to the wrong address or leaves a device half-programmed.
+ * So the port is unarmed, the instruction is allowed through, and the bit goes
+ * back on the single step - the same trade the watchpoints make, for the same
+ * reason.
+ *
+ * The value is only meaningful for a non-string access.  For INS/OUTS it is in
+ * memory rather than in a register, and the record says so through the raw exit
+ * information rather than by inventing a number.
+ */
+static VOID SvHandleIoPort(_Inout_ VIRTUAL_CPU* Cpu,
+                           _Inout_ GUEST_CONTEXT* Context)
+{
+    VMCB* vmcb = &Cpu->GuestVmcb;
+    const UINT64 info = vmcb->Control.ExitInfo1;
+    const UINT32 port = (UINT32)(info >> IOIO_PORT_SHIFT) & 0xFFFF;
+    const BOOLEAN isIn = (info & IOIO_TYPE_IN) != 0;
+    const BOOLEAN isString = (info & IOIO_STRING) != 0;
+    UINT32 width = 1;
+    UINT64 value = 0;
+
+    if ((info & IOIO_SIZE_16) != 0) { width = 2; }
+    else if ((info & IOIO_SIZE_32) != 0) { width = 4; }
+
+    /*
+     * OUT carries its value in the accumulator on the way in; IN does not have
+     * one yet, and reporting whatever RAX happened to hold would be a lie.  The
+     * value a read returned is not available without letting the instruction
+     * run, which is exactly what happens next - so an IN is recorded with a
+     * zero value and its own port, which is the honest half of the answer.
+     */
+    if (!isIn && !isString)
+    {
+        value = Context->Rax & ((width == 1) ? 0xFFULL :
+                                (width == 2) ? 0xFFFFULL : 0xFFFFFFFFULL);
+    }
+
+    SvTraceRegister(SVMHV_TRACE_IO, vmcb->StateSave.Rip, vmcb->StateSave.Cr3,
+                    Cpu->Index, port, value, isIn ? 0u : 1u, width, info);
+
+    SvSetPortIntercept(port, FALSE);
+    Cpu->Step.Port = port;
+    SvStepArm(Cpu, 1, SVMHV_STEP_IO);
+}
+
+/* The #DB after one: put the port back and stop stepping. */
+static VOID SvIoStepEnd(_Inout_ VIRTUAL_CPU* Cpu)
+{
+    SvSetPortIntercept(Cpu->Step.Port, TRUE);
+    SvStepDisarm(Cpu);
+}
+
+/*
+ * Arm or disarm an MSR watch.  PASSIVE_LEVEL, from the control worker.
+ *
+ * The MSRPM is one bitmap shared by every VMCB, so setting a bit arms every
+ * processor at once and there is nothing to broadcast.  The intercept *bit* is
+ * per-VMCB, though, and with STEALTHV_HIDE_EFER at 0 nothing would have turned
+ * it on - so it is set on every processor here and an exit is forced everywhere
+ * to make sure the change is in force before this returns.
+ */
+NTSTATUS SvWatchMsr(_In_ UINT32 Msr, _In_ BOOLEAN Enable)
+{
+    LONG i;
+
+    if (g_Msrpm == NULL)
+    {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    /*
+     * The MSRPM describes three ranges, and everything outside them exits
+     * *unconditionally* once the MSR intercept is on - so those need no bitmap
+     * entry at all, only a place in the watch list.  That is not a corner case
+     * to be refused: Hyper-V's synthetic MSRs live at 0x4000_00xx, outside all
+     * three, and they are the most interesting ones on this machine.
+     */
+    const BOOLEAN inBitmap = (Msr < 0x2000 ||
+                              (Msr >= 0xC0000000 && Msr < 0xC0002000) ||
+                              (Msr >= 0xC0010000 && Msr < 0xC0012000));
+
+    for (i = 0; i < g_MsrWatchCount; i++)
+    {
+        if ((UINT32)g_MsrWatch[i] == Msr)
+        {
+            if (Enable)
+            {
+                return STATUS_SUCCESS;      /* already armed */
+            }
+            /* Compact, so the scan in the exit handler stays a prefix. */
+            g_MsrWatch[i] = g_MsrWatch[g_MsrWatchCount - 1];
+            InterlockedDecrement(&g_MsrWatchCount);
+
+            /* EFER has to keep its intercept whatever the watch says, and an
+               MSR that was never in the bitmap has nothing to clear. */
+            if (inBitmap && (Msr != MSR_EFER || !STEALTHV_HIDE_EFER))
+            {
+                SvClearMsrIntercept((UINT8*)g_Msrpm, Msr);
+            }
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (!Enable)
+    {
+        return STATUS_NOT_FOUND;
+    }
+    if (g_MsrWatchCount >= SVMHV_MAX_MSR_WATCHES)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (inBitmap)
+    {
+        SvSetMsrIntercept((UINT8*)g_Msrpm, Msr);
+    }
+    g_MsrWatch[g_MsrWatchCount] = (LONG)Msr;
+    InterlockedIncrement(&g_MsrWatchCount);
+
+    for (i = 0; i < (LONG)g_CpuCount; i++)
+    {
+        if (g_Cpus[i] != NULL)
+        {
+            g_Cpus[i]->GuestVmcb.Control.InterceptVector3 |= SVM_INTERCEPT_MSR;
+            g_Cpus[i]->GuestVmcb.Control.VmcbClean = 0;
+        }
+    }
+    SvSyncTlbFlush();
+    return STATUS_SUCCESS;
+}
+
+/*
+ * The same for an I/O port.  The IOPM is shared too, but the IOIO intercept is
+ * off by default - the bitmap has been allocated and zeroed since this driver
+ * was written and nothing has ever set a bit in it.
+ */
+NTSTATUS SvWatchIoPort(_In_ UINT32 Port, _In_ BOOLEAN Enable)
+{
+    LONG i;
+
+    if (g_Iopm == NULL || Port > 0xFFFF)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    for (i = 0; i < g_IoWatchCount; i++)
+    {
+        if ((UINT32)g_IoWatch[i] == Port)
+        {
+            if (Enable)
+            {
+                return STATUS_SUCCESS;
+            }
+            g_IoWatch[i] = g_IoWatch[g_IoWatchCount - 1];
+            InterlockedDecrement(&g_IoWatchCount);
+            SvSetPortIntercept(Port, FALSE);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (!Enable)
+    {
+        return STATUS_NOT_FOUND;
+    }
+    if (g_IoWatchCount >= SVMHV_MAX_IO_WATCHES)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    SvSetPortIntercept(Port, TRUE);
+    g_IoWatch[g_IoWatchCount] = (LONG)Port;
+    InterlockedIncrement(&g_IoWatchCount);
+
+    for (i = 0; i < (LONG)g_CpuCount; i++)
+    {
+        if (g_Cpus[i] != NULL)
+        {
+            g_Cpus[i]->GuestVmcb.Control.InterceptVector3 |= SVM_INTERCEPT_IOIO;
+            g_Cpus[i]->GuestVmcb.Control.VmcbClean = 0;
+        }
+    }
+    SvSyncTlbFlush();
+    return STATUS_SUCCESS;
+}
+
 /* ---------------------------------------------------------- segments */
 
 static VMCB_SEGMENT SvBuildSegment(_In_ UINT16 Selector, _In_ UINT64 GdtBase)
@@ -452,6 +738,21 @@ static VOID SvHandleMsr(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context
             Context->Rdx = (UINT32)(value >> 32);
         }
 
+        /*
+         * Recorded here as well as below, because this branch returns without
+         * reaching the common path - which is exactly the mistake that made
+         * "watch EFER" the one MSR watch that silently did nothing, and EFER is
+         * the MSR somebody looking for this driver is most likely to read.
+         * What goes in the record is the value with SVME already masked: the
+         * point is what the guest saw, not what the register holds.
+         */
+        if (SvIsMsrWatched(msr))
+        {
+            SvTraceRegister(SVMHV_TRACE_MSR, vmcb->StateSave.Rip,
+                            vmcb->StateSave.Cr3, Cpu->Index,
+                            msr, value, isWrite ? 1u : 0u, 8, 0);
+        }
+
         SvAdvanceRip(vmcb, 2);
         return;
     }
@@ -467,7 +768,8 @@ static VOID SvHandleMsr(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context
     {
         if (isWrite)
         {
-            __writemsr(msr, ((UINT64)(UINT32)Context->Rdx << 32) | (UINT32)Context->Rax);
+            value = ((UINT64)(UINT32)Context->Rdx << 32) | (UINT32)Context->Rax;
+            __writemsr(msr, value);
         }
         else
         {
@@ -482,6 +784,21 @@ static VOID SvHandleMsr(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context
            #GP handler. */
         SvInjectException(vmcb, SVM_EXCEPTION_GP, TRUE);
         return;
+    }
+
+    /*
+     * Recorded after the access, so a read carries what it actually returned
+     * rather than what the guest was about to be told.  The test is a scan of
+     * at most sixteen aligned words and only runs once the MSR has been dealt
+     * with, so an unwatched MSR - which is nearly all of them, and there are
+     * two hundred thousand a second of those under a parent hypervisor - pays
+     * for the scan and nothing else.
+     */
+    if (SvIsMsrWatched(msr))
+    {
+        SvTraceRegister(SVMHV_TRACE_MSR, vmcb->StateSave.Rip,
+                        vmcb->StateSave.Cr3, Cpu->Index,
+                        msr, value, isWrite ? 1u : 0u, 8, 0);
     }
 
     SvAdvanceRip(vmcb, 2);
@@ -895,6 +1212,18 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
         SvWatchStepEnd(Cpu, TRUE);
     }
 
+    /*
+     * The same for an I/O step, and it matters more here: the port is unarmed
+     * while the window is open, so leaving one behind would silently stop the
+     * watch rather than merely delaying a record.
+     */
+    if (Cpu->Step.Reason == SVMHV_STEP_IO &&
+        vmcb->Control.ExitCode != VMEXIT_EXCEPTION_DB)
+    {
+        SvSetPortIntercept(Cpu->Step.Port, TRUE);
+        SvStepDrain(Cpu);
+    }
+
     switch (vmcb->Control.ExitCode)
     {
     case VMEXIT_MSR:
@@ -934,8 +1263,16 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
                that has been waiting for it, and re-arm the watch. */
             SvWatchStepEnd(Cpu, FALSE);
         }
+        else if (reason == SVMHV_STEP_IO)
+        {
+            SvIoStepEnd(Cpu);
+        }
         break;
     }
+
+    case VMEXIT_IOIO:
+        SvHandleIoPort(Cpu, Context);
+        break;
 
     /*
      * Only intercepted while stepping, and only so that the trap flag we set

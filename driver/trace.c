@@ -1218,6 +1218,33 @@ VOID SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
     SvTracePublish(record, sequence);
 }
 
+VOID SvTraceRegister(_In_ UINT32 Type, _In_ UINT64 Rip, _In_ UINT64 Cr3,
+                     _In_ UINT32 Processor, _In_ UINT64 Which,
+                     _In_ UINT64 Value, _In_ UINT32 IsWrite,
+                     _In_ UINT32 Width, _In_ UINT64 Raw)
+{
+    UINT64 sequence;
+    SVMHV_TRACE_RECORD* record = SvTraceClaim(&sequence);
+
+    if (record == NULL)
+    {
+        return;
+    }
+
+    record->Tsc          = __rdtsc();
+    record->Rip          = Rip;
+    record->Cr3          = Cr3;
+    record->Type         = Type;
+    record->Processor    = Processor;
+    record->ErrorCode    = Raw;
+    record->Arguments[0] = Which;
+    record->Arguments[1] = Value;
+    record->Arguments[2] = IsWrite;
+    record->Arguments[3] = Width;
+
+    SvTracePublish(record, sequence);
+}
+
 VOID SvTraceWatchComplete(_Inout_ SVMHV_WATCH_PENDING* Pending)
 {
     SVMHV_TRACE_RECORD* record = Pending->Record;

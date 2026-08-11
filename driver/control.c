@@ -346,6 +346,15 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
         g_Control.Request.MemoryReturned = SvCyclePowerTransition();
         return STATUS_SUCCESS;
 
+    /* MemoryAddress is the register or port, MemoryLength 1 to arm. */
+    case SVMHV_CMD_WATCH_MSR:
+        return SvWatchMsr((UINT32)g_Control.Request.MemoryAddress,
+                          g_Control.Request.MemoryLength != 0);
+
+    case SVMHV_CMD_WATCH_IO:
+        return SvWatchIoPort((UINT32)g_Control.Request.MemoryAddress,
+                             g_Control.Request.MemoryLength != 0);
+
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
     }

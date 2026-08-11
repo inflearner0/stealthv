@@ -150,6 +150,17 @@
  */
 #define VMEXIT_PUSHF            0x070
 #define VMEXIT_POPF             0x071
+
+/* An I/O port the IOPM says to trap.  EXITINFO1 describes the access. */
+#define VMEXIT_IOIO             0x07B
+
+#define IOIO_TYPE_IN            (1u << 0)   /* clear means OUT              */
+#define IOIO_STRING             (1u << 2)   /* INS/OUTS                     */
+#define IOIO_REP                (1u << 3)
+#define IOIO_SIZE_8             (1u << 4)
+#define IOIO_SIZE_16            (1u << 5)
+#define IOIO_SIZE_32            (1u << 6)
+#define IOIO_PORT_SHIFT         16
 #define VMEXIT_VMRUN            0x080
 #define VMEXIT_VMMCALL          0x081
 #define VMEXIT_VMLOAD           0x082
@@ -188,6 +199,7 @@
 #define SVM_INTERCEPT_POPF      (1u << 17)
 #define SVM_INTERCEPT_CPUID     (1u << 18)
 #define SVM_INTERCEPT_INVLPGA   (1u << 26)
+#define SVM_INTERCEPT_IOIO      (1u << 27)
 #define SVM_INTERCEPT_MSR       (1u << 28)
 
 /* Control area offset 0x010 */

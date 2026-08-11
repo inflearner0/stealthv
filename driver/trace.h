@@ -97,6 +97,18 @@ VOID     SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
                      _In_ UINT32 CodeLength, _In_ BOOLEAN GuestTf);
 
 /*
+ * An MSR or I/O port access that somebody asked to be told about.  One shape
+ * for both because they are the same record with different names for the
+ * fields: Which is the MSR number or the port, Value what moved, IsWrite the
+ * direction, Width the operand size, and Raw whatever the exit information had
+ * that the client might want to decode itself.
+ */
+VOID     SvTraceRegister(_In_ UINT32 Type, _In_ UINT64 Rip, _In_ UINT64 Cr3,
+                         _In_ UINT32 Processor, _In_ UINT64 Which,
+                         _In_ UINT64 Value, _In_ UINT32 IsWrite,
+                         _In_ UINT32 Width, _In_ UINT64 Raw);
+
+/*
  * Where the ring lives, so a client can read it out of driver memory rather than
  * asking for a copy.  The producer counter is an absolute, monotonic cursor;
  * tracking what has already been seen, and noticing when it has been lapped,

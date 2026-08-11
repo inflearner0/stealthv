@@ -1603,6 +1603,8 @@ static void Usage(void)
         "  svmhvctl translate <address> [pid]\n"
         "  svmhvctl write <address> <hexbytes> [pid]\n"
         "  svmhvctl watch <target> write|access\n"
+        "  svmhvctl watchmsr <msr> [on|off]\n"
+        "  svmhvctl watchio  <port> [on|off]\n"
         "  svmhvctl unhook <target>\n\n"
         "Hook options, after the positional arguments:\n"
         "  --process NAME        only when NAME is the current process\n"
@@ -1939,6 +1941,29 @@ int main(int argc, char** argv)
         }
 
         printf("pages=%u\n", pages);
+        return 0;
+    }
+
+    /*
+     * Arm or disarm a register or port watch.  The value rides in the memory
+     * address field and the on/off flag in the length; see SVMHV_CMD_WATCH_MSR.
+     */
+    if ((_stricmp(argv[1], "watchmsr") == 0 ||
+         _stricmp(argv[1], "watchio") == 0) && argc >= 3)
+    {
+        const int isMsr = (_stricmp(argv[1], "watchmsr") == 0);
+        unsigned char data[REQ_MEM_MAX];
+        unsigned int returned = 0;
+        const unsigned __int64 which = strtoull(argv[2], NULL, 16);
+        const unsigned int on =
+            (argc >= 4 && _stricmp(argv[3], "off") == 0) ? 0u : 1u;
+
+        if (!SubmitMemory(isMsr ? SVMHV_CMD_WATCH_MSR : SVMHV_CMD_WATCH_IO,
+                          which, on, 0, NULL, data, &returned))
+        {
+            return 2;
+        }
+        printf("%s=0x%llx\narmed=%u\n", isMsr ? "msr" : "port", which, on);
         return 0;
     }
 

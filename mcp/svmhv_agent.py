@@ -250,7 +250,45 @@ OPTION_BITS = [
 ]
 KIND_NAMES = {0: "exec", 1: "write-watch", 2: "access-watch"}
 ACTION_NAMES = {0: "trace", 1: "detour", 2: "shellcode"}
-TRACE_TYPES = {0: "exec", 1: "write", 2: "access", 3: "return", 4: "step"}
+TRACE_TYPES = {0: "exec", 1: "write", 2: "access", 3: "return", 4: "step",
+               5: "msr", 6: "io"}
+
+# The model-specific registers worth naming on sight. Not a complete list and
+# not meant to be: these are the ones that turn up when something is looking
+# for a hypervisor, or is talking to the local APIC, and seeing the name rather
+# than the number is the difference between reading a trace and decoding one.
+MSR_NAMES = {
+    0x0000001B: "IA32_APIC_BASE",
+    0x0000003A: "IA32_FEATURE_CONTROL",
+    0x000000C0000080: "EFER",
+    0xC0000080: "EFER",
+    0xC0000081: "STAR",
+    0xC0000082: "LSTAR",
+    0xC0000083: "CSTAR",
+    0xC0000084: "SFMASK",
+    0xC0000100: "FS_BASE",
+    0xC0000101: "GS_BASE",
+    0xC0000102: "KERNEL_GS_BASE",
+    0xC0000103: "TSC_AUX",
+    0xC0010114: "VM_CR",
+    0xC0010117: "VM_HSAVE_PA",
+    0x00000277: "IA32_PAT",
+    0x000001D9: "IA32_DEBUGCTL",
+    0x00000010: "IA32_TIME_STAMP_COUNTER",
+    0x000000E7: "IA32_MPERF",
+    0x000000E8: "IA32_APERF",
+}
+
+
+def msr_name(number: int) -> str:
+    name = MSR_NAMES.get(number)
+    if name:
+        return f"{number:#x} ({name})"
+    if 0x40000000 <= number <= 0x400000FF:
+        # Hyper-V's synthetic range. The EOI register in particular is written
+        # on every interrupt, which is where this driver's exit rate comes from.
+        return f"{number:#x} (Hyper-V synthetic)"
+    return f"{number:#x}"
 EXIT_NAMES = {
     0x072: "CPUID", 0x07A: "INVLPGA", 0x07C: "MSR", 0x080: "VMRUN",
     0x081: "VMMCALL", 0x082: "VMLOAD", 0x083: "VMSAVE", 0x084: "STGI",
@@ -478,6 +516,28 @@ def tool_trace(count: int = 40) -> str:
                 f"[{row.get('seq')}] hook {row.get('hook')} cpu{row.get('cpu')} "
                 f"RETURNED {row.get('a0')} after {cycles:,} cycles, "
                 f"to {symbolize(int(row.get('ret', '0'), 0))}")
+        elif kind == 5:
+            written = int(row.get("a2", "0"), 0)
+            lines.append(
+                f"[{row.get('seq')}] cpu{row.get('cpu')} "
+                f"{'wrmsr' if written else 'rdmsr'} "
+                f"{msr_name(int(row.get('a0', '0'), 0))} "
+                f"= {int(row.get('a1', '0'), 0):#x}  "
+                f"from {symbolize(int(row.get('rip', '0'), 0))}")
+        elif kind == 6:
+            written = int(row.get("a2", "0"), 0)
+            width = int(row.get("a3", "1"), 0)
+            raw = int(row.get("err", "0"), 0)
+            flags = [n for b, n in ((4, "string"), (8, "rep")) if raw & b]
+            # An IN has no value yet when it is trapped - the instruction has
+            # not run - so say nothing rather than print the accumulator.
+            value = (f" = {int(row.get('a1', '0'), 0):#x}" if written else "")
+            lines.append(
+                f"[{row.get('seq')}] cpu{row.get('cpu')} "
+                f"{'out' if written else 'in'}{width * 8} "
+                f"port {int(row.get('a0', '0'), 0):#06x}{value}"
+                + (f" [{'|'.join(flags)}]" if flags else "") +
+                f"  from {symbolize(int(row.get('rip', '0'), 0))}")
         elif kind == 4:
             # A single step. There is no hook and no faulting address: the
             # whole record is "this instruction was about to run".
@@ -651,6 +711,38 @@ def tool_trace_summary(count: int = 200) -> str:
 def tool_trace_reset() -> str:
     status = as_int(pairs(ctl("trace-reset")), "status", -1)
     return "trace ring reset" if status == 0 else f"failed: {status:#010x}"
+
+
+def tool_watch_msr(msr: str, enabled: bool = True) -> str:
+    """Trap a model-specific register and record every access."""
+    number = hexarg(msr)
+    result = pairs(ctl("watchmsr", number, "on" if enabled else "off"))
+    status = as_int(result, "status", 0)
+    if status:
+        return f"failed: {status & 0xFFFFFFFF:#010x}"
+    if not enabled:
+        return f"no longer watching msr {msr_name(int(number, 16))}"
+    return (f"watching msr {msr_name(int(number, 16))}\n"
+            f"Reads and writes both. The MSR intercept is on for the whole "
+            f"machine either way when EFER is being hidden, so this costs a "
+            f"scan of the watch list per MSR exit and nothing else.")
+
+
+def tool_watch_io(port: str, enabled: bool = True) -> str:
+    """Trap an I/O port and record every IN or OUT."""
+    number = hexarg(port)
+    result = pairs(ctl("watchio", number, "on" if enabled else "off"))
+    status = as_int(result, "status", 0)
+    if status:
+        return f"failed: {status & 0xFFFFFFFF:#010x}"
+    if not enabled:
+        return f"no longer watching port {int(number, 16):#06x}"
+    return (f"watching port {int(number, 16):#06x}\n"
+            f"The instruction is not emulated - the port is unarmed for one "
+            f"single step and the bit goes back afterwards - so INS and OUTS "
+            f"with a repeat prefix behave exactly as they would unwatched. An "
+            f"IN is recorded without a value, because when it is trapped it "
+            f"has not read anything yet.")
 
 
 def tool_step(count: int = 16) -> str:
@@ -5465,6 +5557,46 @@ TOOLS = [
                 "description": "how many newest records to summarise, 1-200"}},
         },
         "handler": lambda a: tool_trace_summary(int(a.get("count", 200))),
+    },
+    {
+        "name": "svmhv_watch_msr",
+        "description":
+            "Trap a model-specific register and record every read and write: "
+            "which register, the value, and where from. The MSRPM has been "
+            "there since the driver could hide EFER; this is the first way to "
+            "ask it for anything. Use it to see a driver program hardware, or "
+            "to catch code probing IA32_FEATURE_CONTROL and friends looking "
+            "for a hypervisor.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "msr": {"type": "string",
+                        "description": "MSR number in hex, e.g. c0000080"},
+                "enabled": {"type": "boolean",
+                            "description": "false to stop watching"},
+            },
+            "required": ["msr"],
+        },
+        "handler": lambda a: tool_watch_msr(a["msr"], a.get("enabled", True)),
+    },
+    {
+        "name": "svmhv_watch_io",
+        "description":
+            "Trap an I/O port and record every IN and OUT - port, value, "
+            "width and where from. The instruction is not emulated: the port "
+            "is unarmed for exactly one single step and re-armed afterwards, "
+            "so string and repeated forms behave as they would unwatched.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "port": {"type": "string",
+                         "description": "port number in hex, e.g. 3f8"},
+                "enabled": {"type": "boolean",
+                            "description": "false to stop watching"},
+            },
+            "required": ["port"],
+        },
+        "handler": lambda a: tool_watch_io(a["port"], a.get("enabled", True)),
     },
     {
         "name": "svmhv_step",

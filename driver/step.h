@@ -59,6 +59,18 @@ struct _VIRTUAL_CPU;
 #define SVMHV_STEP_TRACE    2
 
 /*
+ * One instruction to let a trapped I/O access happen.
+ *
+ * Same shape as the watchpoint: the IN or OUT did not execute, so the port is
+ * unarmed in the IOPM, the instruction is allowed through, and the bit goes
+ * back on the #DB.  Emulating the access instead was the alternative and it is
+ * a much worse one - INS and OUTS with a REP prefix are a memory copy and a
+ * loop, and getting either wrong writes to the wrong place or hangs the device.
+ * Letting the processor do it is exact by construction.
+ */
+#define SVMHV_STEP_IO       4
+
+/*
  * Not stepping any more, but the trap flag we set may still be in flight.
  *
  * An interrupt delivered while a window is open pushes RFLAGS - with our TF in
@@ -77,7 +89,7 @@ struct _VIRTUAL_CPU;
  * arrive is swallowed, TF forced back to the guest's own value, and everything
  * dropped.  One stale exception is all there can ever be.
  */
-#define SVMHV_STEP_DRAIN    3
+#define SVMHV_STEP_DRAIN    5
 
 /*
  * The most instructions one arm may ask for.  A bound rather than a policy: a
@@ -109,6 +121,9 @@ typedef struct _SVMHV_STEP_STATE
 
     /* SVMHV_STEP_WATCH: the record to finish and the hook that asked. */
     UINT32  HookId;
+
+    /* SVMHV_STEP_IO: the port to put back in the IOPM afterwards. */
+    UINT32  Port;
 } SVMHV_STEP_STATE;
 
 /*

@@ -247,6 +247,13 @@ VOID     SvFillFatalExit(_Out_ SVMHV_FATAL_EXIT* Fatal);
 
 /* The last SVMHV_FATAL_RING_ENTRIES of them, with the total ever recorded. */
 VOID     SvFillFatalRing(_Out_ SVMHV_FATAL_RING* Ring);
+
+/*
+ * Trap an MSR or an I/O port and record every access.  PASSIVE_LEVEL: both
+ * broadcast an exit so the intercept is in force before they return.
+ */
+NTSTATUS SvWatchMsr(_In_ UINT32 Msr, _In_ BOOLEAN Enable);
+NTSTATUS SvWatchIoPort(_In_ UINT32 Port, _In_ BOOLEAN Enable);
 BOOLEAN  SvTakeFatalExitReport(_Out_ SVMHV_FATAL_EXIT* Fatal);
 
 /*

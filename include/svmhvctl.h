@@ -340,6 +340,25 @@ typedef struct _SVMHV_HOOK_LIST
  */
 #define SVMHV_TRACE_STEP        4
 
+/*
+ * An MSR the caller asked to be told about.  Arguments[0] is the MSR number,
+ * Arguments[1] the value read or written, and Arguments[2] is 1 for a write.
+ *
+ * The MSRPM has been there since the driver could hide EFER; what was missing
+ * was any way to ask it for anything.  A driver talking to hardware through
+ * model-specific registers - or probing IA32_FEATURE_CONTROL and friends to
+ * work out whether it is being watched - is invisible without this.
+ */
+#define SVMHV_TRACE_MSR         5
+
+/*
+ * An I/O port access.  Arguments[0] is the port, Arguments[1] the value for a
+ * non-string access, Arguments[2] is 1 for a write (OUT), and Arguments[3] the
+ * operand size in bytes.  ErrorCode carries the raw IOIO exit information, so
+ * a client can see the string and repeat bits for itself.
+ */
+#define SVMHV_TRACE_IO          6
+
 typedef struct _SVMHV_TRACE_RECORD
 {
     UINT64 Sequence;
@@ -619,6 +638,22 @@ typedef struct _SVMHV_SNAPSHOT
 #define SVMHV_CMD_SYMLINKS      12
 #define SVMHV_CMD_CALLBACK_PROBE 13
 #define SVMHV_CMD_POWER_CYCLE   14
+
+/*
+ * Trap an MSR, or an I/O port, and record every access.
+ *
+ * Both take their arguments in the memory fields rather than in a block of
+ * their own: MemoryAddress is the MSR number or the port, and MemoryLength is
+ * 1 to arm and 0 to disarm.  Reusing them costs nothing and keeps every offset
+ * above unchanged, which matters more here than tidiness - clients hardcode
+ * them.
+ */
+#define SVMHV_CMD_WATCH_MSR     15
+#define SVMHV_CMD_WATCH_IO      16
+
+/* How many of each can be armed at once. */
+#define SVMHV_MAX_MSR_WATCHES   16
+#define SVMHV_MAX_IO_WATCHES    16
 
 typedef struct _SVMHV_CONTROL
 {
