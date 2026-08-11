@@ -30,6 +30,7 @@ port as equivalent to kernel access on that machine.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -37,10 +38,31 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CTL = r"C:\lab\svmhvctl.exe"
 PROTOCOL_VERSION = "2024-11-05"
+# Every interface, and no authentication, on purpose.  This is a lab
+# instrument that a model on another machine has to be able to reach without a
+# credential dance; the isolated switch is the boundary, not the bind address.
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8765
+
+# The agent is deliberately dependency-free, but it is still a network parser
+# in front of a kernel control surface.  Keep one request bounded even when a
+# client has connected successfully but is otherwise malformed or buggy.  These
+# are limits on a single malformed request, not a gate on who may call.
+MAX_REQUEST_BODY_BYTES = 1 << 20             # 1 MiB is ample for MCP tools.
+MAX_BATCH_REQUESTS = 32
+REQUEST_READ_TIMEOUT_SECONDS = 15
+
+# Public PDBs can be large, but an unbounded response or cache file is not a
+# reasonable trade for a symbol name.  The parser below keeps the same limit.
+MAX_PDB_BYTES = 512 << 20
+PDB_DOWNLOAD_TIMEOUT_SECONDS = 60
+PDB_PROVENANCE_SUFFIX = ".provenance.json"
 
 # Subcommand names, hex addresses, lengths, mode words, and the option strings
 # built by hook_options - which is why the dot (notepad.exe) and the colon
@@ -74,13 +96,23 @@ def ctl(*arguments: str) -> str:
             raise CtlError(f"{CTL} is not there")
         except subprocess.TimeoutExpired:
             raise CtlError("svmhvctl did not finish within 60s")
+        except OSError as error:
+            raise CtlError(f"could not run {CTL}: {error}")
 
     text = (done.stdout or "") + (done.stderr or "")
+    # Ordered by how useful the message is.  "Not loaded" is the overwhelmingly
+    # common failure and it exits non-zero, so testing the exit code first would
+    # replace the one diagnosis that says what to do with a number.
     if "present=0" in text or "is not loaded" in text:
         raise CtlError(
             "the hypervisor did not answer the control leaf: svmhv is not loaded, "
             "or was built with STEALTHV_CONTROL_INTERFACE 0"
         )
+    if done.returncode:
+        detail = text.strip()
+        raise CtlError(
+            f"svmhvctl exited with {done.returncode}"
+            + (f": {detail}" if detail else ""))
     return text
 
 
@@ -533,7 +565,8 @@ def tool_trace_reset() -> str:
     return "trace ring reset" if status == 0 else f"failed: {status:#010x}"
 
 
-def hook_target(target: str, prolog: int | None) -> tuple[str, str, str]:
+def hook_target(target: str, prolog: int | None,
+                in_process: int = 0) -> tuple[str, str, str]:
     """Resolve a target and settle on a prologue length.
 
     Both halves exist because both are things a caller gets wrong. The target
@@ -543,12 +576,12 @@ def hook_target(target: str, prolog: int | None) -> tuple[str, str, str]:
     to 14 and hoped for. An explicit length is still honoured; a caller who has
     disassembled the function themselves outranks this.
     """
-    address = resolve(target)
+    address = resolve(target, in_process)
     note = ""
 
     if prolog is None:
         try:
-            computed = safe_prolog_length(read_bytes(address, 64))
+            computed = safe_prolog_length(read_bytes(address, 64, in_process))
         except (CtlError, DecodeError) as error:
             raise CtlError(
                 f"could not work out a safe prologue for {target}: {error}. "
@@ -562,7 +595,8 @@ def hook_target(target: str, prolog: int | None) -> tuple[str, str, str]:
 
 def tool_hook_trace(target: str, prolog_length: int | None = None,
                     **options) -> str:
-    address, prolog, note = hook_target(target, prolog_length)
+    target_pid = int(options.get("in_process") or 0)
+    address, prolog, note = hook_target(target, prolog_length, target_pid)
     extra = hook_options(**options)
     return hook_result(
         ctl("hook-trace", address, prolog, *extra),
@@ -571,10 +605,11 @@ def tool_hook_trace(target: str, prolog_length: int | None = None,
 
 def tool_hook_detour(target: str, detour: str, prolog_length: int | None = None,
                      **options) -> str:
-    address, prolog, note = hook_target(target, prolog_length)
+    target_pid = int(options.get("in_process") or 0)
+    address, prolog, note = hook_target(target, prolog_length, target_pid)
     extra = hook_options(**options)
     return hook_result(
-        ctl("hook-detour", address, prolog, f"{resolve(detour):x}", *extra),
+        ctl("hook-detour", address, prolog, f"{resolve(detour, target_pid):x}", *extra),
         f"detoured {target} -> {detour}{note}")
 
 
@@ -611,7 +646,8 @@ def tool_hook_shellcode(target: str, shellcode_hex: str = "", asm: str = "",
         return "give asm, or shellcode_hex as an even number of hex digits"
     if len(cleaned) // 2 > 1024:
         return f"shellcode is {len(cleaned) // 2} bytes; the limit is 1024"
-    address, prolog, note = hook_target(target, prolog_length)
+    target_pid = int(options.get("in_process") or 0)
+    address, prolog, note = hook_target(target, prolog_length, target_pid)
     extra = hook_options(**options)
     outcome = hook_result(
         ctl("hook-shellcode", address, prolog, cleaned, *extra),
@@ -627,7 +663,8 @@ def tool_watch(target: str, mode: str = "write", **options) -> str:
     if mode not in ("write", "access"):
         return "mode must be 'write' or 'access'"
     extra = hook_options(**options)
-    return hook_result(ctl("watch", f"{resolve(target):x}", mode, *extra),
+    target_pid = int(options.get("in_process") or 0)
+    return hook_result(ctl("watch", f"{resolve(target, target_pid):x}", mode, *extra),
                        f"{mode} watch on the page holding {target}")
 
 
@@ -644,12 +681,15 @@ def tool_hook_many(module: str, contains: str, limit: int = 24,
     be decoded is skipped and named rather than hooked with a guessed length.
     """
     limit = max(1, min(int(limit), 64))
-    resolved = module_by_name(module)
+    target_pid = int(options.get("in_process") or 0)
+    resolved = process_module_by_name(target_pid, module) if target_pid \
+        else module_by_name(module)
     if resolved is None:
-        return f"no loaded module called {module!r}"
+        return (f"no module called {module!r} in pid {target_pid}" if target_pid
+                else f"no loaded module called {module!r}")
 
     wanted = contains.lower()
-    targets = [(a, n) for a, n in exports(resolved["base"])
+    targets = [(a, n) for a, n in exports(resolved["base"], target_pid)
                if wanted in n.lower()]
     if not targets:
         return f"{resolved['name']} exports nothing matching {contains!r}"
@@ -658,7 +698,7 @@ def tool_hook_many(module: str, contains: str, limit: int = 24,
     installed, skipped = [], []
     for address, name in targets[:limit]:
         try:
-            prolog = safe_prolog_length(read_bytes(address, 64))
+            prolog = safe_prolog_length(read_bytes(address, 64, target_pid))
         except (CtlError, DecodeError) as error:
             skipped.append(f"{name}: {error}")
             continue
@@ -695,7 +735,8 @@ def tool_watch_range(target: str, size: int, mode: str = "write",
         return "mode must be 'write' or 'access'"
     size = max(1, min(int(size), 64 * 4096))
 
-    start = resolve(target)
+    target_pid = int(options.get("in_process") or 0)
+    start = resolve(target, target_pid)
     first = start & ~0xFFF
     last = (start + size - 1) & ~0xFFF
     pages = list(range(first, last + 0x1000, 0x1000))
@@ -747,10 +788,10 @@ def tool_unhook_all() -> str:
     return "\n".join(lines)
 
 
-def tool_unhook(target: str) -> str:
+def tool_unhook(target: str, pid: int = 0) -> str:
     # Symbols everywhere a target is accepted, or the tool that installed a hook
     # by name cannot remove it by the same name.
-    status = as_int(pairs(ctl("unhook", f"{resolve(target):x}")), "status", -1)
+    status = as_int(pairs(ctl("unhook", f"{resolve(target, pid):x}")), "status", -1)
     return (f"removed the hook on {target}" if status == 0
             else f"remove failed: {status & 0xFFFFFFFF:#010x}")
 
@@ -1838,7 +1879,7 @@ def tool_write(address: str, hex_bytes: str, pid: int = 0) -> str:
 SYMBOL_MAX_OFFSET = 0x2000
 
 _modules_cache: list[dict] = []
-_exports_cache: dict[int, list[tuple[int, str]]] = {}
+_exports_cache: dict[object, list[tuple[int, str]]] = {}
 
 
 def read_bytes(address: int, length: int, pid: int = 0) -> bytes:
@@ -1875,7 +1916,7 @@ def modules(refresh: bool = False) -> list[dict]:
 _modules_fetched = 0.0
 
 
-def module_for(address: int) -> dict | None:
+def module_for(address: int, pid: int = 0) -> dict | None:
     """Which loaded module an address belongs to.
 
     Refreshes once on a miss.  The list is cached because every symbolized
@@ -1884,6 +1925,12 @@ def module_for(address: int) -> dict | None:
     before that happened reports "not inside any loaded module" for addresses
     that plainly are.  A miss is the only reliable signal that it is stale.
     """
+    if pid:
+        for module in process_modules(int(pid)):
+            if module["base"] <= address < module["base"] + module["size"]:
+                return module
+        return None
+
     global _modules_fetched
 
     for module in modules():
@@ -1931,15 +1978,17 @@ def known_symbols(base: int) -> list[tuple[int, str]]:
                 try:
                     path = fetch_pdb(base)
                     _attach_pdb(base, path)
-                except Exception:
-                    pass                # exports still work; see svmhv_pdb_info
+                except Exception as error:       # exports still work below
+                    _symbol_failures[base] = str(error)
+                else:
+                    _symbol_failures.pop(base, None)
         if base in _pdb_symbols:
             return _pdb_symbols[base]
 
     return exports(base)
 
 
-def exports(base: int) -> list[tuple[int, str]]:
+def exports(base: int, pid: int = 0) -> list[tuple[int, str]]:
     """Every exported name in the image at `base`, as (address, name).
 
     Parsed straight out of the mapped image with the memory read primitive, so
@@ -1948,10 +1997,11 @@ def exports(base: int) -> list[tuple[int, str]]:
     It only sees exports, not private symbols; for the kernel that is still
     several thousand functions and every Nt* entry point.
     """
-    if base in _exports_cache:
-        return _exports_cache[base]
+    cache_key = (base, int(pid)) if pid else base
+    if cache_key in _exports_cache:
+        return _exports_cache[cache_key]
 
-    header = read_bytes(base, 0x400)
+    header = read_bytes(base, 0x400, pid)
     if header[:2] != b"MZ":
         raise CtlError(f"no MZ header at {base:#x}")
 
@@ -1967,7 +2017,7 @@ def exports(base: int) -> list[tuple[int, str]]:
     export_rva = int.from_bytes(header[directory:directory + 4], "little")
     export_size = int.from_bytes(header[directory + 4:directory + 8], "little")
     if export_rva == 0 or export_size == 0:
-        _exports_cache[base] = []
+        _exports_cache[cache_key] = []
         return []
 
     # The export directory and its three arrays are contiguous and usually well
@@ -1976,7 +2026,7 @@ def exports(base: int) -> list[tuple[int, str]]:
     blob = bytearray()
     for offset in range(0, min(export_size, 0x20000), 0x1000):
         blob += read_bytes(base + export_rva + offset,
-                           min(0x1000, export_size - offset))
+                           min(0x1000, export_size - offset), pid)
 
     def dword(at):
         return int.from_bytes(blob[at:at + 4], "little")
@@ -1994,7 +2044,8 @@ def exports(base: int) -> list[tuple[int, str]]:
         out = bytearray()
         wanted = entries * width
         for offset in range(0, wanted, 0x1000):
-            out += read_bytes(base + rva + offset, min(0x1000, wanted - offset))
+            out += read_bytes(base + rva + offset,
+                              min(0x1000, wanted - offset), pid)
         return bytes(out)
 
     names = table(names_rva, count_names, 4)
@@ -2010,7 +2061,7 @@ def exports(base: int) -> list[tuple[int, str]]:
             page = (base + rva) & ~0xFFF
             if page not in pages:
                 try:
-                    pages[page] = read_bytes(page, 0x1000)
+                    pages[page] = read_bytes(page, 0x1000, pid)
                 except CtlError:
                     return ""
             chunk = pages[page][(base + rva) & 0xFFF:]
@@ -2036,47 +2087,65 @@ def exports(base: int) -> list[tuple[int, str]]:
             found.append((base + function_rva, name))
 
     found.sort()
-    _exports_cache[base] = found
+    _exports_cache[cache_key] = found
     return found
 
 
-def resolve(name: str) -> int:
-    """'nt!NtCreateFile', 'ntoskrnl.exe!ZwClose' or a bare hex address."""
+def resolve(name: str, pid: int = 0) -> int:
+    """Resolve a kernel or process-local ``module!symbol`` / hex address."""
     text = name.strip()
     if "!" not in text:
         return int(hexarg(text), 16)
 
     module_name, symbol = text.split("!", 1)
-    module = module_by_name(module_name)
+    symbol_pid = int(pid)
+    module = process_module_by_name(symbol_pid, module_name) if symbol_pid \
+        else module_by_name(module_name)
+    if module is None and symbol_pid:
+        # A user-mode listing still needs to resolve imports/calls into nt.
+        # The target itself may be process-local, but its named callee needn't.
+        module = module_by_name(module_name)
+        symbol_pid = 0
     if module is None:
-        raise CtlError(f"no loaded module called {module_name!r}")
+        where = f" in pid {pid}" if pid else ""
+        raise CtlError(f"no loaded module called {module_name!r}{where}")
 
     offset = 0
     if "+" in symbol:
         symbol, _, plus = symbol.partition("+")
         offset = int(plus, 0)
 
-    for address, export in known_symbols(module["base"]):
+    symbols = exports(module["base"], symbol_pid) if symbol_pid \
+        else known_symbols(module["base"])
+    for address, export in symbols:
         if export.lower() == symbol.lower():
             return address + offset
     raise CtlError(
         f"{module['name']} has no symbol called {symbol!r} "
         + ("(private symbols are loaded, so it is genuinely absent)"
-           if module["base"] in _pdb_symbols else
-           "(only exports are known here; load a PDB for the rest)"))
+           if not symbol_pid and module["base"] in _pdb_symbols else
+           "(only exports are known in this address space)"))
 
 
-def symbolize(address: int) -> str:
+def symbolize(address: int, pid: int = 0) -> str:
     """The inverse: an address as module!symbol+offset, as far as it can."""
     if address == 0:
         return "0"
-    module = module_for(address)
+    module = module_for(address, int(pid)) if pid else module_for(address)
+    symbol_pid = int(pid) if module is not None and pid else 0
+    # User code calls into the kernel constantly.  When the branch leaves the
+    # process module list, retain the kernel name instead of rendering a raw
+    # address just because the original read happened in a process context.
+    if module is None and pid:
+        module = module_for(address)
     if module is None:
         return f"{address:#x}"
 
     best = None
     try:
-        for export_address, name in known_symbols(module["base"]):
+        symbols = exports(module["base"], symbol_pid) if symbol_pid \
+            else known_symbols(module["base"])
+        for export_address, name in symbols:
             if export_address <= address and (best is None
                                               or export_address > best[0]):
                 best = (export_address, name)
@@ -2095,7 +2164,8 @@ def symbolize(address: int) -> str:
     # caller acting on "ntoskrnl!_setjmpex+0x9138" would be misled about what
     # called what. Past the threshold, say where it is and stop claiming to
     # know what it is.
-    if delta > SYMBOL_MAX_OFFSET and module["base"] not in _pdb_symbols:
+    if delta > SYMBOL_MAX_OFFSET and (symbol_pid or
+                                      module["base"] not in _pdb_symbols):
         return f"{module['name']}+{address - module['base']:#x}"
 
     return (f"{module['name']}!{best[1]}"
@@ -2115,23 +2185,26 @@ def tool_modules(filter_text: str = "") -> str:
     return "\n".join(lines)
 
 
-def tool_symbol(name: str) -> str:
-    address = resolve(name)
+def tool_symbol(name: str, pid: int = 0) -> str:
+    address = resolve(name, pid)
     return f"{name} = {address:#x}"
 
 
-def tool_exports(module_name: str, contains: str = "") -> str:
-    module = module_by_name(module_name)
+def tool_exports(module_name: str, contains: str = "", pid: int = 0) -> str:
+    module = process_module_by_name(pid, module_name) if pid \
+        else module_by_name(module_name)
     if module is None:
-        return f"no loaded module called {module_name!r}"
+        return (f"no module called {module_name!r} in pid {pid}" if pid
+                else f"no loaded module called {module_name!r}")
     wanted = contains.lower()
-    found = [(a, n) for a, n in exports(module["base"])
+    found = [(a, n) for a, n in exports(module["base"], pid)
              if not wanted or wanted in n.lower()]
     if not found:
         return f"{module['name']} exports nothing matching {contains!r}"
 
     lines = [f"{len(found)} export(s) in {module['name']} "
-             f"(base {module['base']:#x})", ""]
+             f"(base {module['base']:#x})"
+             + (f" in pid {pid}" if pid else ""), ""]
     for address, name in found[:400]:
         lines.append(f"{address:#018x}  {name}")
     if len(found) > 400:
@@ -2257,6 +2330,102 @@ def readable_name(mangled: str) -> str:
     return "::".join(scopes)
 
 
+def _read_limited_pdb(path: str) -> bytes:
+    """Read one PDB without letting a corrupt cache file exhaust the guest."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as error:
+        raise PdbError(f"could not stat PDB: {error}") from error
+    if size > MAX_PDB_BYTES:
+        raise PdbError(
+            f"PDB is {size:,} bytes; the safety limit is {MAX_PDB_BYTES:,}")
+
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_PDB_BYTES + 1)
+    except OSError as error:
+        raise PdbError(f"could not read PDB: {error}") from error
+    if len(data) > MAX_PDB_BYTES:
+        # Size can change between stat() and read(), especially in a shared
+        # symbol cache.  Refuse the new content rather than parsing a prefix.
+        raise PdbError(f"PDB grew beyond the {MAX_PDB_BYTES:,}-byte safety limit")
+    return data
+
+
+def _pdb_streams(data: bytes):
+    """Return the MSF block reader and stream layout after bounded checks."""
+    if not data.startswith(b"Microsoft C/C++ MSF 7.00"):
+        raise PdbError("not an MSF 7.00 file (an old-format PDB, or not a PDB)")
+    if len(data) < 0x38:
+        raise PdbError("the PDB superblock is too short")
+
+    block_size = int.from_bytes(data[0x20:0x24], "little")
+    directory_bytes = int.from_bytes(data[0x2C:0x30], "little")
+    block_map = int.from_bytes(data[0x34:0x38], "little")
+    if (block_size < 512 or block_size > 0x10000
+            or block_size & (block_size - 1)):
+        raise PdbError(f"implausible block size {block_size}")
+    if not directory_bytes or directory_bytes > MAX_PDB_BYTES:
+        raise PdbError(f"implausible directory size {directory_bytes}")
+
+    block_count = len(data) // block_size
+    if block_count == 0:
+        raise PdbError("the PDB does not contain a complete block")
+
+    def block(index):
+        if not 0 <= index < block_count:
+            raise PdbError(f"PDB refers to block {index}, outside the file")
+        start = index * block_size
+        return data[start:start + block_size]
+
+    # This narrow reader intentionally understands the single block-map form
+    # used by modern public PDBs.  It is bounded before indexing it, so a bogus
+    # directory cannot make the parser allocate or seek arbitrarily.
+    directory_blocks_needed = (directory_bytes + block_size - 1) // block_size
+    if directory_blocks_needed > block_size // 4:
+        raise PdbError("the PDB directory block map is too large")
+    map_bytes = block(block_map)
+    directory_blocks = [
+        int.from_bytes(map_bytes[i * 4:i * 4 + 4], "little")
+        for i in range(directory_blocks_needed)]
+    directory = b"".join(block(index) for index in directory_blocks)
+    directory = directory[:directory_bytes]
+    if len(directory) < 4:
+        raise PdbError("the PDB stream directory is too short")
+
+    count = int.from_bytes(directory[0:4], "little")
+    if count == 0 or count > 0x10000:
+        raise PdbError(f"implausible stream count {count}")
+    sizes_end = 4 + count * 4
+    if sizes_end > len(directory):
+        raise PdbError("the PDB stream-size table is truncated")
+
+    sizes = [int.from_bytes(directory[4 + i * 4:8 + i * 4], "little")
+             for i in range(count)]
+    at = sizes_end
+    streams = []
+    for size in sizes:
+        if size != 0xFFFFFFFF and size > MAX_PDB_BYTES:
+            raise PdbError(f"implausible stream size {size}")
+        needed = 0 if size == 0xFFFFFFFF else \
+            (size + block_size - 1) // block_size
+        if at + needed * 4 > len(directory):
+            raise PdbError("the PDB stream block list is truncated")
+        blocks = [int.from_bytes(directory[at + i * 4:at + i * 4 + 4], "little")
+                  for i in range(needed)]
+        # Validate now, before a consumer starts allocating a stream from it.
+        for index in blocks:
+            block(index)
+        at += needed * 4
+        streams.append((blocks, 0 if size == 0xFFFFFFFF else size))
+    return block, streams
+
+
+def _pdb_stream_bytes(block, stream: tuple[list[int], int]) -> bytes:
+    blocks, size = stream
+    return b"".join(block(index) for index in blocks)[:size]
+
+
 def pdb_public_symbols(path: str) -> list[tuple[int, str, int]]:
     """Public symbols from a PDB, as (segment, name, offset).
 
@@ -2267,55 +2436,12 @@ def pdb_public_symbols(path: str) -> list[tuple[int, str, int]]:
     stream, and the S_PUB32 records in it. Everything else is skipped rather
     than half-parsed.
     """
-    with open(path, "rb") as handle:
-        data = handle.read()
-
-    if not data.startswith(b"Microsoft C/C++ MSF 7.00"):
-        raise PdbError("not an MSF 7.00 file (an old-format PDB, or not a PDB)")
-
-    block_size = int.from_bytes(data[0x20:0x24], "little")
-    directory_bytes = int.from_bytes(data[0x2C:0x30], "little")
-    block_map = int.from_bytes(data[0x34:0x38], "little")
-    if block_size == 0 or block_size & (block_size - 1):
-        raise PdbError(f"implausible block size {block_size}")
-
-    def block(index):
-        start = index * block_size
-        return data[start:start + block_size]
-
-    def stream_from(blocks, size):
-        out = bytearray()
-        for index in blocks:
-            out += block(index)
-        return bytes(out[:size])
-
-    # The directory is itself a stream, described by a list of block numbers.
-    directory_blocks_needed = (directory_bytes + block_size - 1) // block_size
-    map_bytes = block(block_map)
-    directory_blocks = [
-        int.from_bytes(map_bytes[i * 4:i * 4 + 4], "little")
-        for i in range(directory_blocks_needed)]
-    directory = stream_from(directory_blocks, directory_bytes)
-
-    count = int.from_bytes(directory[0:4], "little")
-    if count == 0 or count > 0x10000:
-        raise PdbError(f"implausible stream count {count}")
-
-    sizes = [int.from_bytes(directory[4 + i * 4:8 + i * 4], "little")
-             for i in range(count)]
-    at = 4 + count * 4
-    streams = []
-    for size in sizes:
-        needed = 0 if size == 0xFFFFFFFF else (size + block_size - 1) // block_size
-        blocks = [int.from_bytes(directory[at + i * 4:at + i * 4 + 4], "little")
-                  for i in range(needed)]
-        at += needed * 4
-        streams.append((blocks, 0 if size == 0xFFFFFFFF else size))
+    block, streams = _pdb_streams(_read_limited_pdb(path))
 
     if len(streams) <= 3:
         raise PdbError("no DBI stream")
 
-    dbi = stream_from(*streams[3])
+    dbi = _pdb_stream_bytes(block, streams[3])
     if len(dbi) < 24:
         raise PdbError("the DBI stream is too short to hold a header")
 
@@ -2323,7 +2449,7 @@ def pdb_public_symbols(path: str) -> list[tuple[int, str, int]]:
     if symbol_stream == 0xFFFF or symbol_stream >= len(streams):
         raise PdbError("the DBI header names no symbol stream")
 
-    symbols = stream_from(*streams[symbol_stream])
+    symbols = _pdb_stream_bytes(block, streams[symbol_stream])
 
     found = []
     offset = 0
@@ -2357,43 +2483,12 @@ def pdb_identity(path: str) -> tuple[str, int]:
     there for a different build, and a mismatched PDB does not fail - it names
     functions confidently and wrongly, which is worse than having no names.
     """
-    with open(path, "rb") as handle:
-        data = handle.read()
-
-    if not data.startswith(b"Microsoft C/C++ MSF 7.00"):
-        raise PdbError("not an MSF 7.00 file")
-
-    block_size = int.from_bytes(data[0x20:0x24], "little")
-    directory_bytes = int.from_bytes(data[0x2C:0x30], "little")
-    block_map = int.from_bytes(data[0x34:0x38], "little")
-
-    def block(index):
-        return data[index * block_size:(index + 1) * block_size]
-
-    needed = (directory_bytes + block_size - 1) // block_size
-    map_bytes = block(block_map)
-    directory = b"".join(
-        block(int.from_bytes(map_bytes[i * 4:i * 4 + 4], "little"))
-        for i in range(needed))[:directory_bytes]
-
-    count = int.from_bytes(directory[0:4], "little")
-    sizes = [int.from_bytes(directory[4 + i * 4:8 + i * 4], "little")
-             for i in range(count)]
-    at = 4 + count * 4
-    streams = []
-    for size in sizes:
-        blocks_needed = 0 if size == 0xFFFFFFFF else \
-            (size + block_size - 1) // block_size
-        blocks = [int.from_bytes(directory[at + i * 4:at + i * 4 + 4], "little")
-                  for i in range(blocks_needed)]
-        at += blocks_needed * 4
-        streams.append((blocks, 0 if size == 0xFFFFFFFF else size))
+    block, streams = _pdb_streams(_read_limited_pdb(path))
 
     if len(streams) < 2:
         raise PdbError("no PDB info stream")
 
-    blocks, size = streams[1]
-    info = b"".join(block(i) for i in blocks)[:size]
+    info = _pdb_stream_bytes(block, streams[1])
     if len(info) < 28:
         raise PdbError("the PDB info stream is too short")
 
@@ -2414,6 +2509,111 @@ SYMBOLS_AUTO = True                     # fetch on demand unless turned off
 
 _symbol_attempts: set[int] = set()      # modules already tried, to not retry
 _symbol_lock = threading.Lock()
+_symbol_failures: dict[int, str] = {}
+
+
+def _pdb_cache_paths(info: dict) -> tuple[str, str, str, str]:
+    """Return the validated cache location and server URL for one PDB."""
+    name = os.path.basename(info["name"])
+    guid = str(info["guid"])
+    if (not re.fullmatch(r"[A-Za-z0-9_.-]+\.pdb", name, re.IGNORECASE)
+            or not re.fullmatch(r"[0-9A-Fa-f]{33,64}", guid)):
+        raise CtlError(f"refusing an implausible PDB identity {name!r}/{guid!r}")
+    directory = os.path.join(SYMBOL_CACHE, name, guid)
+    path = os.path.join(directory, name)
+    url = f"{SYMBOL_SERVER}/{name}/{guid}/{name}"
+    return name, directory, path, url
+
+
+def _pdb_sha256(path: str) -> tuple[str, int]:
+    """Hash a PDB while enforcing the same limit as the downloader."""
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_PDB_BYTES:
+                    raise PdbError(
+                        f"PDB exceeds the {MAX_PDB_BYTES:,}-byte safety limit")
+                digest.update(chunk)
+    except OSError as error:
+        raise PdbError(f"could not hash PDB: {error}") from error
+    return digest.hexdigest(), total
+
+
+def _pdb_provenance_path(path: str) -> str:
+    return path + PDB_PROVENANCE_SUFFIX
+
+
+def pdb_provenance(path: str) -> dict | None:
+    """Return a verified-download record when the cache has one."""
+    try:
+        with open(_pdb_provenance_path(path), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _write_pdb_provenance(path: str, info: dict, url: str, source: str,
+                          pdb_guid: str, pdb_age: int,
+                          digest: str, size: int) -> None:
+    """Atomically record exactly what was checked before symbols are used."""
+    record = {
+        "schema": 1,
+        "source": source,
+        "url": url,
+        "fetched_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pdb_name": info["name"],
+        "image_guid": str(info["guid"])[:32].upper(),
+        "image_age": int(info["age"]),
+        "pdb_guid": pdb_guid.upper(),
+        "pdb_age": int(pdb_age),
+        "sha256": digest,
+        "bytes": size,
+    }
+    provenance = _pdb_provenance_path(path)
+    partial = provenance + ".part"
+    try:
+        with open(partial, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(record, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(partial, provenance)
+    except OSError as error:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        raise PdbError(f"could not write PDB provenance: {error}") from error
+
+
+def _verify_pdb_identity(path: str, info: dict, url: str) -> tuple[str, int]:
+    """Ensure a PDB really belongs to the image that asked for it."""
+    guid, age = pdb_identity(path)
+    wanted = str(info["guid"])[:32]
+    if guid.upper() != wanted.upper():
+        raise PdbError(
+            f"the file at {url} identifies as GUID {guid}, not {wanted} - "
+            "it is for a different build and would name things wrongly")
+    return guid, age
+
+
+def _check_cached_pdb(path: str, info: dict, url: str) -> None:
+    """Verify a cache hit too; a stale file is as misleading as a bad download."""
+    guid, age = _verify_pdb_identity(path, info, url)
+    digest, size = _pdb_sha256(path)
+    provenance = pdb_provenance(path)
+    if provenance and provenance.get("sha256") not in (None, digest):
+        raise PdbError(
+            "the cached PDB no longer matches its recorded SHA-256; refusing "
+            "to attach symbols from an altered file")
+    if provenance is None:
+        _write_pdb_provenance(path, info, url, "cache-verified", guid, age,
+                              digest, size)
 
 
 def fetch_pdb(base: int) -> str:
@@ -2424,50 +2624,60 @@ def fetch_pdb(base: int) -> str:
     the one asked for.  That last check is the point: the identity is the
     whole reason to download rather than guess by name.
     """
-    import urllib.request
-
     info = pdb_info(base)
-    name = os.path.basename(info["name"])
-    if not name.lower().endswith(".pdb") or "/" in name or "\\" in name:
-        raise CtlError(f"refusing an implausible pdb name {info['name']!r}")
-
-    directory = os.path.join(SYMBOL_CACHE, name, info["guid"])
-    path = os.path.join(directory, name)
+    _, directory, path, url = _pdb_cache_paths(info)
     if os.path.exists(path):
+        try:
+            _check_cached_pdb(path, info, url)
+        except PdbError as error:
+            raise CtlError(f"refusing cached PDB {path}: {error}") from error
         return path
 
-    url = f"{SYMBOL_SERVER}/{name}/{info['guid']}/{name}"
     os.makedirs(directory, exist_ok=True)
     request = urllib.request.Request(
         url, headers={"User-Agent": "Microsoft-Symbol-Server/10.0"})
 
     partial = path + ".part"
-    with urllib.request.urlopen(request, timeout=60) as response, \
-            open(partial, "wb") as out:
-        out.write(response.read())
-
     try:
-        guid, age = pdb_identity(partial)
-    except PdbError as error:
-        os.remove(partial)
-        raise CtlError(f"{url} did not return a usable PDB: {error}")
+        with urllib.request.urlopen(request, timeout=PDB_DOWNLOAD_TIMEOUT_SECONDS) \
+                as response, open(partial, "wb") as out:
+            declared = response.headers.get("Content-Length")
+            if declared:
+                try:
+                    expected = int(declared)
+                except ValueError as error:
+                    raise PdbError("symbol server sent an invalid Content-Length") \
+                        from error
+                if expected < 0 or expected > MAX_PDB_BYTES:
+                    raise PdbError(
+                        f"symbol server advertised {expected:,} bytes; the "
+                        f"safety limit is {MAX_PDB_BYTES:,}")
 
-    # The GUID, and only the GUID.
-    #
-    # The image's debug directory and the PDB's own header both carry an age,
-    # and they routinely disagree - the server path is built from the image's,
-    # while the PDB counts its own revisions and is often one ahead. Comparing
-    # the two ages rejects correct files: CLFS on this machine asks for age 1
-    # and its PDB says 2. The 128-bit GUID is what identifies the build; the
-    # age is a tiebreaker with nothing to break.
-    wanted = info["guid"][:32]
-    if guid.upper() != wanted.upper():
-        os.remove(partial)
-        raise CtlError(
-            f"the file at {url} identifies as GUID {guid}, not {wanted} - "
-            "it is for a different build and would name things wrongly")
+            total = 0
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_PDB_BYTES:
+                    raise PdbError(
+                        f"symbol server exceeded the {MAX_PDB_BYTES:,}-byte "
+                        "safety limit")
+                out.write(chunk)
 
-    os.replace(partial, path)
+        guid, age = _verify_pdb_identity(partial, info, url)
+        digest, size = _pdb_sha256(partial)
+        os.replace(partial, path)
+        _write_pdb_provenance(path, info, url, "symbol-server", guid, age,
+                              digest, size)
+    except (OSError, PdbError, urllib.error.URLError) as error:
+        raise CtlError(f"could not fetch usable symbols from {url}: {error}") \
+            from error
+    finally:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
     return path
 
 
@@ -2498,6 +2708,11 @@ def load_pdb_symbols(module_name: str, path: str) -> int:
     resolved = module_by_name(module_name)
     if resolved is None:
         raise CtlError(f"no loaded module called {module_name!r}")
+
+    # A supplied path is not trusted merely because it ends in .pdb.  Public
+    # symbols from a different build parse perfectly and are worse than no
+    # symbols, because every later address is labelled with confidence.
+    _verify_pdb_identity(path, pdb_info(resolved["base"]), path)
 
     sections = pe_sections(resolved["base"])
     publics = pdb_public_symbols(path)
@@ -2535,6 +2750,20 @@ def tool_pdb_info(module: str) -> str:
     else:
         state = "symbols: not loaded yet"
 
+    cache_line = "  cache: not downloaded"
+    try:
+        _, _, cache_path, _ = _pdb_cache_paths(info)
+        if os.path.exists(cache_path):
+            provenance = pdb_provenance(cache_path)
+            if provenance:
+                cache_line = (f"  cache: {cache_path} (SHA-256 "
+                              f"{provenance.get('sha256', '?')}, "
+                              f"{provenance.get('source', 'unknown')})")
+            else:
+                cache_line = f"  cache: {cache_path} (unverified metadata)"
+    except CtlError:
+        cache_line = "  cache: identity is not safe to turn into a path"
+
     return "\n".join([
         state,
         "",
@@ -2542,6 +2771,7 @@ def tool_pdb_info(module: str) -> str:
         f"  pdb  : {info['name']}",
         f"  path : {info['full']}",
         f"  guid : {info['guid']}",
+        cache_line,
         "",
         "The symbol server path is built from exactly those three:",
         f"  https://msdl.microsoft.com/download/symbols/"
@@ -2569,7 +2799,7 @@ def tool_symbols_load(module: str, path: str = "") -> str:
 
     try:
         count = load_pdb_symbols(module, path)
-    except (PdbError, OSError) as error:
+    except (CtlError, PdbError, OSError) as error:
         return f"could not read {path}: {error}"
     return (f"{count} symbol(s) loaded for {module} from {path}.\n"
             "These now take precedence over exported names everywhere an "
@@ -2960,9 +3190,11 @@ def process_modules(pid: int) -> list[dict]:
     entry = qword(head)
 
     found = []
+    seen_entries = set()
     for _ in range(256):
-        if entry == 0 or entry == head:
+        if entry == 0 or entry == head or entry in seen_entries:
             break
+        seen_entries.add(entry)
         # LDR_DATA_TABLE_ENTRY: DllBase +0x30, SizeOfImage +0x40,
         # FullDllName +0x48, BaseDllName +0x58 (UNICODE_STRING: len, max, ptr)
         blob = read_bytes(entry, 0x70, pid)
@@ -2977,16 +3209,36 @@ def process_modules(pid: int) -> list[dict]:
         name_length = field(0x58, 2)
         name_buffer = field(0x60)
         name = ""
+        path_length = field(0x48, 2)
+        path_buffer = field(0x50)
         if name_buffer and 0 < name_length <= 512:
             try:
                 name = read_bytes(name_buffer, name_length, pid).decode(
                     "utf-16-le", "replace")
             except CtlError:
                 name = ""
+        path = ""
+        if path_buffer and 0 < path_length <= 4096:
+            try:
+                path = read_bytes(path_buffer, path_length, pid).decode(
+                    "utf-16-le", "replace")
+            except CtlError:
+                path = ""
         if base:
-            found.append({"base": base, "size": size, "name": name or "?"})
+            found.append({"base": base, "size": size, "name": name or "?",
+                          "path": path})
         entry = field(0)                       # InLoadOrderLinks.Flink
     return found
+
+
+def process_module_by_name(pid: int, name: str) -> dict | None:
+    """Find a process image or DLL by its loader name, not kernel modules."""
+    wanted = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for module in process_modules(int(pid)):
+        candidate = module["name"].replace("\\", "/").rsplit("/", 1)[-1]
+        if candidate.lower() == wanted:
+            return module
+    return None
 
 
 def tool_process_modules(pid: int) -> str:
@@ -2996,7 +3248,8 @@ def tool_process_modules(pid: int) -> str:
     lines = [f"{len(found)} module(s) in pid {pid}", ""]
     for module in found:
         lines.append(f"  {module['base']:#018x}  {module['size']:>9,}  "
-                     f"{module['name']}")
+                     f"{module['name']}"
+                     + (f"  {module['path']}" if module.get("path") else ""))
     lines += ["", "The first entry is the executable itself. Its base is what "
               "svmhv_read, svmhv_disassemble and svmhv_watch want as 'pid'."]
     return "\n".join(lines)
@@ -3047,12 +3300,14 @@ def pe_sections(base: int, pid: int = 0) -> list[dict]:
     return found
 
 
-def tool_sections(module: str) -> str:
-    resolved = module_by_name(module)
+def tool_sections(module: str, pid: int = 0) -> str:
+    resolved = process_module_by_name(pid, module) if pid else module_by_name(module)
     if resolved is None:
-        return f"no loaded module called {module!r}"
-    found = pe_sections(resolved["base"])
-    lines = [f"{resolved['name']} at {resolved['base']:#x}", ""]
+        return (f"no module called {module!r} in pid {pid}" if pid
+                else f"no loaded module called {module!r}")
+    found = pe_sections(resolved["base"], pid)
+    lines = [f"{resolved['name']} at {resolved['base']:#x}"
+             + (f" in pid {pid}" if pid else ""), ""]
     for section in found:
         flags = section["characteristics"]
         marks = ("r" if flags & 0x40000000 else "-") + \
@@ -3095,23 +3350,24 @@ def extract_strings(blob: bytes, base: int, minimum: int) -> list[tuple[int, str
 
 
 def tool_strings(module: str, minimum: int = 6, limit: int = 200,
-                 contains: str = "") -> str:
+                 contains: str = "", pid: int = 0) -> str:
     """The classic first look at a binary.
 
     For a driver that exports nothing and whose functions have no names, the
     strings are frequently the only thing that says what it is for - registry
     paths, device names, the text of its own error messages.
     """
-    resolved = module_by_name(module)
+    resolved = process_module_by_name(pid, module) if pid else module_by_name(module)
     if resolved is None:
-        return f"no loaded module called {module!r}"
+        return (f"no module called {module!r} in pid {pid}" if pid
+                else f"no loaded module called {module!r}")
     minimum = max(4, min(int(minimum), 64))
     limit = max(1, min(int(limit), 1000))
 
-    sections = [s for s in pe_sections(resolved["base"])
+    sections = [s for s in pe_sections(resolved["base"], pid)
                 if not (s["characteristics"] & 0x20000000)]   # skip code
     if not sections:
-        sections = pe_sections(resolved["base"])
+        sections = pe_sections(resolved["base"], pid)
 
     found: list[tuple[int, str]] = []
     scanned = 0
@@ -3121,7 +3377,7 @@ def tool_strings(module: str, minimum: int = 6, limit: int = 200,
         start = resolved["base"] + section["rva"]
         size = min(section["size"], 2 << 20)
         scanned += size
-        for page, blob in sorted(dump_range(start, size).items()):
+        for page, blob in sorted(dump_range(start, size, pid).items()):
             found += extract_strings(blob, page, minimum)
 
     wanted = contains.lower()
@@ -3129,6 +3385,7 @@ def tool_strings(module: str, minimum: int = 6, limit: int = 200,
         found = [(a, t) for a, t in found if wanted in t.lower()]
 
     lines = [f"{len(found)} string(s) in {resolved['name']}"
+             + (f" in pid {pid}" if pid else "")
              + (f" matching {contains!r}" if contains else "")
              + (f"; showing {limit}" if len(found) > limit else ""), ""]
     for address, text in found[:limit]:
@@ -3159,13 +3416,15 @@ def tool_search(pattern: str, module: str = "", start: str = "",
             return f"{pair!r} is neither a hex byte nor '??'"
 
     if module:
-        resolved = module_by_name(module)
+        resolved = process_module_by_name(pid, module) if pid else \
+            module_by_name(module)
         if resolved is None:
-            return f"no loaded module called {module!r}"
+            return (f"no module called {module!r} in pid {pid}" if pid
+                    else f"no loaded module called {module!r}")
         begin, span = resolved["base"], min(resolved["size"], 4 << 20)
         where = resolved["name"]
     elif start and size:
-        begin, span = resolve(start), min(int(size), 4 << 20)
+        begin, span = resolve(start, pid), min(int(size), 4 << 20)
         where = start
     else:
         return "give either a module, or a start and a size"
@@ -3183,13 +3442,15 @@ def tool_search(pattern: str, module: str = "", start: str = "",
 
     if not hits:
         return f"no match for {pattern!r} in {where}"
-    lines = [f"{len(hits)} match(es) for {pattern!r} in {where}", ""]
+    lines = [f"{len(hits)} match(es) for {pattern!r} in {where}"
+             + (f" in pid {pid}" if pid else ""), ""]
     for address in hits:
-        lines.append(f"  {address:#018x}  {symbolize(address)}")
+        lines.append(f"  {address:#018x}  {symbolize(address, pid)}")
     return "\n".join(lines)
 
 
-def tool_xrefs(target: str, module: str = "", limit: int = 40) -> str:
+def tool_xrefs(target: str, module: str = "", limit: int = 40,
+               pid: int = 0) -> str:
     """Who reaches this address.
 
     svmhv_disassemble follows calls outwards; this follows them inwards, and
@@ -3199,9 +3460,12 @@ def tool_xrefs(target: str, module: str = "", limit: int = 40) -> str:
     data is a table - a dispatch table, a callback registration, an import.
     """
     limit = max(1, min(int(limit), 200))
-    address = resolve(target)
+    address = resolve(target, pid)
 
-    resolved = module_by_name(module) if module else module_for(address)
+    resolved = (process_module_by_name(pid, module) if pid else module_by_name(module)) \
+        if module else module_for(address, pid)
+    if resolved is None and pid and not module:
+        resolved = module_for(address)
     if resolved is None:
         return ("give a module to search: the target is not inside a loaded "
                 "one, so there is nothing to sweep")
@@ -3210,7 +3474,7 @@ def tool_xrefs(target: str, module: str = "", limit: int = 40) -> str:
     absolute = address.to_bytes(8, "little")
 
     calls, jumps, pointers = [], [], []
-    for page, blob in sorted(dump_range(begin, span).items()):
+    for page, blob in sorted(dump_range(begin, span, pid).items()):
         for offset in range(len(blob)):
             byte = blob[offset]
 
@@ -3228,15 +3492,15 @@ def tool_xrefs(target: str, module: str = "", limit: int = 40) -> str:
         if len(calls) + len(jumps) + len(pointers) >= limit * 3:
             break
 
-    lines = [f"references to {symbolize(address)} ({address:#x}) in "
-             f"{resolved['name']}", ""]
+    lines = [f"references to {symbolize(address, pid)} ({address:#x}) in "
+             f"{resolved['name']}" + (f" in pid {pid}" if pid else ""), ""]
 
     def render(title, found, note):
         if not found:
             return
         lines.append(f"{title} ({len(found)}) - {note}")
         for where in found[:limit]:
-            lines.append(f"  {where:#018x}  {symbolize(where)}")
+            lines.append(f"  {where:#018x}  {symbolize(where, pid)}")
         if len(found) > limit:
             lines.append(f"  ... and {len(found) - limit} more")
         lines.append("")
@@ -3262,14 +3526,14 @@ def tool_disassemble(target: str, count: int = 24, pid: int = 0) -> str:
     it is for, and it is the one thing a raw byte dump cannot support.
     """
     count = max(1, min(int(count), 200))
-    address = resolve(target)
+    address = resolve(target, pid)
     # Roughly 15 bytes per instruction, bounded by what one transfer carries.
     wanted = min(4096, max(64, count * 15))
     code = read_bytes(address, wanted, pid)
     if not code:
         return f"nothing readable at {target}"
 
-    lines = [f"{symbolize(address)}  ({address:#x})", ""]
+    lines = [f"{symbolize(address, pid)}  ({address:#x})", ""]
     offset = 0
     shown = 0
     calls: list[str] = []
@@ -3288,7 +3552,7 @@ def tool_disassemble(target: str, count: int = 24, pid: int = 0) -> str:
         raw = code[offset:offset + length].hex()
         note = ""
         if branch is not None:
-            named = symbolize(branch)
+            named = symbolize(branch, pid)
             if named != f"{branch:#x}":
                 note = f"   ; {named}"
                 if text.startswith("call") and named not in calls:
@@ -5398,20 +5662,66 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, b"not found\n", "text/plain")
 
+    def _error(self, code: int, rpc_code: int, message: str):
+        self._send(code, json.dumps({
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": rpc_code, "message": message},
+        }).encode(), "application/json")
+
+    def _read_body(self) -> bytes | None:
+        """The request body, or None once a refusal has been answered.
+
+        Bounded twice: by what the client declares and by what it actually
+        sends, and read under a timeout so a half-sent body occupies one
+        worker thread for fifteen seconds rather than forever.  The timeout is
+        applied to the body only - an idle keep-alive connection between tool
+        calls is left alone, because closing those is how a client ends up
+        seeing RemoteDisconnected instead of an answer.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._error(400, -32700, "invalid Content-Length")
+            return None
+        if length < 0 or length > MAX_REQUEST_BODY_BYTES:
+            self._error(413, -32600,
+                        f"request body limit is {MAX_REQUEST_BODY_BYTES} bytes")
+            self.close_connection = True
+            return None
+        if not length:
+            return b""
+
+        previous = self.connection.gettimeout()
+        self.connection.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
+        try:
+            raw = self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+            return None
+        finally:
+            self.connection.settimeout(previous)
+
+        if len(raw) != length:
+            self.close_connection = True
+            return None
+        return raw
+
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
+        raw = self._read_body()
+        if raw is None:
+            return
 
         try:
             payload = json.loads(raw or b"{}")
         except json.JSONDecodeError:
-            self._send(400, json.dumps({
-                "jsonrpc": "2.0", "id": None,
-                "error": {"code": -32700, "message": "parse error"},
-            }).encode(), "application/json")
+            self._error(400, -32700, "parse error")
             return
 
         if isinstance(payload, list):
+            if len(payload) > MAX_BATCH_REQUESTS:
+                self._error(400, -32600,
+                            f"batch limit is {MAX_BATCH_REQUESTS} requests")
+                return
             responses = [r for r in (dispatch(item) for item in payload) if r]
             body = json.dumps(responses).encode() if responses else b""
         else:
@@ -5430,8 +5740,8 @@ def main() -> None:
     global CTL
 
     parser = argparse.ArgumentParser(description="svmhv MCP agent (in-guest)")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--ctl", default=CTL)
     options = parser.parse_args()
 
