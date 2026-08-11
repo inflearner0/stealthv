@@ -59,6 +59,27 @@ struct _VIRTUAL_CPU;
 #define SVMHV_STEP_TRACE    2
 
 /*
+ * Not stepping any more, but the trap flag we set may still be in flight.
+ *
+ * An interrupt delivered while a window is open pushes RFLAGS - with our TF in
+ * it - onto the interrupt frame and clears TF for the handler.  Ending the
+ * window at that point clears a flag that is already clear and drops the #DB
+ * intercept, and then the handler's IRET puts TF back from the stack.  The next
+ * instruction raises a #DB that nothing is intercepting any more, so the guest
+ * receives a single-step exception it never asked for, in whatever code
+ * happened to be running.
+ *
+ * That is not theoretical either: it landed inside the __except of the driver's
+ * own memory-write path and turned ten of twenty-four writes through a
+ * watchpoint into "wrote 0 bytes" - writes which had in fact happened.
+ *
+ * So the intercept stays armed with the flag cleared, and the first #DB to
+ * arrive is swallowed, TF forced back to the guest's own value, and everything
+ * dropped.  One stale exception is all there can ever be.
+ */
+#define SVMHV_STEP_DRAIN    3
+
+/*
  * The most instructions one arm may ask for.  A bound rather than a policy: a
  * caller that asks for a million gets a processor that spends the next million
  * instructions taking an exit each, and there is no way to interrupt it from
@@ -103,6 +124,13 @@ VOID SvStepArm(_Inout_ struct _VIRTUAL_CPU* Cpu, _In_ UINT32 Count,
 VOID SvStepDisarm(_Inout_ struct _VIRTUAL_CPU* Cpu);
 
 /*
+ * Stop stepping, but keep the #DB intercept until one more arrives.  For
+ * ending a window that did not end at its own #DB, where the trap flag may be
+ * sitting on an interrupt frame waiting to come back; see SVMHV_STEP_DRAIN.
+ */
+VOID SvStepDrain(_Inout_ struct _VIRTUAL_CPU* Cpu);
+
+/*
  * A #DB arrived.  Returns TRUE if it was ours - in which case it has been
  * consumed and must not reach the guest - and FALSE if the guest was
  * single-stepping on its own account and should get its exception back.
@@ -118,5 +146,11 @@ BOOLEAN SvStepHandleDebugException(_Inout_ struct _VIRTUAL_CPU* Cpu);
 BOOLEAN SvStepEmulatePushf(_Inout_ struct _VIRTUAL_CPU* Cpu);
 BOOLEAN SvStepEmulatePopf(_Inout_ struct _VIRTUAL_CPU* Cpu);
 
-/* How many steps have been taken, and how many windows ended exposed. */
-VOID SvStepCounters(_Out_ UINT64* Steps, _Out_ UINT64* Exposed);
+/*
+ * How many steps have been taken, how many windows ended with the trap flag
+ * exposed, and how many #DBs were handed to the guest during a window because
+ * they did not look like ours.  The last one should be zero unless something in
+ * the guest is using hardware breakpoints.
+ */
+VOID SvStepCounters(_Out_ UINT64* Steps, _Out_ UINT64* Exposed,
+                    _Out_ UINT64* NotOurs, _Out_ UINT64* Drained);

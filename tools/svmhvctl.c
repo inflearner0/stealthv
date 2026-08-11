@@ -1284,10 +1284,12 @@ static int Step(unsigned long count)
 
     printf("step_requested=%lu\nflags_during=0x%llx\nflags_after=0x%llx\n"
            "tf_during=%u\ntf_after=%u\nsteps_total=%llu\nexposed_windows=%llu\n"
+           "db_not_ours=%llu\nwatch_steps_abandoned=%llu\ndb_drained=%llu\n"
            "sink=%llu\n",
            count, during, after,
            (unsigned)((during >> 8) & 1), (unsigned)((after >> 8) & 1),
-           out.Rbx, out.Rdx, (unsigned long long)sink);
+           out.Rbx, out.Rdx, out.Rsi, out.Rdi, out.R8,
+           (unsigned long long)sink);
     return 0;
 }
 

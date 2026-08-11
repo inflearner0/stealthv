@@ -10,6 +10,19 @@ static volatile LONG64 g_Steps;
 static volatile LONG64 g_Exposed;
 
 /*
+ * #DBs that arrived while a window was open and were handed to the guest
+ * anyway, because they did not look like our single step.  Should be zero on a
+ * machine where nothing is using hardware breakpoints: anything else means the
+ * test below is rejecting our own exceptions and injecting them into whatever
+ * the guest was doing, which surfaces as a spurious STATUS_SINGLE_STEP in code
+ * that has no idea it is being stepped.
+ */
+static volatile LONG64 g_NotOurs;
+
+/* Stale #DBs swallowed after a window ended early; see SVMHV_STEP_DRAIN. */
+static volatile LONG64 g_Drained;
+
+/*
  * The bytes of the instruction that is about to run.
  *
  * Preferred source is the VMCB's own decode assist: the processor already
@@ -184,6 +197,45 @@ VOID SvStepArm(_Inout_ VIRTUAL_CPU* Cpu, _In_ UINT32 Count, _In_ UINT32 Reason)
     vmcb->Control.VmcbClean = 0;
 }
 
+/* Put the guest's own trap flag back into RFLAGS, whatever ours was. */
+static VOID SvStepRestoreTf(_Inout_ VIRTUAL_CPU* Cpu)
+{
+    if (Cpu->Step.GuestTf)
+    {
+        Cpu->GuestVmcb.StateSave.Rflags |= SVM_RFLAGS_TF;
+    }
+    else
+    {
+        Cpu->GuestVmcb.StateSave.Rflags &= ~SVM_RFLAGS_TF;
+    }
+}
+
+VOID SvStepDrain(_Inout_ VIRTUAL_CPU* Cpu)
+{
+    VMCB* vmcb = &Cpu->GuestVmcb;
+
+    if (Cpu->Step.Reason == SVMHV_STEP_NONE ||
+        Cpu->Step.Reason == SVMHV_STEP_DRAIN)
+    {
+        return;
+    }
+
+    SvStepRestoreTf(Cpu);
+
+    /*
+     * PUSHF and POPF can go now - with TF back to the guest's own value there
+     * is nothing left to lie about.  The #DB intercept stays, because the flag
+     * may still be on an interrupt frame about to be restored by an IRET.
+     */
+    vmcb->Control.InterceptVector3 &=
+        ~(SVM_INTERCEPT_PUSHF | SVM_INTERCEPT_POPF);
+    vmcb->Control.VmcbClean = 0;
+
+    Cpu->Step.Reason = SVMHV_STEP_DRAIN;
+    Cpu->Step.Remaining = 0;
+    Cpu->Step.HookId = 0;
+}
+
 VOID SvStepDisarm(_Inout_ VIRTUAL_CPU* Cpu)
 {
     VMCB* vmcb = &Cpu->GuestVmcb;
@@ -193,14 +245,7 @@ VOID SvStepDisarm(_Inout_ VIRTUAL_CPU* Cpu)
         return;
     }
 
-    if (Cpu->Step.GuestTf)
-    {
-        vmcb->StateSave.Rflags |= SVM_RFLAGS_TF;
-    }
-    else
-    {
-        vmcb->StateSave.Rflags &= ~SVM_RFLAGS_TF;
-    }
+    SvStepRestoreTf(Cpu);
 
     vmcb->Control.InterceptException &=
         ~SVM_INTERCEPT_EXCEPTION(SVM_EXCEPTION_DB_VECTOR);
@@ -223,17 +268,47 @@ BOOLEAN SvStepHandleDebugException(_Inout_ VIRTUAL_CPU* Cpu)
     }
 
     /*
-     * A #DB that is not a single step - a hardware breakpoint the guest set
-     * for itself - happens to arrive while we are stepping and belongs to the
-     * guest.  Only BS is ours.
+     * Is this one ours?
+     *
+     * DR6.BS is the architectural answer, and it is the right test when the
+     * guest is using the debug registers itself - a hardware breakpoint that
+     * happens to fire inside our window belongs to the guest and has to be
+     * given back.  But it cannot be the *only* test.  DR6 reaches us through
+     * the VMCB state save, and a #DB that we asked for by setting TF is not
+     * guaranteed to arrive with BS already visible there; when it does not,
+     * rejecting it injects a single-step exception into a guest that never
+     * armed one.  That is not theoretical - it cost the first store through
+     * every freshly installed watchpoint, which came back as a spurious
+     * STATUS_SINGLE_STEP caught by an unrelated __except and reported as a
+     * write of zero bytes that had in fact happened.
+     *
+     * So: BS settles it when it is set.  When it is not, the question is
+     * whether the guest could have produced this #DB at all, and it could not
+     * if none of DR7's four breakpoints is enabled.  Bits 0-7 are the local
+     * and global enables; with all of them clear the only thing that can raise
+     * #DB here is the flag we set.
      */
-    if ((vmcb->StateSave.Dr6 & SVM_DR6_BS) == 0)
+    if ((vmcb->StateSave.Dr6 & SVM_DR6_BS) == 0 &&
+        (vmcb->StateSave.Dr7 & 0xFF) != 0)
     {
+        InterlockedIncrement64(&g_NotOurs);
         return FALSE;
     }
 
     /* The guest must not find our step in its own debug status register. */
     vmcb->StateSave.Dr6 &= ~SVM_DR6_BS;
+
+    /*
+     * The stale one.  The window is already over; this is the trap flag coming
+     * back off an interrupt frame after we had stopped expecting it.  Swallow
+     * it, put the flag back for real this time, and let go of the intercept.
+     */
+    if (Cpu->Step.Reason == SVMHV_STEP_DRAIN)
+    {
+        SvStepDisarm(Cpu);
+        InterlockedIncrement64(&g_Drained);
+        return TRUE;
+    }
 
     InterlockedIncrement64(&g_Steps);
 
@@ -362,8 +437,11 @@ BOOLEAN SvStepEmulatePopf(_Inout_ VIRTUAL_CPU* Cpu)
     return TRUE;
 }
 
-VOID SvStepCounters(_Out_ UINT64* Steps, _Out_ UINT64* Exposed)
+VOID SvStepCounters(_Out_ UINT64* Steps, _Out_ UINT64* Exposed,
+                    _Out_ UINT64* NotOurs, _Out_ UINT64* Drained)
 {
     *Steps = (UINT64)InterlockedCompareExchange64(&g_Steps, 0, 0);
     *Exposed = (UINT64)InterlockedCompareExchange64(&g_Exposed, 0, 0);
+    *NotOurs = (UINT64)InterlockedCompareExchange64(&g_NotOurs, 0, 0);
+    *Drained = (UINT64)InterlockedCompareExchange64(&g_Drained, 0, 0);
 }

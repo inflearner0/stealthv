@@ -529,11 +529,15 @@ static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* 
                      */
                     UINT64 steps;
                     UINT64 exposed;
+                    UINT64 notOurs;
+                    UINT64 drained;
 
-                    SvStepCounters(&steps, &exposed);
+                    SvStepCounters(&steps, &exposed, &notOurs, &drained);
                     Context->Rbx = steps;
                     Context->Rdx = exposed;
-                    Context->Rsi = Cpu->Step.FlagsExposed ? 1u : 0u;
+                    Context->Rsi = notOurs;
+                    Context->Rdi = Cpu->WatchStepsAbandoned;
+                    Context->R8  = drained;
                 }
                 else
                 {
@@ -594,14 +598,78 @@ static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* 
 
 /* ------------------------------------------------ nested page faults */
 
-static VOID SvSwitchNpt(_Inout_ VIRTUAL_CPU* Cpu, _In_ BOOLEAN Shadow)
+static VOID SvSwitchNpt(_Inout_ VIRTUAL_CPU* Cpu, _In_ ULONG View)
 {
-    Cpu->ShadowNptActive = Shadow;
-    Cpu->GuestVmcb.Control.NCr3 = Shadow ? g_NptShadow.Pml4Pa : g_NptPrimary.Pml4Pa;
+    static const NPT_HIERARCHY* const views[] = {
+        &g_NptPrimary, &g_NptShadow, &g_NptPermissive
+    };
+
+    Cpu->NptView = View;
+    Cpu->ShadowNptActive = (View == SVMHV_NPT_SHADOW);
+    Cpu->GuestVmcb.Control.NCr3 = views[View]->Pml4Pa;
 
     /* Nested translations are ASID-tagged, so changing NCr3 needs a flush. */
     Cpu->PendingFlush = TRUE;
     Cpu->HookSwitches++;
+}
+
+/*
+ * Let a store that a watchpoint trapped actually happen.
+ *
+ * Switching to the shadow hierarchy - which is what an execution hook does, and
+ * what this used to do - cannot work here.  An execution hook runs the code
+ * that is on the page it trapped, so one executable page in the shadow view is
+ * enough.  A watchpoint traps a store, and the instruction doing the storing is
+ * almost never on the page being stored to; making the page writable in a view
+ * where nothing is executable means the re-fetch of the storing instruction
+ * faults instead, the handler reads that as execution having left the page,
+ * sends the processor home, and the store faults again.  Forever.
+ *
+ * So: the permissive view, where both the store and the fetch succeed, and one
+ * single step to get control back afterwards.  Two exits per store, the same as
+ * the design always claimed - the difference is that the store now retires.
+ */
+static VOID SvWatchStep(_Inout_ VIRTUAL_CPU* Cpu)
+{
+    SvSwitchNpt(Cpu, SVMHV_NPT_PERMISSIVE);
+    SvStepArm(Cpu, 1, SVMHV_STEP_WATCH);
+}
+
+/*
+ * Finish one, from wherever it turned out to end.
+ *
+ * Normally that is the #DB one instruction later.  It can also be any other
+ * exit: an interrupt delivered between the fault and the store clears TF in the
+ * handler's context, so the step can be deferred for as long as the interrupt
+ * takes, and anything that exits in the meantime lands here.  Ending it early
+ * reads the value sooner than intended and re-arms the watch, so the store
+ * faults again and is recorded again - a duplicate record and another attempt,
+ * which converges.  Leaving the processor in the permissive view until the
+ * step eventually arrived would be the worse trade: the watch is disarmed on
+ * that processor for the whole of it.
+ */
+static VOID SvWatchStepEnd(_Inout_ VIRTUAL_CPU* Cpu, _In_ BOOLEAN Abandoned)
+{
+    SvTraceWatchComplete(&Cpu->WatchPending);
+    SvSwitchNpt(Cpu, SVMHV_NPT_PRIMARY);
+
+    if (Abandoned)
+    {
+        /*
+         * Ending somewhere other than our own #DB means something was
+         * delivered to the guest in between, and a delivered interrupt takes a
+         * copy of RFLAGS - trap flag included - with it.  Dropping the #DB
+         * intercept here would let that copy come back on the handler's IRET
+         * and raise a single-step exception at the guest, uninter­cepted.  See
+         * SVMHV_STEP_DRAIN.
+         */
+        SvStepDrain(Cpu);
+        Cpu->WatchStepsAbandoned++;
+    }
+    else
+    {
+        SvStepDisarm(Cpu);
+    }
 }
 
 /*
@@ -653,13 +721,7 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
          */
         if ((info & (NPF_EXECUTE | NPF_WRITE)) != 0)
         {
-            /*
-             * This is also where a held watch record gets finished.  Getting
-             * here means the guest re-executed the store and then fetched its
-             * next instruction, so what it wrote is now in the page.
-             */
-            SvTraceWatchComplete(&Cpu->WatchPending);
-            SvSwitchNpt(Cpu, FALSE);
+            SvSwitchNpt(Cpu, SVMHV_NPT_PRIMARY);
             SvNpfExplained(Cpu);
             return FALSE;
         }
@@ -675,7 +737,7 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
                served by the primary view and see the original bytes. */
             if ((info & NPF_EXECUTE) != 0)
             {
-                SvSwitchNpt(Cpu, TRUE);
+                SvSwitchNpt(Cpu, SVMHV_NPT_SHADOW);
                 SvNpfExplained(Cpu);
                 return FALSE;
             }
@@ -688,7 +750,7 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
                                 Cpu->Index, vmcb->StateSave.Cr3, page.WatchVa,
                                 &Cpu->WatchPending);
                 SvHookCountHit(page.HookId);
-                SvSwitchNpt(Cpu, TRUE);
+                SvWatchStep(Cpu);
                 SvNpfExplained(Cpu);
                 return FALSE;
             }
@@ -705,7 +767,7 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
                             Cpu->Index, vmcb->StateSave.Cr3, page.WatchVa,
                             &Cpu->WatchPending);
             SvHookCountHit(page.HookId);
-            SvSwitchNpt(Cpu, TRUE);
+            SvWatchStep(Cpu);
             SvNpfExplained(Cpu);
             return FALSE;
 
@@ -792,21 +854,20 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
     }
 
     /*
-     * A watch record held over from the previous exit.
+     * A watch step that is not going to end the way it was supposed to.
      *
-     * The exit that is supposed to complete one is the nested page fault that
-     * returns this processor to the primary view, and that is genuinely the
-     * next exit it takes - nothing in the shadow hierarchy is executable, so
-     * the guest cannot get anywhere without faulting.  This is here for the
-     * case that reasoning is wrong: completing it from a different exit reads
-     * the value slightly later than intended, which is a worse answer than the
-     * intended one and a much better answer than a record that never appears.
-     * The NPF path clears it first, so this normally sees nothing.
+     * It ends at the #DB one instruction later.  Anything else arriving first
+     * means the guest was interrupted between the fault and the store - which
+     * clears TF in the handler's context, so our step is deferred for as long
+     * as that takes.  Rather than leave this processor sitting in the
+     * permissive view with its watch disarmed, end it here: the record goes out
+     * with whatever the location holds, the watch re-arms, and the store faults
+     * again when the guest gets back to it.
      */
-    if (Cpu->WatchPending.Record != NULL &&
-        vmcb->Control.ExitCode != VMEXIT_NPF)
+    if (Cpu->Step.Reason == SVMHV_STEP_WATCH &&
+        vmcb->Control.ExitCode != VMEXIT_EXCEPTION_DB)
     {
-        SvTraceWatchComplete(&Cpu->WatchPending);
+        SvWatchStepEnd(Cpu, TRUE);
     }
 
     switch (vmcb->Control.ExitCode)
@@ -832,13 +893,24 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
      * that set a hardware breakpoint is entitled to it.
      */
     case VMEXIT_EXCEPTION_DB:
+    {
+        /* Captured first: handling the exception is what clears it. */
+        const UINT32 reason = Cpu->Step.Reason;
+
         if (!SvStepHandleDebugException(Cpu))
         {
             vmcb->Control.EventInj = SVM_EVENTINJ_VALID |
                                      SVM_EVENTINJ_TYPE_EXCEPTION |
                                      SVM_EXCEPTION_DB_VECTOR;
         }
+        else if (reason == SVMHV_STEP_WATCH)
+        {
+            /* The store has retired.  Read what it left, publish the record
+               that has been waiting for it, and re-arm the watch. */
+            SvWatchStepEnd(Cpu, FALSE);
+        }
         break;
+    }
 
     /*
      * Only intercepted while stepping, and only so that the trap flag we set
@@ -1019,6 +1091,16 @@ static VOID SvPrepareVmcb(_Inout_ VIRTUAL_CPU* Cpu, _In_ const CONTEXT* Guest)
      */
     RtlZeroMemory(vmcb, sizeof(*vmcb));
     Cpu->ShadowNptActive = FALSE;
+    Cpu->NptView = SVMHV_NPT_PRIMARY;
+
+    /*
+     * A step window cannot survive the VMCB being rebuilt: the intercepts that
+     * make it work have just been zeroed, so its #DB would never arrive and the
+     * processor would sit armed forever.  A watch record held by one goes with
+     * it - unpublished, which the ring is entitled to.
+     */
+    RtlZeroMemory(&Cpu->Step, sizeof(Cpu->Step));
+    RtlZeroMemory(&Cpu->WatchPending, sizeof(Cpu->WatchPending));
 
     __writemsr(MSR_EFER, __readmsr(MSR_EFER) | EFER_SVME);
     __writemsr(MSR_VM_HSAVE_PA,
@@ -1272,6 +1354,7 @@ static VOID SvResumeVirtualization(VOID)
          */
         cpu->LaunchFailed     = 0;
         cpu->ShadowNptActive  = FALSE;
+        cpu->NptView          = SVMHV_NPT_PRIMARY;
         cpu->PendingFlush     = FALSE;
         cpu->SpuriousNpf      = 0;
         cpu->LastNpfGpa       = 0;

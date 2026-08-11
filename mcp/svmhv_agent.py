@@ -651,7 +651,14 @@ def tool_step(count: int = 16) -> str:
     after = as_int(result, "tf_after", -1)
     exposed = as_int(result, "exposed_windows", 0)
 
-    if during == 0:
+    if during == 0 and count < 64:
+        # The read is a good forty instructions past the hypercall, so a short
+        # run has already disarmed itself by the time it happens and a clear
+        # flag says nothing either way. Do not let it read as a pass.
+        lines.append(f"trap flag read back clear, but {count} steps end before "
+                     f"the read is reached - this says nothing about whether "
+                     f"it was hidden. Ask for 200 or more.")
+    elif during == 0:
         lines.append("trap flag as the guest read it mid-run: clear - PUSHF "
                      "is being intercepted and answered")
     elif during > 0:
@@ -661,6 +668,24 @@ def tool_step(count: int = 16) -> str:
         lines.append("trap flag after the run: STILL SET. The window should "
                      "have disarmed itself - that is a bug, not a concealment "
                      "weakness.")
+    not_ours = as_int(result, "db_not_ours", 0)
+    abandoned = as_int(result, "watch_steps_abandoned", 0)
+    if not_ours:
+        lines.append(f"{not_ours} debug exception(s) were handed to the guest "
+                     f"during a step window. Unless something in the guest is "
+                     f"using hardware breakpoints, that is our own #DB being "
+                     f"injected into code that never asked for it.")
+    drained = as_int(result, "db_drained", 0)
+    if abandoned:
+        lines.append(f"{abandoned} watch step(s) on this processor ended "
+                     f"somewhere other than their own #DB - expected under "
+                     f"interrupt load; it costs a duplicate watch record and "
+                     f"another attempt at the store")
+    if drained:
+        lines.append(f"{drained} stale debug exception(s) were swallowed after "
+                     f"a window ended early. These are the trap flag coming "
+                     f"back off an interrupt frame; swallowing them is what "
+                     f"keeps the guest from seeing a single-step it never set.")
     if exposed:
         lines.append(f"{exposed} window(s) have given up hiding the flag "
                      f"because the guest's stack was in an address space the "

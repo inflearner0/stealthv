@@ -113,7 +113,22 @@ typedef struct DECLSPEC_ALIGN(PAGE_SIZE) _VIRTUAL_CPU
     ULONG   SpuriousNpf;
 
     BOOLEAN PendingFlush;
+
+    /*
+     * Which nested hierarchy this processor is using.  ShadowNptActive is kept
+     * alongside it because the fault handler asks that question far more often
+     * than it asks which of the three, and it reads better where it is used.
+     */
+    ULONG   NptView;                /* SVMHV_NPT_*                          */
     BOOLEAN ShadowNptActive;
+
+    /*
+     * Watch steps that ended somewhere other than their own #DB, because
+     * something was delivered to the guest in between.  Harmless and
+     * self-correcting - the store faults again - but a large number here means
+     * watch records are being duplicated and is worth knowing about.
+     */
+    UINT64  WatchStepsAbandoned;
 
     /*
      * A watch record claimed at the fault and held back until the store it

@@ -15,6 +15,7 @@
 
 NPT_HIERARCHY g_NptPrimary;
 NPT_HIERARCHY g_NptShadow;
+NPT_HIERARCHY g_NptPermissive;
 
 /*
  * Nested page tables are walked by the processor using physical addresses, so
@@ -34,8 +35,17 @@ typedef struct _NPT_BLOCK
 static NPT_BLOCK g_Blocks[NPT_MAX_BLOCKS];
 static ULONG     g_BlockCount;
 
-/* Pool of spare table pages for splitting large leaves. */
-#define NPT_SPLIT_POOL_PAGES 768
+/*
+ * Pool of spare table pages for splitting large leaves.
+ *
+ * Raised from 768 when the permissive hierarchy arrived: hiding a page splits
+ * a 1 GiB leaf down to 4 KiB in every hierarchy that describes it, so the cost
+ * of the driver's own hidden pages went up by half.  Hooks are unaffected -
+ * they only ever split the primary and shadow views - but running out here is
+ * a load-time failure with an obscure message, so the headroom is worth more
+ * than the megabyte.
+ */
+#define NPT_SPLIT_POOL_PAGES 1152
 
 static UINT8*        g_SplitPool;
 static UINT64        g_SplitPoolPa;
@@ -256,10 +266,23 @@ NTSTATUS SvNptInitialize(VOID)
         return status;
     }
 
+    /*
+     * Identical to the primary hierarchy, and deliberately never restricted by
+     * a hook or a watch.  A processor enters it for exactly one instruction, to
+     * let a store that a watchpoint trapped actually retire; see npt.h for why
+     * the shadow hierarchy cannot do that job.
+     */
+    status = SvNptBuildHierarchy(&g_NptPermissive, 0);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
     DbgPrint("svmhv: npt identity map: %u bits phys, %u GiB, 1GiB pages=%d, "
-             "ncr3 %llx / shadow %llx\n",
+             "ncr3 %llx / shadow %llx / permissive %llx\n",
              physBits, (ULONG)(SvNptCoverage() / (1024 * 1024 * 1024)),
-             g_Use1GbPages, g_NptPrimary.Pml4Pa, g_NptShadow.Pml4Pa);
+             g_Use1GbPages, g_NptPrimary.Pml4Pa, g_NptShadow.Pml4Pa,
+             g_NptPermissive.Pml4Pa);
 
     return STATUS_SUCCESS;
 }
@@ -276,6 +299,7 @@ VOID SvNptFree(VOID)
     RtlZeroMemory(g_Blocks, sizeof(g_Blocks));
     RtlZeroMemory(&g_NptPrimary, sizeof(g_NptPrimary));
     RtlZeroMemory(&g_NptShadow, sizeof(g_NptShadow));
+    RtlZeroMemory(&g_NptPermissive, sizeof(g_NptPermissive));
     g_BlockCount = 0;
     g_SplitPool = NULL;
     g_SplitPoolNext = 0;
@@ -496,9 +520,11 @@ NTSTATUS SvNptHideRange(_In_ PVOID Va, _In_ SIZE_T Size)
         const UINT64 gpa = (UINT64)MmGetPhysicalAddress(page).QuadPart;
         UINT64* primary = SvNptSplitTo4Kb(&g_NptPrimary, gpa);
         UINT64* shadow  = SvNptSplitTo4Kb(&g_NptShadow, gpa);
+        UINT64* permissive = SvNptSplitTo4Kb(&g_NptPermissive, gpa);
         const UINT64 backing = SvNptHideBacking();
 
-        if (primary == NULL || shadow == NULL || backing == 0)
+        if (primary == NULL || shadow == NULL || permissive == NULL ||
+            backing == 0)
         {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -516,6 +542,14 @@ NTSTATUS SvNptHideRange(_In_ PVOID Va, _In_ SIZE_T Size)
          */
         *primary = backing | NPT_PRESENT | NPT_WRITE | NPT_USER;
         *shadow  = backing | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NO_EXECUTE;
+
+        /*
+         * The permissive view is permissive about *our* restrictions, not about
+         * the concealment.  A processor is only in it for one instruction, but
+         * one instruction is all a guest needs to read a page it was not
+         * supposed to find.
+         */
+        *permissive = backing | NPT_PRESENT | NPT_WRITE | NPT_USER;
     }
 
     return STATUS_SUCCESS;
