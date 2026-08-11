@@ -374,6 +374,46 @@ typedef struct _SVMHV_TRACE_RECORD
     UINT64 Frames[SVMHV_MAX_FRAMES];
 
     /*
+     * Watchpoint detail.
+     *
+     * A watch hit used to carry RIP, the guest physical address and the #NPF
+     * error code, and nothing else.  That names the page and the instruction
+     * and stops there: not which address space it came from, not what was
+     * stored, not even the bytes of the store.  Answering the only question a
+     * watchpoint is ever asked - what wrote this, and what did it write - then
+     * cost three more round trips and a guess, and for a user-mode watch the
+     * process could not be established at all.
+     *
+     * All of it is free at the point of the fault.  The handler is holding the
+     * VMCB, and the watched page is pinned by the hook's MDL and aliased into
+     * system space, so reading it is a read through a locked mapping rather
+     * than a guess about what is resident.
+     *
+     *   Cr3          from the VMCB.  A client resolves it to a process against
+     *                DirectoryTableBase; recording the process id here instead
+     *                would mean a Ps* call from host context with GIF clear,
+     *                which this driver deliberately does not do.
+     *   ValueBefore  the qword at the faulting address, read at the fault.
+     *   ValueAfter   the same qword once the store has retired, read on the
+     *                exit that returns this processor to the primary view.
+     *   ValueWidth   how many of those bytes are inside the page; 0 when no
+     *                value could be taken (an exec record, or a fault whose
+     *                page has no system alias).
+     *   Code         the bytes at Rip, so the client can decode the store
+     *                without a second round trip.  Clamped to the end of RIP's
+     *                page and taken only for a kernel RIP: the page holding the
+     *                instruction that just faulted is resident by definition,
+     *                but the host's CR3 is not the faulting process's, so a
+     *                user-mode RIP is not ours to read from here.
+     */
+    UINT64 Cr3;
+    UINT64 ValueBefore;
+    UINT64 ValueAfter;
+    UINT32 ValueWidth;
+    UINT32 CodeLength;
+    UINT8  Code[16];
+
+    /*
      * Publication protocol, appended so the original record layout remains
      * readable by v1 consumers.  A recorder first clears CommitSequence,
      * fills every preceding field, then stores Sequence + 1 here with a full
@@ -576,7 +616,7 @@ typedef struct _SVMHV_CONTROL
  * fires, mcp\svmhv_mcp.py needs the same edit.
  */
 C_ASSERT(sizeof(SVMHV_FILTER)          == 24);
-C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES + 16);
+C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES + 64);
 C_ASSERT(sizeof(SVMHV_STATS)           == 640);
 C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
@@ -620,10 +660,12 @@ C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, Shellcode)       == 296);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, ProcessName)     == 148);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CaptureLength)   == 164);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CaptureData)     == 172);
-C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Generation)      ==
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Cr3)             ==
          432 + 8 + 8 * SVMHV_MAX_FRAMES);
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Generation)      ==
+         432 + 8 + 8 * SVMHV_MAX_FRAMES + 48);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CommitSequence)  ==
-         432 + 8 + 8 * SVMHV_MAX_FRAMES + sizeof(UINT64));
+         432 + 8 + 8 * SVMHV_MAX_FRAMES + 48 + sizeof(UINT64));
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence)     ==
          2728 + sizeof(SVMHV_HOOK_LIST) + sizeof(SVMHV_SELFTEST) +
          sizeof(SVMHV_FATAL_EXIT));

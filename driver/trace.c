@@ -958,6 +958,10 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
             record->ProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
             record->ThreadId  = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
             record->Irql      = (UINT32)irql;
+            /* Redundant here, where the process id is already known, and
+               recorded anyway so that one field means the same thing on every
+               kind of record - a watch has nothing but this. */
+            record->Cr3       = __readcr3();
             if (imageName != NULL)
             {
                 RtlCopyMemory(record->ProcessName, imageName,
@@ -1056,13 +1060,67 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
 
 /* ----------------------------------------------------------- watch path */
 
+/*
+ * The instruction that faulted, so the client can decode the store without
+ * coming back for it.
+ *
+ * Safe for exactly one reason, and it is worth being precise about it: the
+ * processor has just fetched an instruction from this page, so the page is
+ * mapped and resident by definition.  That argument covers RIP's own page and
+ * nothing else, hence the clamp to the page boundary - the next page has no
+ * such guarantee and reading into it is how the stack walk used to bugcheck.
+ *
+ * Kernel addresses only.  The host's CR3 at an exit is whichever address space
+ * this processor launched in, so a user-mode RIP would either read the wrong
+ * process's memory or fault; the record says CodeLength 0 and the client
+ * disassembles it through the control channel instead, at PASSIVE_LEVEL where
+ * attaching to the right process is legal.
+ */
+static UINT32 SvTraceCodeAt(_In_ UINT64 Rip, _Out_writes_(Max) UINT8* Code,
+                            _In_ UINT32 Max)
+{
+    const UINT64 pageEnd = (Rip | (PAGE_SIZE - 1)) + 1;
+    UINT32 length = Max;
+    UINT32 i;
+
+    if (Rip < (UINT64)MM_SYSTEM_RANGE_START)
+    {
+        return 0;
+    }
+    if (pageEnd - Rip < length)
+    {
+        length = (UINT32)(pageEnd - Rip);
+    }
+
+    for (i = 0; i < length; i++)
+    {
+        Code[i] = ((const UINT8*)Rip)[i];
+    }
+
+    return length;
+}
+
 VOID SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
                      _In_ UINT64 Gpa, _In_ UINT64 ErrorCode,
-                     _In_ UINT32 Processor)
+                     _In_ UINT32 Processor, _In_ UINT64 Cr3,
+                     _In_opt_ const VOID* WatchVa,
+                     _Inout_ SVMHV_WATCH_PENDING* Pending)
 {
     UINT64 sequence;
-    SVMHV_TRACE_RECORD* record = SvTraceClaim(&sequence);
+    SVMHV_TRACE_RECORD* record;
 
+    /*
+     * A record outstanding from a previous hit means the exit that should have
+     * completed it never arrived.  Publish it as it stands rather than leaking
+     * the slot; ValueWidth already says the second read did not happen.
+     */
+    if (Pending->Record != NULL)
+    {
+        SvTracePublish(Pending->Record, Pending->Sequence);
+        RtlZeroMemory(Pending, sizeof(*Pending));
+    }
+
+    record = SvTraceClaim(&sequence);
     if (record == NULL)
     {
         return;
@@ -1074,8 +1132,61 @@ VOID SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
     record->ErrorCode = ErrorCode;
     record->HookId    = HookId;
     record->Type      = Type;
-    record->Processor  = Processor;
+    record->Processor = Processor;
+    record->Cr3       = Cr3;
+    record->CodeLength = SvTraceCodeAt(Rip, record->Code, sizeof(record->Code));
+
+    /*
+     * The value, if the page has an alias.  The GPA an #NPF reports is the
+     * faulting byte address, not just its page, so the offset is where the
+     * access actually landed.  A qword of it, clamped so it stays inside the
+     * page - the store's real width is unknown without decoding it, and
+     * reporting a window the client can diff is more honest than guessing.
+     */
+    if (WatchVa != NULL)
+    {
+        const UINT32 offset = (UINT32)(Gpa & (PAGE_SIZE - 1));
+        UINT32 width = sizeof(UINT64);
+
+        if (offset + width > PAGE_SIZE)
+        {
+            width = PAGE_SIZE - offset;
+        }
+
+        record->ValueBefore = 0;
+        RtlCopyMemory(&record->ValueBefore, (const UINT8*)WatchVa + offset,
+                      width);
+        record->ValueWidth = width;
+
+        /*
+         * Held back rather than published.  The store has not run yet - the
+         * guest is about to re-execute it - so publishing now would record a
+         * "before" and call it the answer.  The next exit this processor takes
+         * is the fault that returns it to the primary view, and by then the
+         * store has retired.
+         */
+        Pending->Record   = record;
+        Pending->Sequence = sequence;
+        Pending->Address  = (const UINT8*)WatchVa + offset;
+        Pending->Width    = width;
+        return;
+    }
+
     SvTracePublish(record, sequence);
+}
+
+VOID SvTraceWatchComplete(_Inout_ SVMHV_WATCH_PENDING* Pending)
+{
+    SVMHV_TRACE_RECORD* record = Pending->Record;
+
+    if (record == NULL)
+    {
+        return;
+    }
+
+    RtlCopyMemory(&record->ValueAfter, Pending->Address, Pending->Width);
+    SvTracePublish(record, Pending->Sequence);
+    RtlZeroMemory(Pending, sizeof(*Pending));
 }
 
 /* --------------------------------------------------------------- clients */

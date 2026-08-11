@@ -7,6 +7,7 @@
 #include "svm.h"
 #include "npt.h"
 #include "svmhvctl.h"
+#include "trace.h"      /* SVMHV_WATCH_PENDING lives in the VIRTUAL_CPU */
 
 #define SVMHV_POOL_TAG          'vmvS'      /* "Svmv" */
 #define SVMHV_HOST_STACK_SIZE   0x6000      /* 24 KiB per CPU              */
@@ -112,6 +113,14 @@ typedef struct DECLSPEC_ALIGN(PAGE_SIZE) _VIRTUAL_CPU
 
     BOOLEAN PendingFlush;
     BOOLEAN ShadowNptActive;
+
+    /*
+     * A watch record claimed at the fault and held back until the store it
+     * trapped has actually run; see SvTraceWatchHit.  One per processor is
+     * enough because a processor can only be inside one store at a time, and
+     * the exit that completes it is the very next one this processor takes.
+     */
+    SVMHV_WATCH_PENDING WatchPending;
     PVOID   HostStackBase;
     HOST_STACK_LAYOUT* Layout;
 

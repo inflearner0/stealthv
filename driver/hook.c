@@ -24,6 +24,20 @@ typedef struct _SVM_HOOK
     PMDL    Mdl;                /* keeps the target page resident           */
 
     /*
+     * A system-space alias of the pinned page, so the exit handler can read
+     * what is in it with GIF clear.  Owned by whichever record owns the MDL,
+     * borrowed by the rest, and NULL if the mapping could not be made - in
+     * which case a watch still fires, it just reports no value.
+     *
+     * It cannot be PageVa.  A user-mode watch's page belongs to a process, and
+     * the host's CR3 at the exit is whatever address space this processor
+     * launched in, so the target's own address means nothing from there.  The
+     * alias is a mapping of already-locked pages and is therefore valid at any
+     * IRQL, which is what makes reading through it legal at the fault.
+     */
+    PVOID   WatchVa;
+
+    /*
      * Non-zero when the target is a user-mode address, and the reason the MDL
      * above has to be treated completely differently.
      *
@@ -101,6 +115,7 @@ typedef struct _SVM_HOOK_PAGE_ENTRY
     UINT64 Gpa;
     UINT32 HookId;
     UINT32 Kind;
+    PVOID  WatchVa;             /* system alias of the page; watches only    */
 } SVM_HOOK_PAGE_ENTRY;
 
 typedef struct _SVM_HOOK_PAGE_INDEX
@@ -143,9 +158,10 @@ static VOID SvHookRebuildPageIndex(VOID)
 
         RtlMoveMemory(&index->Entries[at + 1], &index->Entries[at],
                       (count - at) * sizeof(index->Entries[0]));
-        index->Entries[at].Gpa    = hook->Gpa;
-        index->Entries[at].HookId = i;
-        index->Entries[at].Kind   = hook->Kind;
+        index->Entries[at].Gpa     = hook->Gpa;
+        index->Entries[at].HookId  = i;
+        index->Entries[at].Kind    = hook->Kind;
+        index->Entries[at].WatchVa = hook->WatchVa;
         count++;
     }
 
@@ -294,10 +310,15 @@ VOID SvHookCleanup(VOID)
 
         if (hook->Mdl != NULL && hook->OwnsPage)
         {
+            if (hook->WatchVa != NULL)
+            {
+                MmUnmapLockedPages(hook->WatchVa, hook->Mdl);
+            }
             MmUnlockPages(hook->Mdl);
             IoFreeMdl(hook->Mdl);
         }
         hook->Mdl = NULL;
+        hook->WatchVa = NULL;
         /* Borrowed shadow pages point at the owner's copy; freeing one from
            every record that shares it would free it several times over. */
         if (hook->ShadowVa != NULL && hook->OwnsPage)
@@ -338,6 +359,7 @@ BOOLEAN SvHookFindPage(_In_ UINT64 Gpa, _Out_ SVM_HOOK_PAGE* Page)
     Page->Found = FALSE;
     Page->HookId = 0;
     Page->Kind = 0;
+    Page->WatchVa = NULL;
 
     while (low < high)
     {
@@ -346,9 +368,10 @@ BOOLEAN SvHookFindPage(_In_ UINT64 Gpa, _Out_ SVM_HOOK_PAGE* Page)
 
         if (entry->Gpa == page)
         {
-            Page->Found  = TRUE;
-            Page->HookId = entry->HookId;
-            Page->Kind   = entry->Kind;
+            Page->Found   = TRUE;
+            Page->HookId  = entry->HookId;
+            Page->Kind    = entry->Kind;
+            Page->WatchVa = entry->WatchVa;
             return TRUE;
         }
         if (entry->Gpa < page)
@@ -834,6 +857,7 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     ULONG i;
     UINT64 gpa;
     PVOID shadowVa = NULL;
+    PVOID watchVa = NULL;
     PMDL mdl = NULL;
     SVMHV_ATTACH attach = { 0 };
     SVM_HOOK* pageOwner = NULL;
@@ -1211,6 +1235,17 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         /* Re-read: locking may not move a kernel page, but do not assume it. */
         gpa = (UINT64)MmGetPhysicalAddress(pageVa).QuadPart;
 
+        /*
+         * Alias the page into system space while we are still at
+         * PASSIVE_LEVEL and in the target's address space.  Not conditional on
+         * this being a watch: a watch may later join a page an exec hook
+         * already owns, and it is the owner that holds the mapping.  Failing
+         * is survivable - the hook works, its records just carry no value - so
+         * it does not fail the install.
+         */
+        watchVa = MmGetSystemAddressForMdlSafe(
+                      mdl, NormalPagePriority | MdlMappingNoExecute);
+
         if (isExec)
         {
             PHYSICAL_ADDRESS highest;
@@ -1233,6 +1268,7 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
          * shadow would undo the neighbour rather than add to it.
          */
         shadowVa = pageOwner->ShadowVa;
+        watchVa  = pageOwner->WatchVa;
     }
 
     if (isExec)
@@ -1249,6 +1285,7 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
     hook->ShadowPa     = (shadowVa != NULL)
                        ? (UINT64)MmGetPhysicalAddress(shadowVa).QuadPart : 0;
     hook->Mdl          = mdl;
+    hook->WatchVa      = watchVa;
     hook->OwnsPage     = (pageOwner == NULL);
     hook->TargetProcessId = Request->TargetProcessId;
     hook->PrologLength = isExec ? Request->PrologLength : 0;
@@ -1352,6 +1389,12 @@ done:
         }
         if (mdl != NULL)
         {
+            /* mdl is only still set when this record owns it, so the alias is
+               ours too, and it has to go before the pages are unlocked. */
+            if (watchVa != NULL)
+            {
+                MmUnmapLockedPages(watchVa, mdl);
+            }
             MmUnlockPages(mdl);
             IoFreeMdl(mdl);
         }
@@ -1431,6 +1474,14 @@ NTSTATUS SvHookRemove(_In_ PVOID Target)
          */
         if (hook->TargetProcessId != 0 && hook->Mdl != NULL && hook->OwnsPage)
         {
+            /* The alias is a mapping of these pages, so it goes first - and it
+               has to go at all, or the process keeps a system PTE per removed
+               hook for as long as the driver is loaded. */
+            if (hook->WatchVa != NULL)
+            {
+                MmUnmapLockedPages(hook->WatchVa, hook->Mdl);
+                hook->WatchVa = NULL;
+            }
             MmUnlockPages(hook->Mdl);
             IoFreeMdl(hook->Mdl);
             hook->Mdl = NULL;

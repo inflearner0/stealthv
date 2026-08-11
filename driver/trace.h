@@ -33,6 +33,19 @@ typedef struct _TRACE_FRAME
 
 C_ASSERT(sizeof(TRACE_FRAME) == 0x40);
 
+/*
+ * A watch record that has been claimed and filled but not published, because
+ * the interesting half of it - what the store actually wrote - does not exist
+ * yet.  Lives in the VIRTUAL_CPU: one processor can only be inside one store.
+ */
+typedef struct _SVMHV_WATCH_PENDING
+{
+    SVMHV_TRACE_RECORD* Record;
+    UINT64              Sequence;
+    const VOID*         Address;    /* inside the page alias, where to re-read */
+    UINT32              Width;
+} SVMHV_WATCH_PENDING;
+
 NTSTATUS SvTraceInitialize(VOID);
 VOID     SvTraceFree(VOID);
 
@@ -48,11 +61,31 @@ PVOID    SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
 /*
  * Called from the #NPF handler for a watchpoint hit, in host context with GIF
  * clear.  Deliberately records less than the exec path: no Ps* calls, no IRQL
- * query, nothing that touches the kernel's own state.
+ * query, nothing that touches the kernel's own state.  Cr3 is taken from the
+ * VMCB and stands in for the process id the exec path gets from Ps*.
+ *
+ * WatchVa is a system alias of the faulting page, or NULL.  When it is present
+ * the recorder reads the qword at the faulting offset and holds the record
+ * back, unpublished, so that SvTraceWatchComplete can fill in what the store
+ * left there.  A held record is invisible to readers until it is completed,
+ * which the publication protocol already handles - CommitSequence does not
+ * match, so the slot is skipped.
  */
 VOID     SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
                          _In_ UINT64 Gpa, _In_ UINT64 ErrorCode,
-                         _In_ UINT32 Processor);
+                         _In_ UINT32 Processor, _In_ UINT64 Cr3,
+                         _In_opt_ const VOID* WatchVa,
+                         _Inout_ SVMHV_WATCH_PENDING* Pending);
+
+/*
+ * Finish a record SvTraceWatchHit held back, reading the watched qword a second
+ * time now that the store has retired, and publish it.  Called from the exit
+ * that returns this processor to the primary view - which is the very next exit
+ * it takes, because nothing else in the shadow hierarchy is executable - and
+ * defensively from anywhere else that could reach an exit with one outstanding.
+ * Does nothing when there is nothing pending.
+ */
+VOID     SvTraceWatchComplete(_Inout_ SVMHV_WATCH_PENDING* Pending);
 
 /*
  * Where the ring lives, so a client can read it out of driver memory rather than

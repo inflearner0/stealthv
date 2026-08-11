@@ -452,12 +452,55 @@ def tool_trace(count: int = 40) -> str:
             error = int(row.get("err", "0"), 0)
             decoded = [n for b, n in ((1, "present"), (2, "write"),
                                       (4, "user"), (16, "fetch")) if error & b]
-            lines.append(
+            entry = [
                 f"[{row.get('seq')}] hook {row.get('hook')} cpu{row.get('cpu')} "
                 f"{TRACE_TYPES.get(kind, '?')} gpa {row.get('gpa')} "
-                f"from rip {row.get('rip')} "
+                f"from rip {symbolize(int(row.get('rip', '0'), 0))} "
                 f"({'|'.join(decoded) or 'not-present'})"
-            )
+            ]
+
+            # What the location held before and after. The driver reads a fixed
+            # window rather than decoding the store's width, so say which bytes
+            # actually moved instead of pretending to know the operand size.
+            width = int(row.get("width", "0"), 0)
+            if width:
+                before = int(row.get("before", "0"), 0)
+                after = int(row.get("after", "0"), 0)
+                if before == after:
+                    entry.append(f"      value unchanged: "
+                                 f"0x{before:0{width * 2}x}")
+                else:
+                    changed = [i for i in range(width)
+                               if (before >> (i * 8)) & 0xFF !=
+                                  (after >> (i * 8)) & 0xFF]
+                    span = (f"byte {changed[0]}" if len(changed) == 1
+                            else f"bytes {changed[0]}-{changed[-1]}")
+                    entry.append(f"      0x{before:0{width * 2}x} -> "
+                                 f"0x{after:0{width * 2}x}  ({span} of "
+                                 f"{width} at +0x{int(row.get('gpa', '0'), 0) & 0xFFF:x})")
+
+            # The instruction that did it, decoded here rather than costing the
+            # caller another round trip for the one thing it always wants next.
+            code = row.get("code")
+            if code:
+                try:
+                    raw = bytes.fromhex(code)
+                    _, text, _ = disassemble_one(raw, 0,
+                                                 int(row.get("rip", "0"), 0))
+                    entry.append(f"      {text}")
+                except (ValueError, IndexError):
+                    entry.append(f"      code {code}")
+
+            # Not resolved to a process name here: that would mean attaching to
+            # every process in turn to read its CR3, which is one hypercall
+            # each and far too slow to do while rendering a trace. Printed raw
+            # because the useful comparison is between records - the same CR3
+            # twice is the same address space, which is what separates "one
+            # thing is doing this" from "everything is".
+            cr3 = row.get("cr3")
+            if cr3:
+                entry.append(f"      cr3 {cr3}")
+            lines.append("\n".join(entry))
     return "\n".join(lines)
 
 

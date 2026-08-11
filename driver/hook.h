@@ -48,6 +48,19 @@ typedef struct _SVM_HOOK_PAGE
     UINT32  HookId;
     UINT32  Kind;                   /* SVMHV_HOOK_*                         */
     BOOLEAN Found;
+
+    /*
+     * A system-space alias of the watched page, so the exit handler can read
+     * what is in it.  Watches only, and NULL if the alias could not be made.
+     *
+     * It has to be an alias rather than the target's own address: a user-mode
+     * watch's page belongs to another process, and the host's CR3 at the exit
+     * is whatever address space this processor launched in.  The page is
+     * already pinned by the hook's MDL, so the alias is a mapping of locked
+     * pages and is valid at any IRQL, which is what makes it legal to read
+     * with GIF clear.
+     */
+    PVOID   WatchVa;
 } SVM_HOOK_PAGE;
 
 /* What the trace recorder needs to know about a hook that just fired. */

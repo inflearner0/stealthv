@@ -615,6 +615,12 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
          */
         if ((info & (NPF_EXECUTE | NPF_WRITE)) != 0)
         {
+            /*
+             * This is also where a held watch record gets finished.  Getting
+             * here means the guest re-executed the store and then fetched its
+             * next instruction, so what it wrote is now in the page.
+             */
+            SvTraceWatchComplete(&Cpu->WatchPending);
             SvSwitchNpt(Cpu, FALSE);
             SvNpfExplained(Cpu);
             return FALSE;
@@ -641,7 +647,8 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
             if ((info & NPF_WRITE) != 0)
             {
                 SvTraceWatchHit(page.HookId, SVMHV_TRACE_WRITE, rip, gpa, info,
-                                Cpu->Index);
+                                Cpu->Index, vmcb->StateSave.Cr3, page.WatchVa,
+                                &Cpu->WatchPending);
                 SvHookCountHit(page.HookId);
                 SvSwitchNpt(Cpu, TRUE);
                 SvNpfExplained(Cpu);
@@ -650,10 +657,15 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
             break;
 
         case SVMHV_HOOK_ACCESS:
-            /* The page is not present at all in the primary view, so this is
-               every kind of access, reads included. */
+            /*
+             * The page is not present at all in the primary view, so this is
+             * every kind of access, reads included - and a read leaves the
+             * value alone, so the second half of the capture will simply show
+             * it unchanged.  That is the answer, not a missing one.
+             */
             SvTraceWatchHit(page.HookId, SVMHV_TRACE_ACCESS, rip, gpa, info,
-                            Cpu->Index);
+                            Cpu->Index, vmcb->StateSave.Cr3, page.WatchVa,
+                            &Cpu->WatchPending);
             SvHookCountHit(page.HookId);
             SvSwitchNpt(Cpu, TRUE);
             SvNpfExplained(Cpu);
@@ -739,6 +751,24 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
     if (vmcb->Control.ExitCode < RTL_NUMBER_OF(Cpu->ExitCodeCounts))
     {
         Cpu->ExitCodeCounts[vmcb->Control.ExitCode]++;
+    }
+
+    /*
+     * A watch record held over from the previous exit.
+     *
+     * The exit that is supposed to complete one is the nested page fault that
+     * returns this processor to the primary view, and that is genuinely the
+     * next exit it takes - nothing in the shadow hierarchy is executable, so
+     * the guest cannot get anywhere without faulting.  This is here for the
+     * case that reasoning is wrong: completing it from a different exit reads
+     * the value slightly later than intended, which is a worse answer than the
+     * intended one and a much better answer than a record that never appears.
+     * The NPF path clears it first, so this normally sees nothing.
+     */
+    if (Cpu->WatchPending.Record != NULL &&
+        vmcb->Control.ExitCode != VMEXIT_NPF)
+    {
+        SvTraceWatchComplete(&Cpu->WatchPending);
     }
 
     switch (vmcb->Control.ExitCode)

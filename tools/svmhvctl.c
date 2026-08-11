@@ -1246,6 +1246,36 @@ static void PrintTraceRecord(const SVMHV_TRACE_RECORD* record)
            record->Arguments[2], record->Arguments[3],
            record->StackArguments[0], record->StackArguments[1]);
 
+    /* Which address space it came from.  A watch has nothing else that says. */
+    if (record->Cr3 != 0)
+    {
+        printf(" cr3=0x%llx", (unsigned long long)record->Cr3);
+    }
+
+    /*
+     * What the watched location held, before the store and after it.  Both are
+     * printed even when they are equal - "nothing changed" is an answer, and
+     * the common one for a read that tripped an ACCESS watch.
+     */
+    if (record->ValueWidth != 0)
+    {
+        printf(" width=%u before=0x%llx after=0x%llx",
+               record->ValueWidth,
+               (unsigned long long)record->ValueBefore,
+               (unsigned long long)record->ValueAfter);
+    }
+
+    /* The instruction that did it, so the client need not come back for it. */
+    if (record->CodeLength != 0)
+    {
+        unsigned int b;
+        printf(" code=");
+        for (b = 0; b < record->CodeLength && b < sizeof(record->Code); b++)
+        {
+            printf("%02x", record->Code[b]);
+        }
+    }
+
     /* The stack, when the walk managed one. */
     if (record->FrameCount != 0)
     {
