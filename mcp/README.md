@@ -82,13 +82,15 @@ that machine.
 
 ## Tools
 
-47 of them. Each is `svmhv_` plus the name below:
+52 of them. Each is `svmhv_` plus the name below:
 
 | | |
 |---|---|
 | **the hypervisor** | `status` `exit_histogram` `selftest` `service` |
 | **hooks** | `hook_trace` `hook_detour` `hook_shellcode` `hook_many` `watch` `watch_range` `unhook` `unhook_all` `hooks` |
 | **what they caught** | `trace` `trace_summary` `trace_reset` |
+| **finding code** | `sweep` `coverage` |
+| **registers and ports** | `watch_msr` `watch_io` `step` |
 | **memory** | `read` `write` `read_physical` `write_physical` `translate` |
 | **code** | `disassemble` `assemble` `xrefs` `explain` `search` `strings` |
 | **symbols** | `symbols_auto` `symbols_load` `symbol` `exports` `imports` `pdb_info` `syscalls` |
@@ -97,6 +99,51 @@ that machine.
 | **notes** | `note` |
 
 Plus `GET /health` for a quick liveness check.
+
+## Finding code nothing declared
+
+`sweep` marks every guest physical page in a range non-executable and records
+the first time each one runs; `coverage` reads the result back with the pages no
+loaded module accounts for listed first. A page faults once, is granted the
+permission for good, and never faults again, so the cost is one exit per
+distinct page ever touched — a 1 GiB range over an idle guest cost about three
+thousand nested page faults in total, not three thousand per second.
+
+This is the thing a hypervisor can do that a debugger cannot. A module list
+describes the code somebody declared. `sweep write` answers the other half:
+which pages something modified, which is where an unpacker shows itself.
+
+One table page per 2 MiB, out of a pool the first sweep of each driver load
+sizes for itself — so arm the largest range you want *first*, or reload.
+
+## User-mode hooks
+
+`hook_trace` takes `in_process`, and it now installs execution hooks there, not
+just watchpoints. The detour is not in kernel memory: it is a page allocated
+inside the target process, and the way back into the hypervisor is a `VMMCALL`
+rather than a jump, which needs no privilege and is intercepted already.
+
+The page has to be **private to the process**. An image page is shared with
+every process that has it mapped, and a stub only exists in one of them, so the
+driver refuses those with `STATUS_SHARING_VIOLATION`. A manually mapped payload
+— the thing this is for — is private by construction.
+
+A user-mode hook records the four argument registers and CR3, and nothing that
+needs guest context: no captures, no filters, no process name. The stub reports
+from an exit with `GIF` clear, where dereferencing a caller's pointer or calling
+`Ps*` is not legal.
+
+## Single-stepping
+
+`step` runs the guest one instruction at a time for a bounded count, recording
+RIP, RFLAGS and the instruction bytes. AMD has no monitor trap flag, so this is
+`RFLAGS.TF` and `#DB` — but `PUSHF` and `POPF` are intercepted for the duration,
+so a guest that looks reads back the trap flag *it* set.
+
+That works for kernel stacks and **not** for user-mode ones: emulating `PUSHF`
+means touching the guest's stack, and the exit handler can only reach an address
+space it is already in. When it cannot, it gives up hiding the flag, says so,
+and counts it. `step` reports the count rather than pretending.
 
 ## The one thing that will bite you
 
@@ -110,22 +157,32 @@ the safe choice; supply one only when you have decoded it yourself.
 Symbols do resolve: `nt!NtCreateFile` works as a target, and the PDB is fetched
 from the Microsoft symbol server on first use.
 
-## Watchpoints are page-granular and expensive
+## Watchpoints are page-granular
 
-A write watch fires **twice per store**: once to reach the permissive view, once
-to leave it. On a page that is written in bulk that is thousands of exits a
-second, which is enough to starve the guest until nothing can reach it any more —
-including the channel that would remove the watch.
+A write watch costs **two exits per store**: one to trap it, one for the single
+step that lets it retire. The record carries what the location held before and
+after, the instruction that did it, and the address space it came from.
 
-Two guards exist because this actually happened during development and cost a VM:
+This used not to work at all, and the distinction matters if you are reading
+older notes. Permitting the store meant switching to the shadow view, where
+nothing is executable — and the instruction doing the storing is almost never on
+the page being stored to, so the re-fetch faulted, the handler read that as
+execution leaving the page, and the store faulted again forever. One eight-byte
+write measured 168,116 nested page faults with the value never changing. It was
+described as watchpoints being expensive; it was a livelock.
+
+Two guards remain, because a hot watched page is still a bad idea:
 
 - the driver refuses a watch on its own control block, snapshot or trace ring
   (`STATUS_ACCESS_DENIED`);
 - the worker disarms any watch producing more than 20000 hits in a 100 ms
   interval, and says so in the debug log.
 
-Neither makes a watch on a hot page a good idea. Watch data you expect to be
-touched rarely, and prefer an exec hook with a filter for anything frequent.
+The second one could not save you from the livelock, which is worth knowing
+about the guard: the thread it starved was the control worker, so the thing that
+would have removed the watch was the thing that was stuck. Watch data you expect
+to be touched rarely, and prefer an exec hook with a filter for anything
+frequent.
 
 ## Shellcode contract
 
