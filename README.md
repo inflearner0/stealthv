@@ -1,137 +1,134 @@
 # stealthv
 
-**A minimal AMD-V (SVM) hypervisor for Windows x64, with nested-paging code
-hooks that are invisible to anything reading memory — driven over MCP, so a
-model can reverse engineer a driver, an executable or the kernel itself by
-asking.**
+**An AMD-V (SVM) hypervisor for Windows x64 that puts the already-running kernel
+into a guest, hooks it through nested page tables so nothing reading memory can
+see the hooks, and exposes the whole thing as 64 MCP tools — so a model can
+reverse engineer a driver, an executable or the kernel by asking.**
 
 [![ci](https://github.com/inflearner0/stealthv/actions/workflows/ci.yml/badge.svg)](https://github.com/inflearner0/stealthv/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/inflearner0/stealthv?include_prereleases)](https://github.com/inflearner0/stealthv/releases)
 [![license](https://img.shields.io/github/license/inflearner0/stealthv)](LICENSE)
 
-A **blue pill** / **hyperjacking** research tool: a kernel driver that puts the
-**already running** Windows kernel into an SVM guest, hooks it through **nested
-page tables**, and studies **hypervisor detection** from inside the guest. The
-AMD counterpart to the Intel VT-x/EPT projects.
+> **Lab instrument.** It hides from the guest, installs invisible kernel hooks,
+> runs caller-supplied shellcode in ring 0 on request, and will reset the
+> machine it runs on. Hardware you own, isolated network. Read `CLAUDE.md`
+> before trusting it with anything.
 
-> **A lab instrument.** It hides itself from the guest, installs invisible
-> kernel hooks, and runs caller-supplied shellcode in kernel mode on request,
-> and it will reset the machine it is running on. Machines you own, isolated
-> network, and read `CLAUDE.md` before trusting it with anything.
+## Run it
 
-## Driven over MCP
+Needs an AMD host, the WDK, and a Windows VM with test signing on. Build on the
+host, copy three files into the guest, register the driver once:
 
-An [MCP server](mcp/svmhv_agent.py) runs **inside the guest** and exposes the
-whole instrument as 60 tools, so what drives it can be a model rather than a
-person at a console. Ask what a driver's IOCTL interface is, hook the handler,
-watch the arguments arrive, patch one in flight, read the original bytes back to
-confirm the page never changed — then snapshot the memory it works on, call it
-again with a different argument, and put the memory back.
-
-```
-client  --HTTP-->  svmhv_agent.py (guest)  -->  svmhvctl.exe  -->  CPUID
+```powershell
+.\build.ps1 -Sign
 ```
 
-Inside the guest on purpose: PowerShell Direct drops its session the moment the
-hypervisor loads, so a host-side server puts the fragile part in the wrong
-place. Standard library only.
+Then in the guest, with `bin\svmhv.sys`, `bin\svmhvctl.exe` and
+`mcp\svmhv_agent.py` copied to `C:\lab\`:
 
-Each tool is `svmhv_` plus the name below:
+```powershell
+sc.exe create svmhv type= kernel binPath= C:\lab\svmhv.sys
+python C:\lab\svmhv_agent.py --host 0.0.0.0 --port 8765
+```
+
+Point an MCP client at `http://<guest>:8765/mcp` and call `svmhv_service` with
+`action: load`. `GET /health` says whether the agent is up and the hypervisor is
+answering.
+
+Under Hyper-V the VM needs, from the host:
+
+```powershell
+Set-VMProcessor -VMName $vm -ExposeVirtualizationExtensions $true
+Set-VMMemory    -VMName $vm -DynamicMemoryEnabled $false -StartupBytes 6GB
+```
+
+The agent runs **inside** the guest on purpose: PowerShell Direct drops its
+session the moment the hypervisor loads and does not recover until reboot, so a
+host-side server puts the fragile part in the wrong place. Standard library
+only — no pip step on a machine with no internet.
+
+## Tools
+
+Each is `svmhv_` plus the name.
 
 | | |
 |---|---|
-| **the hypervisor** | `status` `exit_histogram` `selftest` `service` |
+| **hypervisor** | `status` `exit_histogram` `selftest` `service` `revive` |
 | **hooks** | `hook_trace` `hook_detour` `hook_shellcode` `hook_many` `watch` `watch_range` `unhook` `unhook_all` `hooks` |
-| **what they caught** | `trace` `trace_summary` `trace_reset` |
+| **what they caught** | `trace` `trace_summary` `trace_reset` `watch_msr` `watch_io` |
+| **experiments** | `snapshot` `call` `usercall` `explore` `diverge` `step` `reverse` `provenance` `struct` |
+| **finding undeclared code** | `sweep` `coverage` `coverage_diff` `dump` `ibs` |
 | **memory** | `read` `write` `read_physical` `write_physical` `translate` |
 | **code** | `disassemble` `assemble` `xrefs` `explain` `search` `strings` |
 | **symbols** | `symbols_auto` `symbols_load` `symbol` `exports` `imports` `pdb_info` `syscalls` |
 | **modules and processes** | `modules` `sections` `processes` `process_modules` `verify` |
 | **drivers** | `driver` `devices` `symlinks` `ioctl` `ioctls` `watch_ioctls` `callbacks` |
-| **experiments** | `snapshot` `call` `explore` `diverge` `reverse` `provenance` `struct` |
-| **finding code** | `sweep` `coverage` `coverage_diff` `dump` `ibs` |
-| **notes** | `note` `revive` |
+| **notes** | `note` |
 
 Symbols download themselves on first use. Disassembly and assembly use capstone
-and keystone when installed and a built-in decoder and assembler when not.
+and keystone when installed, a built-in decoder and assembler when not.
 
 ## What it does
 
-**Hooks nothing can see.** A hooked page is mapped to the original in one
+**Hooks nothing can see.** A hooked page maps to the original in one nested
 hierarchy and to a patched copy in the other, executable in exactly one of them.
-Reading the function returns the original instructions, and only the processor
-executing inside the page sees the copy — every other processor, and every
-integrity check running on this one, reads the real bytes. Nothing is patched in
-place.
+Reading the function returns the original bytes; only the processor executing
+inside the page sees the copy. Nothing is patched in place. Hooks trace
+arguments and return values, detour to your own code, run assembled shellcode or
+fault on write — filtered by process, caller or argument value, and able to
+spoof an argument or block the call.
 
-- **trace** — arguments, return value, cycles taken, calling module, and return
-  addresses found on the stack (candidates, scanned rather than unwound)
-- **detour** — your own function, with a trampoline back to the original
-- **shellcode** — assembly at the hook, assembled from Intel syntax
-- **watch** — fault on write or on any access, code or data
-- **filters** — only this process, only this caller, only when an argument is
-  above a value; and **spoof** an argument or **block** the call
+**Experiments, not just observation.** `snapshot` is copy-on-write over a range,
+so the same code runs twice with one input changed. `call` invokes a function
+with arguments you pick. Stepped runs record all sixteen registers per
+instruction, so `reverse` finds what set a register by walking backwards. On top
+of those: `diverge` runs two inputs and reports the one instruction where the
+paths part — usually the whole answer for a licence or signature check;
+`explore` reports which of many inputs reached new code; `struct` infers a field
+layout from the width and direction of accesses to a buffer.
 
-**Experiments, not only observation.** A copy-on-write **snapshot** over a range
-of memory: every page loses write permission, the first store to each faults and
-the original is copied aside, and restore puts them back — so the same code can
-be run twice with one input changed. **call** runs a function with arguments you
-choose and reports what it returns. A stepped run records all sixteen registers
-per instruction, so **reverse** answers "which instruction gave this register
-that value" by walking backwards instead of running again. **provenance** watches
-a buffer and reports its writers grouped by instruction.
+**Finding code nothing declared.** The sweep removes a permission from every
+page in a range and gives it back one fault at a time — one exit per page, ever.
+In `both` mode it remembers the *order*: written and then executed means the
+code arrived after the mapping did, which is a manual map, an unpacker or a JIT
+and little else. `dump` turns such a page into a file with its section table
+rewritten to the memory layout, so a disassembler opens it at the right
+addresses; a payload that erased its own MZ header is dumped flat.
 
-Three tools compose those into the questions you actually have. **diverge** runs
-a function under two inputs and reports the one instruction where the paths
-part — the branch the input decided. **explore** calls it once per input and
-reports which inputs reached code the others did not. **struct** watches a
-buffer and infers a field layout from the width and direction of the accesses to
-it.
-
-The snapshot restores *memory in one range* and nothing else — not registers,
-not devices — and a range another processor is using gets restored underneath
-it. `call` runs the target: called with arguments it was not written for it
-takes the guest down, and no exception handler can prevent that.
-
-**Finding code nothing declared.** The coverage sweep takes a permission away
-from every page in a range and gives it back one fault at a time, so a page
-costs one exit ever. In `both` mode it remembers the *order*: a page written and
-then executed had its code arrive after its mapping did, which is a manual map,
-an unpacker or a JIT and very little else. **coverage_diff** brackets an action
-with two windows and reports only what the second reached. **dump** turns one of
-those pages into a file with its section table rewritten to the memory layout,
-so a disassembler opens it at the right addresses; a payload that erased its own
-MZ header is dumped flat rather than refused. **ibs** samples through the
-processor's own instruction-based sampling where the hardware exposes it.
-
-**Virtualisation.** Every logical processor taken with `VMRUN` while Windows is
-running on it. Nested page tables identity-map the whole 48-bit guest physical
-space with 1 GiB leaves, split to 4 KiB on demand. `VMLOAD`/`VMSAVE`,
-`STGI`/`CLGI`, `SKINIT` and `INVLPGA` answered with `#UD`. Devirtualises for
-sleep and re-enters on resume — one transition at a time; repeated cycles are
-known to crash the machine.
-
-**Reading the machine.** Guest virtual and guest physical memory, in the kernel
-or inside any process, without opening a handle to it or being visible to it,
-plus virtual-to-physical translation.
-
-**Staying unnoticed.** `CPUID` is not intercepted at all, which is an AMD
-privilege: `rdtsc; cpuid; rdtsc` measures 2376 cycles with the hypervisor live
-and 2376 with it unloaded, because it is the same instruction on the same
-processor. `EFER.SVME` reads as clear. The driver's own pages read as zeroes,
-each backed by a page of its own so they do not mirror each other. Nothing is
-done to the TSC, because nothing needs to be.
+**Staying unnoticed.** `CPUID` is not intercepted at all — an AMD privilege.
+`rdtsc; cpuid; rdtsc` measures 2376 cycles loaded and 2376 unloaded, because it
+is the same instruction on the same processor. `EFER.SVME` reads as clear. The
+driver's pages read as zeroes, each backed by a private page so they do not
+mirror each other. The TSC is untouched.
 
 **Runs nested.** Under Hyper-V the guest's hypercalls are relayed from host
 context, so VMBus, storage and networking keep working with SVM owned by this
 driver. On bare metal the same intercept injects `#UD`.
 
-**On a driver specifically.** A `.sys` exports nothing, so: `driver` reads its
-dispatch table, `devices` and `symlinks` give the names callers open and the
-`\\.\Foo` that maps to them, `ioctls` recovers the control codes by reading the
-dispatcher, and `callbacks` lists every driver registered for process, thread or
-image notifications — those arrays have no symbol and look identical, so the
-driver plants a callback of its own and finds it rather than guessing.
+**On a driver specifically.** A `.sys` exports nothing, so `driver` reads its
+dispatch table, `devices` and `symlinks` give the names callers open, `ioctls`
+recovers control codes from the dispatcher, and `callbacks` lists everything
+registered for process, thread or image notifications — those arrays have no
+symbol and look identical, so the driver plants a callback of its own and finds
+it rather than guessing.
 
-`CLAUDE.md` has the engineering detail, including the four bugs that shaped
-the design and the things every instrument lies about.
+## Limits worth knowing before you start
+
+- **`snapshot` restores memory in one range and nothing else** — not registers,
+  not devices. A range another processor is using gets restored underneath it.
+- **`call` runs the target.** Called with arguments it was not written for it
+  takes the guest down, and no exception handler can prevent that: an invalid
+  kernel pointer is a bugcheck, not an exception.
+- **A sweep can wedge the machine.** The control worker is the only thing that
+  can disarm one, and the fault storm is what starves it. `both` mode is capped
+  at 64 MiB; an exec sweep over 1 GiB has needed a hard reset.
+- **`usercall` does not work yet.** It fails cleanly with
+  `STATUS_PROCEDURE_NOT_FOUND` on kernels where its thread routines do not
+  resolve.
+- **`ibs` needs hardware that exposes it.** Hyper-V does not pass it through, so
+  it refuses there and has never taken a sample in this lab.
+- **The guest still resets occasionally**, idle as well as loaded, with no
+  bugcheck and no dump. `LastBootUpTime` is the only honest instrument.
+
+`CLAUDE.md` has the engineering detail: the bugs that shaped the design, and
+what every instrument here lies about.
