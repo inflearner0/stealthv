@@ -8,6 +8,7 @@
 
         .\build.ps1            # compile + link
         .\build.ps1 -Sign      # also create/reuse a test certificate and sign
+        .\build.ps1 -Fixtures  # also build tools\umtarget.exe, a hook target
 
     driver\    the kernel driver
     include\   the control interface, shared with the tools
@@ -17,6 +18,7 @@
 [CmdletBinding()]
 param(
     [switch]$Sign,
+    [switch]$Fixtures,          # tools\umtarget.exe; see the section below
     [string]$SdkVersion,        # default: newest WDK with km\ headers
     [string]$VsPath,            # default: whatever vswhere reports
     [string]$KitRoot            # default: Program Files (x86)\Windows Kits\10
@@ -196,15 +198,22 @@ Invoke-Tool $cl (@("/nologo", "/W4", "/WX", "/O2", "/MT", "/Zi", "/FC") + $umInc
 
 # ------------------------------------------------- user-mode hook target
 # Something for a user-mode execution hook to hook; see tools\umtarget.c.
+#
+# Off by default, and it should be: it is a fixture, not a part of the product.
+# Nothing ships it, the CI artefact list does not mention it, and building it
+# unconditionally puts a file nobody asked for in every build - including on
+# toolchains this has never been compiled with. -Fixtures when you want it.
 
-Invoke-Tool $cl (@("/nologo", "/W4", "/WX", "/O2", "/MT", "/Zi", "/FC") + $umInc + @(
-    "/Fo$out\", "/Fd$out\umtarget.pdb", "/Fe$out\umtarget.exe",
-    "$root\tools\umtarget.c",
-    "/link", "/INCREMENTAL:NO",
-    "/LIBPATH:$msvc\lib\x64",
-    "/LIBPATH:$kit\Lib\$SdkVersion\um\x64",
-    "/LIBPATH:$kit\Lib\$SdkVersion\ucrt\x64"
-)) "cl umtarget.c"
+if ($Fixtures) {
+    Invoke-Tool $cl (@("/nologo", "/W4", "/WX", "/O2", "/MT", "/Zi", "/FC") + $umInc + @(
+        "/Fo$out\", "/Fd$out\umtarget.pdb", "/Fe$out\umtarget.exe",
+        "$root\tools\umtarget.c",
+        "/link", "/INCREMENTAL:NO",
+        "/LIBPATH:$msvc\lib\x64",
+        "/LIBPATH:$kit\Lib\$SdkVersion\um\x64",
+        "/LIBPATH:$kit\Lib\$SdkVersion\ucrt\x64"
+    )) "cl umtarget.c"
+}
 
 # ------------------------------------------------------------------ signing
 if ($Sign) {

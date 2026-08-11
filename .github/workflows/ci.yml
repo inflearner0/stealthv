@@ -55,17 +55,45 @@ jobs:
           # end-to-end check of the x64 assembly stub and its #UD recovery path.
           # A non-loaded hypervisor is the expected condition and must report it
           # cleanly instead of terminating the helper.
-          $output = & .\bin\svmhvctl.exe present 2>&1
+          #
+          # Both of the things that make this awkward are PowerShell's, not the
+          # tool's, and this step has been broken by each of them in turn:
+          #
+          #   - Actions runs pwsh with $ErrorActionPreference = 'Stop', and
+          #     "2>&1" merges the tool's stderr into the output stream as
+          #     ErrorRecords. Under Stop, the first one THROWS - so the step
+          #     died on the explanatory line before ever reaching the check
+          #     below. An earlier fix joined the array into a string, which
+          #     addressed the matching and not the throwing.
+          #   - pwsh 7.3+ can also turn any non-zero exit code from a native
+          #     command into a terminating error, and this tool exits 1 on
+          #     purpose to say the hypervisor is absent.
+          #
+          # So: neither preference applies here, and the two streams go to
+          # files rather than through the object pipeline, which is the only
+          # way to read a native tool's output without PowerShell editorialising
+          # about it.
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          .\bin\svmhvctl.exe present 1>probe.out 2>probe.err
           $exitCode = $LASTEXITCODE
-          $output | ForEach-Object { Write-Host $_ }
-          # -match against an array filters it rather than answering yes or no,
-          # and the explanatory line on stderr is one of the elements. Join it
-          # into a single string so this is the boolean it looks like.
-          $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+
+          $text = ((Get-Content probe.out -Raw -ErrorAction SilentlyContinue) +
+                   "`n" +
+                   (Get-Content probe.err -Raw -ErrorAction SilentlyContinue))
+          Write-Host $text
+
           if ($exitCode -ne 1 -or $text -notmatch 'present=0') {
             throw "svmhvctl present did not report a clean non-loaded state " +
                   "(exit $exitCode, output: $text)"
           }
+
+          # And the step's own result must come from the check above and
+          # nothing else. $LASTEXITCODE is 1 by design at this point - the tool
+          # says "not loaded" that way - and a shell that hands its last exit
+          # code back would fail the step for the very condition being tested.
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:

@@ -19,6 +19,8 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>     /* strtoul */
+#include <string.h>     /* memcpy  */
 
 /*
  * mov rax, rcx ; add rax, rdx ; add rax, r8 ; add rax, r9 ; ret
