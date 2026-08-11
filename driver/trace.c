@@ -15,16 +15,6 @@
 NTKERNELAPI UCHAR* PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 /*
- * The kernel's own stack walker.  Exported and usable from any IRQL, and it
- * reads the .pdata unwind tables rather than assuming frame pointers, which is
- * the only approach that works on optimised x64 code.
- *
- * Writing one by hand was the alternative and it is not close: an unwinder that
- * guesses is an unwinder that eventually reads a bad address inside a recorder
- * running with a hook installed, and the machine is then wedged in the one path
- * that could remove the hook.
- */
-/*
  * Candidate return addresses, by reading the stack.
  *
  * Not an unwind, and it does not pretend to be.  Three ways of doing this
@@ -41,38 +31,64 @@ NTKERNELAPI UCHAR* PsGetProcessImageFileName(_In_ PEPROCESS Process);
  * That is weaker than an unwind and it is reported as candidates rather than
  * as a call stack.
  *
- * Reading is the only risk and it is a small one: this is the current thread's
- * own stack, below the pointer it was entered with, and therefore resident.
+ * The walk is bounded by the stack's real top, and it has to be.  This used to
+ * read a fixed 256 qwords upwards and guard them with __try/__except, which is
+ * two mistakes rather than one: a shallow stack runs into its guard page well
+ * short of 256 slots, and an access to an unmapped *kernel* address is not an
+ * exception Windows raises - MiSystemFault decides the reference is invalid and
+ * calls KeBugCheckEx, so there is nothing for a handler to catch.  Installed on
+ * nt!NtCreateFile that took the guest down in under a minute with
+ * 0x50 PAGE_FAULT_IN_NONPAGED_AREA, reading the page immediately above the
+ * faulting thread's own RSP.  The __except went with the fix, because keeping
+ * it would mean keeping something that looks like protection and is not.
+ *
+ * IoGetStackLimits rather than KeGetCurrentThread()'s StackLimit/StackBase,
+ * because an exec hook fires at whatever IRQL its target runs at: at
+ * DISPATCH_LEVEL the live stack is the processor's DPC stack, and the thread's
+ * own limits describe a different piece of memory entirely.  IoGetStackLimits
+ * knows which one is current and is callable at any IRQL.
  */
+#define TRACE_STACK_SLOTS   256     /* cost bound; the limits are the safety */
+
 static ULONG SvTraceStackCandidates(_In_ UINT64 Rsp,
                                     _Out_writes_(Count) UINT64* Frames,
                                     _In_ ULONG Count)
 {
-    const ULONG64* stack = (const ULONG64*)Rsp;
+    ULONG_PTR low = 0;
+    ULONG_PTR high = 0;
+    UINT64 at;
     ULONG found = 0;
-    ULONG i;
+    ULONG examined;
 
     if (Rsp == 0 || Count == 0)
     {
         return 0;
     }
 
-    __try
-    {
-        for (i = 0; i < 256 && found < Count; i++)
-        {
-            const UINT64 value = stack[i];
+    IoGetStackLimits(&low, &high);
 
-            /* Kernel code lives above this; anything else is data. */
-            if (value >= 0xFFFFF80000000000ULL && value < 0xFFFFFFFFFFFF0000ULL)
-            {
-                Frames[found++] = value;
-            }
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    /*
+     * If RSP is not inside the stack we were told about, we do not know what we
+     * are standing on and must not go looking.  Nothing legitimate does this;
+     * it means the frame came from somewhere this walk cannot reason about.
+     */
+    at = (Rsp + 7) & ~7ULL;
+    if (high <= low || at < (UINT64)low || at >= (UINT64)high)
     {
-        /* Ran off the end of the stack; keep whatever was found. */
+        return 0;
+    }
+
+    for (examined = 0;
+         examined < TRACE_STACK_SLOTS && found < Count && at + 8 <= (UINT64)high;
+         examined++, at += 8)
+    {
+        const UINT64 value = *(const UINT64*)at;
+
+        /* Kernel code lives above this; anything else is data. */
+        if (value >= 0xFFFFF80000000000ULL && value < 0xFFFFFFFFFFFF0000ULL)
+        {
+            Frames[found++] = value;
+        }
     }
 
     return found;
