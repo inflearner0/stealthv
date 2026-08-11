@@ -71,6 +71,30 @@ int main(int argc, char** argv)
     while (GetTickCount64() < deadline)
     {
         /*
+         * A fresh page each time round, mapped and written and only then run.
+         *
+         * The single allocation this used to make was a fair model of a manual
+         * map and a hopeless way to test one: the sweep has to be armed before
+         * the write, and one page out of six gigabytes almost never lands in a
+         * range small enough to sweep safely.  Remapping every iteration turns
+         * "arm the sweep and hope" into "arm the sweep and wait", which is the
+         * difference between a test that works and one that needs luck.
+         */
+        void* fresh = VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                                   PAGE_EXECUTE_READWRITE);
+
+        if (fresh != NULL)
+        {
+            memcpy(fresh, kVictim, sizeof(kVictim));
+            FlushInstructionCache(GetCurrentProcess(), fresh, sizeof(kVictim));
+            if (((VICTIM)fresh)(1, 2, 3, 4) != 10)
+            {
+                wrong++;
+            }
+            VirtualFree(fresh, 0, MEM_RELEASE);
+        }
+
+        /*
          * The result is checked, not discarded.  A hook that corrupted an
          * argument register or the return value would otherwise look exactly
          * like a hook that worked, and "the trace record appeared" is only half

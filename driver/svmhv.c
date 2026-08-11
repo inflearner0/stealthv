@@ -1227,13 +1227,31 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
      * and has to win, and before the unmapped case, because a swept page is
      * present and would otherwise look like a fault nobody can explain.
      */
-    if (SvNptSweepGrant(gpa, info))
     {
-        SvTraceRegister(SVMHV_TRACE_COVER, rip, vmcb->StateSave.Cr3,
-                        Cpu->Index, gpa, 0, 0, 0, info);
-        Cpu->PendingFlush = TRUE;
-        SvNpfExplained(Cpu);
-        return FALSE;
+        UINT32 pageState = 0;
+
+        if (SvNptSweepGrant(gpa, info, &pageState))
+        {
+            /*
+             * The state rides in the value field, because what a page has had
+             * done to it and in which order is the finding - "written, then
+             * executed" is a manual map, and the page tables afterwards cannot
+             * be asked which way round it happened.
+             *
+             * Not every grant is narrated; see SVMHV_PAGE_REPORT.  The page is
+             * granted either way, so the cost is unchanged - what changes is
+             * whether the answer arrives buried in thirty thousand records
+             * saying that ordinary code ran.
+             */
+            if ((pageState & SVMHV_PAGE_REPORT) != 0)
+            {
+                SvTraceRegister(SVMHV_TRACE_COVER, rip, vmcb->StateSave.Cr3,
+                                Cpu->Index, gpa, pageState, 0, 0, info);
+            }
+            Cpu->PendingFlush = TRUE;
+            SvNpfExplained(Cpu);
+            return FALSE;
+        }
     }
 
     if ((info & NPF_PRESENT) == 0)

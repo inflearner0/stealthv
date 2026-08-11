@@ -1614,7 +1614,7 @@ static void Usage(void)
         "  svmhvctl watch <target> write|access\n"
         "  svmhvctl watchmsr <msr> [on|off]\n"
         "  svmhvctl watchio  <port> [on|off]\n"
-        "  svmhvctl sweep exec|write <base> <size> | sweep off\n"
+        "  svmhvctl sweep exec|write|both <base> <size> | sweep off\n"
         "  svmhvctl unhook <target>\n\n"
         "Hook options, after the positional arguments:\n"
         "  --process NAME        only when NAME is the current process\n"
@@ -1992,9 +1992,10 @@ int main(int argc, char** argv)
 
         if (_stricmp(argv[2], "exec") == 0)       { mode = 1; }
         else if (_stricmp(argv[2], "write") == 0) { mode = 2; }
+        else if (_stricmp(argv[2], "both") == 0)  { mode = 3; }
         else if (_stricmp(argv[2], "off") != 0)
         {
-            fprintf(stderr, "sweep takes exec, write or off\n");
+            fprintf(stderr, "sweep takes exec, write, both or off\n");
             return 2;
         }
 

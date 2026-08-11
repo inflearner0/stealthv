@@ -146,6 +146,20 @@ static UINT64          g_SweepBase;
 static UINT64          g_SweepSize;
 static volatile LONG64 g_SweepGranted;
 
+/*
+ * One byte per page of the swept range: what has been done to it and in which
+ * order.  Order is the whole point - written-then-executed is a manual map,
+ * executed-then-written is self-modifying code, and neither can be recovered
+ * from the page tables afterwards because both end up with the same
+ * permissions.  A byte rather than two bits because a byte is atomic to write
+ * and the array is small: 512 MiB of range costs 128 KiB of it.
+ */
+/* svmhv.h has the shared tag, but including it here would be a cycle. */
+#define NPT_SWEEP_TAG   'wSvS'
+
+static UINT8*          g_SweepPageState;
+static UINT64          g_SweepPages;
+
 static UINT64* SvNptAllocTable(_Out_ UINT64* PhysicalAddress)
 {
     LONG index;
@@ -360,6 +374,9 @@ VOID SvNptFree(VOID)
  */
 #define NPT_SWEEP_MAX_TABLES    4096
 
+/* See the refusal in SvNptSweepArm: this is where the evidence is. */
+#define NPT_SWEEP_BOTH_MAX      (64ULL * 1024 * 1024)
+
 VOID SvNptSweepDisarm(VOID)
 {
     UINT64 gpa;
@@ -385,6 +402,13 @@ VOID SvNptSweepDisarm(VOID)
         }
     }
 
+    if (g_SweepPageState != NULL)
+    {
+        ExFreePoolWithTag(g_SweepPageState, NPT_SWEEP_TAG);
+        g_SweepPageState = NULL;
+        g_SweepPages = 0;
+    }
+
     g_SweepMode = SVMHV_SWEEP_OFF;
     g_SweepBase = 0;
     g_SweepSize = 0;
@@ -395,7 +419,8 @@ NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode)
     UINT64 gpa;
     UINT64 tables;
 
-    if (Mode != SVMHV_SWEEP_EXECUTE && Mode != SVMHV_SWEEP_WRITE)
+    if (Mode != SVMHV_SWEEP_EXECUTE && Mode != SVMHV_SWEEP_WRITE &&
+        Mode != SVMHV_SWEEP_BOTH)
     {
         SvNptSweepDisarm();
         return STATUS_SUCCESS;
@@ -413,6 +438,26 @@ NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode)
     if (tables > NPT_SWEEP_MAX_TABLES)
     {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    /*
+     * Both modes at once are far more expensive than either alone, and the
+     * difference is not a factor of two.  An execute sweep faults on the code
+     * pages, which are a small and shrinking subset of memory; taking write
+     * permission away as well means faulting on very nearly every page the
+     * guest touches at all, and the fault storm starves the control worker -
+     * which is also the thread that would disarm it.
+     *
+     * Measured, on eight processors with four processes starting: 64 MiB is
+     * comfortable at about 1300 faults and the guest stays responsive; 2 GiB
+     * took every processor out of SVM; 256 MiB powered the machine off.  So
+     * the cap is a real limit rather than a tidy round number, and it is set
+     * where the evidence is rather than at the largest value that has ever
+     * worked.  Sweep a range you have a reason to suspect.
+     */
+    if (Mode == SVMHV_SWEEP_BOTH && Size > NPT_SWEEP_BOTH_MAX)
+    {
+        return STATUS_INVALID_BUFFER_SIZE;
     }
 
     SvNptSweepDisarm();
@@ -466,6 +511,20 @@ NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode)
     g_SweepPoolNext = 0;
 
     /*
+     * One byte per page, for what order things happened in.  Non-fatal if it
+     * cannot be had: the sweep still reports first touches, it just cannot say
+     * which came first, and saying so beats refusing to run.
+     */
+    g_SweepPages = Size / PAGE_SIZE;
+    g_SweepPageState = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                              (SIZE_T)g_SweepPages,
+                                              NPT_SWEEP_TAG);
+    if (g_SweepPageState == NULL)
+    {
+        g_SweepPages = 0;
+    }
+
+    /*
      * Split first, then take the permission away, and only then arm - so that
      * by the time a fault can happen, every table the handler could need is
      * already there.  A split that fails leaves the range partly armed, which
@@ -488,9 +547,13 @@ NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode)
         {
             *pte |= NPT_NO_EXECUTE;
         }
-        else
+        else if (Mode == SVMHV_SWEEP_WRITE)
         {
             *pte &= ~NPT_WRITE;
+        }
+        else
+        {
+            *pte = (*pte | NPT_NO_EXECUTE) & ~NPT_WRITE;
         }
     }
 
@@ -501,11 +564,18 @@ NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode)
     return STATUS_SUCCESS;
 }
 
-BOOLEAN SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo)
+BOOLEAN SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo,
+                        _Out_ UINT32* State)
 {
     const ULONG mode = g_SweepMode;
     const UINT64 page = Gpa & ~(UINT64)(PAGE_SIZE - 1);
+    const BOOLEAN wantsExec = (FaultInfo & NPF_EXECUTE) != 0;
+    const BOOLEAN wantsWrite = (FaultInfo & NPF_WRITE) != 0;
+    UINT64 index;
     UINT64* pte;
+    UINT8 state;
+
+    *State = 0;
 
     if (mode == SVMHV_SWEEP_OFF ||
         page < g_SweepBase || page >= g_SweepBase + g_SweepSize)
@@ -513,16 +583,17 @@ BOOLEAN SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo)
         return FALSE;
     }
 
-    /* Only the fault this sweep is about; a write fault on an execute sweep
-       belongs to something else and must keep going down the normal path. */
-    if (mode == SVMHV_SWEEP_EXECUTE)
+    /* Only the fault this sweep is about; anything else belongs to another
+       part of the handler and must keep going down the normal path. */
+    if (mode == SVMHV_SWEEP_EXECUTE && !wantsExec)
     {
-        if ((FaultInfo & NPF_EXECUTE) == 0)
-        {
-            return FALSE;
-        }
+        return FALSE;
     }
-    else if ((FaultInfo & NPF_WRITE) == 0)
+    if (mode == SVMHV_SWEEP_WRITE && !wantsWrite)
+    {
+        return FALSE;
+    }
+    if (mode == SVMHV_SWEEP_BOTH && !wantsExec && !wantsWrite)
     {
         return FALSE;
     }
@@ -538,23 +609,64 @@ BOOLEAN SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo)
         return FALSE;
     }
 
-    if (mode == SVMHV_SWEEP_EXECUTE)
+    index = (page - g_SweepBase) / PAGE_SIZE;
+    state = (g_SweepPageState != NULL && index < g_SweepPages)
+                ? g_SweepPageState[index] : 0;
+
+    if (wantsExec && (*pte & NPT_NO_EXECUTE) != 0)
     {
-        if ((*pte & NPT_NO_EXECUTE) == 0)
-        {
-            return FALSE;               /* another processor got here first */
-        }
         *pte &= ~NPT_NO_EXECUTE;
+        /*
+         * Written before this fetch?  Then the code on this page arrived after
+         * the mapping did, and that is the whole finding - recorded here, at
+         * the moment it becomes true, because the page tables afterwards look
+         * identical whichever order it happened in.
+         */
+        if ((state & SVMHV_PAGE_WRITTEN) != 0)
+        {
+            state |= SVMHV_PAGE_WRITE_FIRST;
+        }
+        state |= SVMHV_PAGE_EXECUTED;
+    }
+    else if (wantsWrite && (*pte & NPT_WRITE) == 0)
+    {
+        *pte |= NPT_WRITE;
+        state |= SVMHV_PAGE_WRITTEN;
     }
     else
     {
-        if ((*pte & NPT_WRITE) != 0)
-        {
-            return FALSE;
-        }
-        *pte |= NPT_WRITE;
+        /*
+         * Another processor granted this page between the fault and now.
+         *
+         * The fault is *explained* - the guest has only to re-execute - and
+         * saying otherwise is what took eight processors out of SVM the first
+         * time both modes ran together.  Returning FALSE dropped the fault
+         * into the unexplained path, where sixteen consecutive ones on the
+         * same page and RIP are read as a livelock and answered by leaving
+         * SVM.  With one permission and an idle guest that race is rare; with
+         * two permissions and four processes starting at once it is constant.
+         */
+        *State = state;                 /* no REPORT: nothing new happened */
+        return TRUE;
     }
 
+    if (g_SweepPageState != NULL && index < g_SweepPages)
+    {
+        g_SweepPageState[index] = state;
+    }
+
+    /*
+     * Worth narrating?  In the single-permission modes every first touch is
+     * the answer.  In both-mode only the transition is, and saying so here
+     * rather than in the caller keeps the decision next to the state that
+     * makes it.
+     */
+    if (mode != SVMHV_SWEEP_BOTH || (state & SVMHV_PAGE_WRITE_FIRST) != 0)
+    {
+        state |= SVMHV_PAGE_REPORT;
+    }
+
+    *State = state;
     InterlockedIncrement64(&g_SweepGranted);
     return TRUE;
 }

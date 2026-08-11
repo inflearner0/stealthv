@@ -123,6 +123,40 @@ ULONG    SvNptSplitPagesUsed(VOID);
 #define SVMHV_SWEEP_EXECUTE     1   /* which pages have run                 */
 #define SVMHV_SWEEP_WRITE       2   /* which pages have been written         */
 
+/*
+ * Both at once, which is the mode worth having.
+ *
+ * A page that was written and then executed is a page whose code arrived after
+ * the mapping did, and almost nothing legitimate does that: an image is loaded
+ * by the section manager and arrives executable.  Code copied into pool memory
+ * and jumped to is a manual map, an unpacker, or a JIT - and the first two are
+ * what there is no other way to find, because nothing on disk and no module
+ * list describes them.
+ *
+ * Order is the whole signal, so the state of each page is remembered rather
+ * than inferred: written-then-executed is the find, executed-then-written is
+ * self-modifying code, and either on its own is ordinary.
+ */
+#define SVMHV_SWEEP_BOTH        3
+
+/* What a page has had done to it, reported with its first-execution record. */
+#define SVMHV_PAGE_WRITTEN      0x01
+#define SVMHV_PAGE_EXECUTED     0x02
+#define SVMHV_PAGE_WRITE_FIRST  0x04    /* the write came before the fetch */
+
+/*
+ * Set when this grant is worth a trace record.
+ *
+ * In the single-permission modes every first touch is the answer, so it is
+ * always set.  In SVMHV_SWEEP_BOTH it is set only for the write-then-execute
+ * transition, because that is the finding and everything else is noise: a
+ * 2 GiB range in both modes produced 28779 first-touch records on an idle
+ * guest, and a reader that shows the newest two hundred of those will never
+ * show the one page that mattered.  The grants still happen and are still
+ * counted; they simply are not narrated.
+ */
+#define SVMHV_PAGE_REPORT       0x08
+
 NTSTATUS SvNptSweepArm(_In_ UINT64 Base, _In_ UINT64 Size, _In_ ULONG Mode);
 VOID     SvNptSweepDisarm(VOID);
 
@@ -132,7 +166,8 @@ VOID     SvNptSweepDisarm(VOID);
  * the page and re-execute.  No allocation: every table it touches already
  * exists.
  */
-BOOLEAN  SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo);
+BOOLEAN  SvNptSweepGrant(_In_ UINT64 Gpa, _In_ UINT64 FaultInfo,
+                         _Out_ UINT32* State);
 
 /* Pages granted so far, and how many the range holds. */
 VOID     SvNptSweepState(_Out_ ULONG* Mode, _Out_ UINT64* Base, _Out_ UINT64* Size,

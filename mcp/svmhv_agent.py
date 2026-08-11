@@ -744,8 +744,8 @@ def tool_trace_reset() -> str:
 def tool_sweep(mode: str = "exec", base: str = "0", size: str = "0") -> str:
     """Arm or disarm a coverage sweep over guest physical memory."""
     mode = mode.lower()
-    if mode not in ("exec", "write", "off"):
-        return "mode must be exec, write or off"
+    if mode not in ("exec", "write", "both", "off"):
+        return "mode must be exec, write, both or off"
     if mode == "off":
         result = pairs(ctl("sweep", "off"))
         status = as_int(result, "status", 0)
@@ -767,14 +767,32 @@ def tool_sweep(mode: str = "exec", base: str = "0", size: str = "0") -> str:
         elif code == 0xC000009A:
             why = (" - no contiguous block that size. Ask for less, or reload "
                    "the driver when the guest is less fragmented.")
+        elif code == 0xC0000206:
+            why = (" - both-mode is capped at 64 MiB, and the cap is where the "
+                   "evidence is: 2 GiB took every processor out of SVM and 256 "
+                   "MiB powered the guest off. Taking write permission away "
+                   "means faulting on nearly every page the guest touches, and "
+                   "the storm starves the worker that would disarm it. Sweep a "
+                   "range you have a reason to suspect.")
         return f"failed: {code:#010x}{why}"
 
     armed = as_int(result, "sweep_size")
-    return (f"sweeping {mode} over {armed / (1 << 20):,.0f} MiB from "
-            f"{int(hexarg(base), 16):#x}\n"
-            f"Every page in the range now faults once, the first time it is "
-            f"{'executed' if mode == 'exec' else 'written'}, and never again. "
-            f"Read the result with svmhv_coverage.")
+    what = {"exec": "executed", "write": "written",
+            "both": "written or executed"}[mode]
+    lines = [f"sweeping {mode} over {armed / (1 << 20):,.0f} MiB from "
+             f"{int(hexarg(base), 16):#x}",
+             f"Every page in the range now faults once, the first time it is "
+             f"{what}, and never again. Read the result with svmhv_coverage."]
+    if mode == "both":
+        lines += [
+            "",
+            "This is the mode that finds manually mapped code. A page written "
+            "and THEN executed had its code arrive after its mapping did, "
+            "which an image loaded by the section manager never does - so "
+            "what comes back marked that way is a manual map, an unpacker or "
+            "a JIT, and very little else.",
+        ]
+    return "\n".join(lines)
 
 
 def tool_coverage(limit: int = 400, unknown_only: bool = True) -> str:
@@ -797,11 +815,18 @@ def tool_coverage(limit: int = 400, unknown_only: bool = True) -> str:
     # module list, so testing a user-mode RIP against it says "unknown" for
     # every thread in every process - which would bury the one answer the tool
     # exists to give under all of ordinary user-mode execution.
-    known, unknown, user = [], [], []
+    # Written-then-executed comes out on its own and first. Everything else
+    # here is "code ran", which is ordinary; this is "code arrived, and then
+    # ran", which almost nothing legitimate does.
+    known, unknown, user, wx = [], [], [], []
     for row in rows:
         gpa = int(row.get("a0", "0"), 0)
         rip = int(row.get("rip", "0"), 0)
         cr3 = int(row.get("cr3", "0"), 0)
+        state = int(row.get("a1", "0"), 0)
+        if state & 0x04:                    # SVMHV_PAGE_WRITE_FIRST
+            wx.append((gpa, rip, cr3))
+            continue
         if rip < 0xFFFF800000000000:
             user.append((gpa, rip, cr3))
         elif module_for(rip) is not None:
@@ -809,10 +834,20 @@ def tool_coverage(limit: int = 400, unknown_only: bool = True) -> str:
         else:
             unknown.append((gpa, rip, cr3))
 
-    lines = [f"{len(rows)} page(s) in the most recent records: {len(unknown)} "
-             f"run from kernel addresses no loaded module accounts for, "
-             f"{len(known)} from inside a known module, {len(user)} from user "
-             f"mode"]
+    lines = [f"{len(rows)} page(s) in the most recent records: {len(wx)} "
+             f"WRITTEN THEN EXECUTED, {len(unknown)} run from kernel "
+             f"addresses no loaded module accounts for, {len(known)} from "
+             f"inside a known module, {len(user)} from user mode"]
+
+    if wx:
+        lines += ["", "WRITTEN THEN EXECUTED - code that arrived after its "
+                      "mapping did. This is what a manual map looks like:"]
+        for gpa, rip, cr3 in wx[:limit]:
+            lines.append(f"  gpa {gpa:#014x}  first executed from "
+                         f"{symbolize(rip)}  cr3 {cr3:#x}")
+        lines.append("  Dump one with svmhv_read_physical at that gpa. The "
+                     "page was written before it ran, so whatever wrote it is "
+                     "the loader worth finding next.")
     if produced > len(rows):
         # A sweep over a live range produces thousands of these, and this reads
         # only the newest slice of the ring. Say so rather than let a sample
@@ -5721,11 +5756,15 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["exec", "write", "off"],
+                "mode": {"type": "string",
+                         "enum": ["exec", "write", "both", "off"],
                          "description":
                              "exec finds code that has run; write finds pages "
-                             "something modified, which is where an unpacker "
-                             "shows itself"},
+                             "something modified; BOTH is the one that finds "
+                             "manually mapped code, because it remembers the "
+                             "order - a page written and then executed had its "
+                             "code arrive after its mapping, which a normally "
+                             "loaded image never does"},
                 "base": {"type": "string",
                          "description": "guest physical base, hex"},
                 "size": {"type": "string", "description": "bytes, hex"},
