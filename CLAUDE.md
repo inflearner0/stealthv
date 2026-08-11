@@ -109,6 +109,40 @@ being absent.
   status` reports `fatal_count` and the reason afterwards, and with `kd`
   attached a triple fault prints one line naming RIP, RSP, CR2, CR3 and
   EXITINTINFO. Read `fatal_count` before believing any run.
+- **`capture_stack` bugchecks the guest, reproducibly.** A trace hook installed
+  with it on `nt!NtCreateFile` took the guest down in under a minute with
+  `0x50 PAGE_FAULT_IN_NONPAGED_AREA`, reading `ffffc70a123ab000` — the page
+  immediately above the faulting thread's own stack pointer, which is the guard
+  page. The fault is inside `SvTraceStackCandidates`, which walks 256 qwords up
+  from RSP looking for things that could be return addresses and simply runs off
+  the top of a shallow stack.
+
+  Its `__try`/`__except` does not help and cannot: an access to an unmapped
+  *kernel* address is not an exception Windows raises, it is `MiSystemFault`
+  deciding the reference is invalid and calling `KeBugCheckEx`, so there is
+  nothing for the handler to catch. The comment claiming the stack is
+  "therefore resident" is true only of the part below RSP that has been written.
+  Closing it means bounding the walk by the real limits —
+  `KeGetCurrentThread()`'s `StackLimit` and `StackBase`, or
+  `IoGetStackLimits` — rather than by a count of 256, and the `__except` should
+  go with it so it stops looking like protection.
+
+  Unlike the reset, this one leaves evidence: host event **18590** (not 18560),
+  a real `Minidump\*.dmp`, and a stack of `KeBugCheckEx` ← `MiSystemFault` ←
+  `MmAccessFault` ← `KiPageFault` ← `svmhv+0x69c8`. Exec hooks without
+  `capture_stack` ran for forty minutes under the same load with nothing.
+- **A hot loop in PowerShell dies while an exec hook is live.** With a
+  system-wide trace hook on `nt!NtCreateFile`, `powershell.exe` twice took an
+  `AccessViolationException` inside `RuntimeHelpers._CompileMethod`, reached
+  through `Interpreter.LoopCompiler.CreateDelegate` — PowerShell promoting a
+  loop to compiled code, and the JIT faulting as it does so. The task exits
+  `0xC0000005` and no `finally` runs, so a test written that way abandons the
+  driver loaded and takes PowerShell Direct with it.
+
+  Whether the hypervisor is at fault is not established; what is established is
+  that a lab script must not drive the ring from a `for` loop while a hook is
+  installed. `cursortests.ps1` waits for ordinary system activity instead. Worth
+  noting the guest itself survived both: `LastBootUpTime` never moved.
 - The resume-from-sleep path has never run; see above.
 - A processor that comes online *after* load has no per-processor slot and stays
   unvirtualised. It is no longer an out-of-bounds array index, but it is still a
