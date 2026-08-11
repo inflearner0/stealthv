@@ -258,7 +258,8 @@ VOID SvStepDisarm(_Inout_ VIRTUAL_CPU* Cpu)
     Cpu->Step.HookId = 0;
 }
 
-BOOLEAN SvStepHandleDebugException(_Inout_ VIRTUAL_CPU* Cpu)
+BOOLEAN SvStepHandleDebugException(_Inout_ VIRTUAL_CPU* Cpu,
+                                   _In_opt_ const struct _GUEST_CONTEXT* Context)
 {
     VMCB* vmcb = &Cpu->GuestVmcb;
 
@@ -320,7 +321,7 @@ BOOLEAN SvStepHandleDebugException(_Inout_ VIRTUAL_CPU* Cpu)
         SvTraceStep(vmcb->StateSave.Rip, vmcb->StateSave.Rsp,
                     vmcb->StateSave.Rflags, vmcb->StateSave.Cr3,
                     Cpu->Index, bytes, length,
-                    Cpu->Step.GuestTf);
+                    Cpu->Step.GuestTf, Context);
     }
 
     Cpu->Step.Remaining--;

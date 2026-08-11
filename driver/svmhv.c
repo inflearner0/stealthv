@@ -31,15 +31,14 @@
 #include "control.h"
 #include "hvcall.h"
 #include "objects.h"
+#include "snapshot.h"
+#include "ibs.h"
 
 #ifndef STATUS_HV_FEATURE_UNAVAILABLE
 #define STATUS_HV_FEATURE_UNAVAILABLE ((NTSTATUS)0xC0350011L)
 #endif
 
 NTSYSAPI    VOID    NTAPI RtlCaptureContext(PCONTEXT ContextRecord);
-NTKERNELAPI VOID    KeGenericCallDpc(PKDEFERRED_ROUTINE Routine, PVOID Context);
-NTKERNELAPI VOID    KeSignalCallDpcDone(PVOID SystemArgument1);
-NTKERNELAPI LOGICAL KeSignalCallDpcSynchronize(PVOID SystemArgument2);
 
 DRIVER_INITIALIZE DriverEntry;
 static DRIVER_UNLOAD     SvDriverUnload;
@@ -1218,6 +1217,20 @@ static BOOLEAN SvHandleNestedPageFault(_Inout_ VIRTUAL_CPU* Cpu)
     }
 
     /*
+     * A snapshot: this page lost write permission so that the first store to it
+     * could be caught and the original copied aside.  Checked before the sweep
+     * because both take write permission away and the snapshot's answer is the
+     * more specific one - the sweep would grant the write without saving
+     * anything, and the page would then be unrestorable with nothing to say so.
+     */
+    if (SvSnapshotSaveOnWrite(gpa, info))
+    {
+        Cpu->PendingFlush = TRUE;
+        SvNpfExplained(Cpu);
+        return FALSE;
+    }
+
+    /*
      * A coverage sweep: this page is faulting because we took the permission
      * away, not because anything is wrong with it.  Grant it for good, record
      * that it was reached, and re-execute - so a page costs one exit the first
@@ -1344,6 +1357,13 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
     }
 
     /*
+     * Collect an IBS sample if one has ripened.  Here rather than at an
+     * interrupt because this handler is already running - see ibs.h.  One
+     * global read and a well-predicted branch when nothing is armed.
+     */
+    SvIbsPoll(Cpu->Index, vmcb->StateSave.Cr3);
+
+    /*
      * A watch step that is not going to end the way it was supposed to.
      *
      * It ends at the #DB one instruction later.  Anything else arriving first
@@ -1399,7 +1419,7 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
         /* Captured first: handling the exception is what clears it. */
         const UINT32 reason = Cpu->Step.Reason;
 
-        if (!SvStepHandleDebugException(Cpu))
+        if (!SvStepHandleDebugException(Cpu, Context))
         {
             vmcb->Control.EventInj = SVM_EVENTINJ_VALID |
                                      SVM_EVENTINJ_TYPE_EXCEPTION |
@@ -1768,7 +1788,17 @@ static VOID SvVirtualizeDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Context,
 
     if (cpu != NULL)
     {
-        SvVirtualizeProcessor(cpu);
+        /*
+         * Idempotent, so that this DPC can be used to bring back only the
+         * processors that are out.  Entering guest mode on one that is already
+         * in it would capture a context from inside the hypervisor and launch a
+         * guest that resumes there - see SvReviveProcessors, which is the
+         * caller that makes this matter.
+         */
+        if (cpu->Virtualized == 0)
+        {
+            SvVirtualizeProcessor(cpu);
+        }
     }
     else
     {
@@ -1941,6 +1971,94 @@ static VOID SvPowerCallback(_In_opt_ PVOID Context, _In_opt_ PVOID Argument1,
         DbgPrint("svmhv: back in S0 - revirtualising\n");
         SvResumeVirtualization();
     }
+}
+
+/*
+ * Put back the processors that are out of SVM, and only those.
+ *
+ * A fatal exit takes its processor out of guest mode and leaves it there.  That
+ * is the right trade at the moment it happens - the machine survives and the
+ * evidence survives - but until now the only way back was to unload and reload
+ * the driver, which throws away every hook, every sweep and the trace ring
+ * along with the problem.  For a client that has spent an hour establishing
+ * where to look, that is most of the cost of the fault.
+ *
+ * Deliberately not automatic.  Whatever caused the fatal exit is usually still
+ * there, so a worker that revived a processor on sight would produce a loop
+ * that reports one fatal exit per poll and makes no progress - and the counter
+ * that says how bad things are would be the thing being reset.  Reviving is a
+ * decision, so it is a command.
+ */
+ULONG SvReviveProcessors(_Out_ ULONG* WereDown, _Out_ ULONG* Total)
+{
+    ULONG down = 0;
+    ULONG up = 0;
+    ULONG i;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    *WereDown = 0;
+    *Total = 0;
+
+    if (g_Cpus == NULL)
+    {
+        return 0;
+    }
+
+    *Total = g_CpuCount;
+
+    for (i = 0; i < g_CpuCount; i++)
+    {
+        VIRTUAL_CPU* cpu = g_Cpus[i];
+
+        if (cpu->Virtualized != 0)
+        {
+            continue;
+        }
+
+        /*
+         * The same clean slate the resume path uses, and for the same reason:
+         * LaunchFailed is sticky, and a processor that failed once would
+         * otherwise refuse for the rest of the driver's life.  Only the
+         * processors that are down are touched - resetting a live one's view
+         * or its pending flush underneath it would be a race with itself.
+         */
+        cpu->LaunchFailed    = 0;
+        cpu->ShadowNptActive = FALSE;
+        cpu->NptView         = SVMHV_NPT_PRIMARY;
+        cpu->PendingFlush    = FALSE;
+        cpu->SpuriousNpf     = 0;
+        cpu->LastNpfGpa      = 0;
+        cpu->LastNpfRip      = 0;
+        down++;
+    }
+
+    *WereDown = down;
+
+    if (down == 0)
+    {
+        return 0;
+    }
+
+    DbgPrint("svmhv: reviving %lu processor(s) that had left SVM\n", down);
+    KeGenericCallDpc(SvVirtualizeDpc, NULL);
+
+    for (i = 0; i < g_CpuCount; i++)
+    {
+        if (g_Cpus[i]->Virtualized != 0)
+        {
+            up++;
+        }
+        else
+        {
+            DbgPrint("svmhv: CPU %lu did not come back (exitcode %llx)\n",
+                     i, g_Cpus[i]->LaunchExitCode);
+        }
+    }
+
+    DbgPrint("svmhv: revive - %lu of %lu processors in guest mode\n",
+             up, g_CpuCount);
+    return up;
 }
 
 ULONG SvCyclePowerTransition(VOID)
@@ -2596,6 +2714,18 @@ static VOID SvDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     SvControlStop();
     SvPowerUnregister();
 
+    /*
+     * Before the processors leave guest mode, not after: releasing a snapshot
+     * gives write permission back and then drives an exit everywhere to make it
+     * take effect, and that exit is a VMMCALL - which raises #UD on a processor
+     * that is no longer in SVM.
+     */
+    SvSnapshotRelease();
+
+    /* Same reason, and the same window: disarming writes an MSR on every
+       processor, which is only legal while they are still ours. */
+    (VOID)SvIbsArm(0);
+
     /* A client that armed the callback probe and went away leaves four
        registrations behind, one of which fires on every registry operation. */
     SvObjectsProbeStop();
@@ -2734,6 +2864,11 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
             SvHideHypervisorPages();
         }
     }
+
+    /* Once, and before any processor can be in the exit handler asking: the
+       CPUID gate is the only thing standing between an arm and a #GP with GIF
+       clear.  See ibs.h. */
+    SvIbsProbe();
 
     KeGenericCallDpc(SvVirtualizeDpc, NULL);
 

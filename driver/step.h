@@ -150,7 +150,15 @@ VOID SvStepDrain(_Inout_ struct _VIRTUAL_CPU* Cpu);
  * consumed and must not reach the guest - and FALSE if the guest was
  * single-stepping on its own account and should get its exception back.
  */
-BOOLEAN SvStepHandleDebugException(_Inout_ struct _VIRTUAL_CPU* Cpu);
+/*
+ * Context is the guest's pushed register frame, recorded with every step of a
+ * SVMHV_STEP_TRACE run so the run can be walked backwards afterwards.  Same
+ * forward declaration as SvTraceStep's, and for the same reason.
+ */
+struct _GUEST_CONTEXT;
+
+BOOLEAN SvStepHandleDebugException(_Inout_ struct _VIRTUAL_CPU* Cpu,
+                                   _In_opt_ const struct _GUEST_CONTEXT* Context);
 
 /*
  * PUSHF and POPF, emulated so that TF reads back the way the guest left it.

@@ -1615,6 +1615,11 @@ static void Usage(void)
         "  svmhvctl watchmsr <msr> [on|off]\n"
         "  svmhvctl watchio  <port> [on|off]\n"
         "  svmhvctl sweep exec|write|both <base> <size> | sweep off\n"
+        "  svmhvctl snapshot take <address> <size> [pid] [store pages]\n"
+        "  svmhvctl snapshot restore | release | query\n"
+        "  svmhvctl call <address> [arg ...] [pid=<n>]\n"
+        "  svmhvctl revive\n"
+        "  svmhvctl ibs <interval in micro-ops, 0 to stop>\n"
         "  svmhvctl unhook <target>\n\n"
         "Hook options, after the positional arguments:\n"
         "  --process NAME        only when NAME is the current process\n"
@@ -2029,6 +2034,180 @@ int main(int argc, char** argv)
         memcpy(&size, data, sizeof(size));
         printf("sweep_mode=%u\nsweep_base=0x%llx\nsweep_size=0x%llx\n"
                "sweep_granted=%u\n", mode, base, size, returned);
+        return 0;
+    }
+
+    /* Instruction-based sampling.  "ibs <interval>" in decimal, 0 to stop. */
+    if (_stricmp(argv[1], "ibs") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned __int64 interval = strtoull(argv[2], NULL, 0);
+        unsigned __int64 armed = 0;
+        unsigned __int64 samples = 0;
+        unsigned int returned = 0;
+
+        memset(data, 0, sizeof(data));
+        if (!SubmitMemory(SVMHV_CMD_IBS, interval, SVMHV_IBS_ARGS, 0,
+                          data, data, &returned))
+        {
+            return 2;
+        }
+
+        memcpy(&armed,   data,     sizeof(armed));
+        memcpy(&samples, data + 8, sizeof(samples));
+
+        printf("ibs_interval=%llu\nibs_samples=%llu\n", armed, samples);
+        return 0;
+    }
+
+    /* Put back the processors a fatal exit left outside SVM. */
+    if (_stricmp(argv[1], "revive") == 0)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned __int64 down = 0;
+        unsigned __int64 up = 0;
+        unsigned __int64 total = 0;
+        unsigned int returned = 0;
+
+        memset(data, 0, sizeof(data));
+        if (!SubmitMemory(SVMHV_CMD_REVIVE, 0, SVMHV_REVIVE_ARGS, 0,
+                          data, data, &returned))
+        {
+            return 2;
+        }
+
+        memcpy(&down,  data,      sizeof(down));
+        memcpy(&up,    data + 8,  sizeof(up));
+        memcpy(&total, data + 16, sizeof(total));
+
+        printf("revive_were_down=%llu\nrevive_virtualized=%llu\n"
+               "revive_processors=%llu\n", down, up, total);
+        return 0;
+    }
+
+    /*
+     * Call a function.  "call <address> [arg ...]", hex throughout, up to eight
+     * arguments, with "pid=<n>" anywhere among them to pick an address space.
+     */
+    if (_stricmp(argv[1], "call") == 0 && argc >= 3)
+    {
+        unsigned char data[REQ_MEM_MAX];
+        unsigned __int64 arguments[SVMHV_CALL_MAX_ARGS];
+        unsigned __int64 target = strtoull(argv[2], NULL, 16);
+        unsigned __int64 returnValue = 0;
+        unsigned __int64 cycles = 0;
+        unsigned int returned = 0;
+        unsigned int exception = 0;
+        unsigned int count = 0;
+        unsigned int pid = 0;
+        int i;
+
+        memset(arguments, 0, sizeof(arguments));
+
+        for (i = 3; i < argc; i++)
+        {
+            if (_strnicmp(argv[i], "pid=", 4) == 0)
+            {
+                pid = (unsigned int)strtoul(argv[i] + 4, NULL, 0);
+                continue;
+            }
+            if (count >= SVMHV_CALL_MAX_ARGS)
+            {
+                fprintf(stderr, "at most %u arguments\n", SVMHV_CALL_MAX_ARGS);
+                return 2;
+            }
+            arguments[count++] = strtoull(argv[i], NULL, 16);
+        }
+
+        memset(data, 0, sizeof(data));
+        memcpy(data, arguments, sizeof(arguments));
+        memcpy(data + sizeof(arguments), &count, sizeof(count));
+
+        if (!SubmitMemory(SVMHV_CMD_CALL, target, SVMHV_CALL_ARGS, pid,
+                          data, data, &returned))
+        {
+            return 2;
+        }
+
+        memcpy(&returnValue, data,      sizeof(returnValue));
+        memcpy(&cycles,      data + 8,  sizeof(cycles));
+        memcpy(&exception,   data + 16, sizeof(exception));
+
+        printf("call_target=0x%llx\ncall_args=%u\ncall_result=0x%llx\n"
+               "call_cycles=%llu\ncall_exception=0x%08x\n",
+               target, count, returnValue, cycles, exception);
+        return 0;
+    }
+
+    /*
+     * Copy-on-write snapshot.  "snapshot take <address> <size> [pid] [store]",
+     * "snapshot restore", "snapshot release", "snapshot query".
+     */
+    if (_stricmp(argv[1], "snapshot") == 0 && argc >= 3)
+    {
+        static const char* const states[] = { "idle", "armed", "overflowed" };
+        unsigned char data[REQ_MEM_MAX];
+        unsigned int returned = 0;
+        unsigned __int64 address = 0;
+        unsigned __int64 size = 0;
+        unsigned __int64 base = 0;
+        unsigned __int64 armed = 0;
+        unsigned __int64 dirty = 0;
+        unsigned __int64 capacity = 0;
+        unsigned int mode = 0;
+        unsigned int pid = 0;
+        unsigned int storePages = 0;
+        unsigned int state = 0;
+        unsigned int restored = 0;
+
+        if (_stricmp(argv[2], "take") == 0)         { mode = 1; }
+        else if (_stricmp(argv[2], "restore") == 0) { mode = 2; }
+        else if (_stricmp(argv[2], "release") == 0) { mode = 0; }
+        else if (_stricmp(argv[2], "query") == 0)   { mode = 3; }
+        else
+        {
+            fprintf(stderr, "snapshot takes take, restore, release or query\n");
+            return 2;
+        }
+
+        if (mode == 1)
+        {
+            if (argc < 5)
+            {
+                fprintf(stderr,
+                        "snapshot take needs <address> <size> in hex, "
+                        "then optional <pid> <store pages>\n");
+                return 2;
+            }
+            address = strtoull(argv[3], NULL, 16);
+            size    = strtoull(argv[4], NULL, 16);
+            if (argc >= 6) { pid = (unsigned int)strtoul(argv[5], NULL, 0); }
+            if (argc >= 7) { storePages = (unsigned int)strtoul(argv[6], NULL, 0); }
+        }
+
+        memset(data, 0, sizeof(data));
+        memcpy(data, &size, sizeof(size));
+        memcpy(data + 8, &mode, sizeof(mode));
+        memcpy(data + 12, &storePages, sizeof(storePages));
+
+        if (!SubmitMemory(SVMHV_CMD_SNAPSHOT, address, SVMHV_SNAPSHOT_ARGS, pid,
+                          data, data, &returned))
+        {
+            return 2;
+        }
+
+        memcpy(&state,    data,      sizeof(state));
+        memcpy(&restored, data + 4,  sizeof(restored));
+        memcpy(&base,     data + 8,  sizeof(base));
+        memcpy(&armed,    data + 16, sizeof(armed));
+        memcpy(&dirty,    data + 24, sizeof(dirty));
+        memcpy(&capacity, data + 32, sizeof(capacity));
+
+        printf("snapshot_state=%s\nsnapshot_base=0x%llx\nsnapshot_size=0x%llx\n"
+               "snapshot_dirty=%llu\nsnapshot_capacity=%llu\n"
+               "snapshot_restored=%u\n",
+               (state < 3) ? states[state] : "unknown",
+               base, armed, dirty, capacity, restored);
         return 0;
     }
 

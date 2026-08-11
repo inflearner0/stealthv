@@ -10,6 +10,16 @@
 #include "trace.h"      /* SVMHV_WATCH_PENDING lives in the VIRTUAL_CPU */
 #include "step.h"       /* and so does SVMHV_STEP_STATE                 */
 
+/*
+ * Undocumented but exported, and there is no header for them in the WDK.
+ * Declared here rather than in svmhv.c because everything that runs something
+ * on every processor needs them - the virtualise and devirtualise paths, the
+ * TLB sync, and now the IBS arm.
+ */
+NTKERNELAPI VOID    KeGenericCallDpc(PKDEFERRED_ROUTINE Routine, PVOID Context);
+NTKERNELAPI VOID    KeSignalCallDpcDone(PVOID SystemArgument1);
+NTKERNELAPI LOGICAL KeSignalCallDpcSynchronize(PVOID SystemArgument2);
+
 #define SVMHV_POOL_TAG          'vmvS'      /* "Svmv" */
 #define SVMHV_HOST_STACK_SIZE   0x6000      /* 24 KiB per CPU              */
 #define SVMHV_GUEST_ASID        1
@@ -289,3 +299,10 @@ BOOLEAN  SvTakeFatalExitReport(_Out_ SVMHV_FATAL_EXIT* Fatal);
  * Returns how many processors came back virtualised.
  */
 ULONG    SvCyclePowerTransition(VOID);
+
+/*
+ * Bring back the processors that a fatal exit left outside SVM, and only those.
+ * Returns how many are in guest mode afterwards; WereDown is how many needed
+ * it, so that "nothing was wrong" and "nothing came back" are distinguishable.
+ */
+ULONG    SvReviveProcessors(_Out_ ULONG* WereDown, _Out_ ULONG* Total);

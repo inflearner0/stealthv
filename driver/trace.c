@@ -1209,7 +1209,8 @@ VOID SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
 VOID SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
                  _In_ UINT64 Cr3, _In_ UINT32 Processor,
                  _In_reads_(CodeLength) const UINT8* Code,
-                 _In_ UINT32 CodeLength, _In_ BOOLEAN GuestTf)
+                 _In_ UINT32 CodeLength, _In_ BOOLEAN GuestTf,
+                 _In_opt_ const struct _GUEST_CONTEXT* Context)
 {
     UINT64 sequence;
     SVMHV_TRACE_RECORD* record = SvTraceClaim(&sequence);
@@ -1246,6 +1247,33 @@ VOID SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
     }
     RtlCopyMemory(record->Code, Code, CodeLength);
     record->CodeLength = CodeLength;
+
+    /*
+     * Every register, in x86-64 encoding order, so that the index in a record
+     * is the same number the ModRM byte of the instruction at Rip uses and a
+     * reader can go straight from a decoded operand to the value it held.  RSP
+     * is the VMCB's, because the slot of that name in the pushed frame is a
+     * dummy pushed only for alignment.
+     */
+    if (Context != NULL)
+    {
+        record->Registers[0]  = Context->Rax;
+        record->Registers[1]  = Context->Rcx;
+        record->Registers[2]  = Context->Rdx;
+        record->Registers[3]  = Context->Rbx;
+        record->Registers[4]  = Rsp;
+        record->Registers[5]  = Context->Rbp;
+        record->Registers[6]  = Context->Rsi;
+        record->Registers[7]  = Context->Rdi;
+        record->Registers[8]  = Context->R8;
+        record->Registers[9]  = Context->R9;
+        record->Registers[10] = Context->R10;
+        record->Registers[11] = Context->R11;
+        record->Registers[12] = Context->R12;
+        record->Registers[13] = Context->R13;
+        record->Registers[14] = Context->R14;
+        record->Registers[15] = Context->R15;
+    }
 
     SvTracePublish(record, sequence);
 }

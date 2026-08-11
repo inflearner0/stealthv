@@ -8,6 +8,9 @@
 #include "trace.h"
 #include "memory.h"
 #include "objects.h"
+#include "snapshot.h"
+#include "call.h"
+#include "ibs.h"
 
 /*
  * Both are ordinary driver globals on purpose: a client resolves svmhv!g_Control
@@ -276,7 +279,8 @@ static VOID SvControlReportFatalExit(VOID)
     DbgPrint("svmhv: FATAL EXIT #%llu on cpu %lu: %s\n"
              "svmhv:   exitcode %llx info1 %llx info2 %llx exitintinfo %llx\n"
              "svmhv:   rip %llx rsp %llx cr2 %llx cr3 %llx\n"
-             "svmhv:   that processor has left SVM and is running natively\n",
+             "svmhv:   that processor has left SVM and is running natively\n"
+             "svmhv:   'svmhvctl revive' puts it back without a reload\n",
              fatal.Count, fatal.Processor, reason,
              fatal.ExitCode, fatal.ExitInfo1, fatal.ExitInfo2, fatal.ExitIntInfo,
              fatal.Rip, fatal.Rsp, fatal.Cr2, fatal.Cr3);
@@ -378,6 +382,107 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
            cached stop being the ones it is using. */
         SvSyncTlbFlush();
         return status;
+    }
+
+    case SVMHV_CMD_SNAPSHOT:
+    {
+        UINT64 size = 0;
+        UINT32 mode = 0;
+        UINT32 storePages = 0;
+        UINT32 state = 0;
+        UINT32 restored32 = 0;
+        UINT64 restored = 0;
+        UINT64 base = 0;
+        UINT64 armed = 0;
+        UINT64 dirty = 0;
+        UINT64 capacity = 0;
+        ULONG stateWord = 0;
+        NTSTATUS status = STATUS_SUCCESS;
+
+        RtlCopyMemory(&size, g_Control.Request.MemoryData, sizeof(size));
+        RtlCopyMemory(&mode, g_Control.Request.MemoryData + 8, sizeof(mode));
+        RtlCopyMemory(&storePages, g_Control.Request.MemoryData + 12,
+                      sizeof(storePages));
+
+        switch (mode)
+        {
+        case SVMHV_SNAPSHOT_TAKE:
+            status = SvSnapshotTake(g_Control.Request.MemoryAddress, size,
+                                    g_Control.Request.MemoryProcessId,
+                                    storePages);
+            break;
+
+        case SVMHV_SNAPSHOT_RESTORE:
+            status = SvSnapshotRestore(&restored);
+            break;
+
+        case SVMHV_SNAPSHOT_RELEASE:
+            SvSnapshotRelease();
+            break;
+
+        case SVMHV_SNAPSHOT_QUERY:
+            break;
+
+        default:
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        SvSnapshotState(&stateWord, &base, &armed, &dirty, &capacity);
+        state = (UINT32)stateWord;
+        restored32 = (UINT32)restored;
+
+        RtlZeroMemory(g_Control.Request.MemoryData, SVMHV_SNAPSHOT_ARGS);
+        RtlCopyMemory(g_Control.Request.MemoryData,      &state, sizeof(state));
+        RtlCopyMemory(g_Control.Request.MemoryData + 4,  &restored32,
+                      sizeof(restored32));
+        RtlCopyMemory(g_Control.Request.MemoryData + 8,  &base, sizeof(base));
+        RtlCopyMemory(g_Control.Request.MemoryData + 16, &armed, sizeof(armed));
+        RtlCopyMemory(g_Control.Request.MemoryData + 24, &dirty, sizeof(dirty));
+        RtlCopyMemory(g_Control.Request.MemoryData + 32, &capacity,
+                      sizeof(capacity));
+        g_Control.Request.MemoryReturned = SVMHV_SNAPSHOT_ARGS;
+        return status;
+    }
+
+    case SVMHV_CMD_CALL:
+        return SvCallFunction(&g_Control.Request);
+
+    case SVMHV_CMD_IBS:
+    {
+        const NTSTATUS status =
+            SvIbsArm((UINT32)g_Control.Request.MemoryAddress);
+        UINT32 interval = 0;
+        UINT64 samples = 0;
+        UINT64 interval64;
+
+        SvIbsState(&interval, &samples);
+        interval64 = interval;
+
+        RtlZeroMemory(g_Control.Request.MemoryData, SVMHV_IBS_ARGS);
+        RtlCopyMemory(g_Control.Request.MemoryData, &interval64,
+                      sizeof(interval64));
+        RtlCopyMemory(g_Control.Request.MemoryData + 8, &samples,
+                      sizeof(samples));
+        g_Control.Request.MemoryReturned = SVMHV_IBS_ARGS;
+        return status;
+    }
+
+    case SVMHV_CMD_REVIVE:
+    {
+        ULONG wereDown = 0;
+        ULONG processors = 0;
+        const ULONG up = SvReviveProcessors(&wereDown, &processors);
+        const UINT64 down64 = wereDown;
+        const UINT64 up64 = up;
+        const UINT64 total = processors;
+
+        RtlZeroMemory(g_Control.Request.MemoryData, SVMHV_REVIVE_ARGS);
+        RtlCopyMemory(g_Control.Request.MemoryData,      &down64, sizeof(down64));
+        RtlCopyMemory(g_Control.Request.MemoryData + 8,  &up64,   sizeof(up64));
+        RtlCopyMemory(g_Control.Request.MemoryData + 16, &total,  sizeof(total));
+        g_Control.Request.MemoryReturned = SVMHV_REVIVE_ARGS;
+        return STATUS_SUCCESS;
     }
 
     default:

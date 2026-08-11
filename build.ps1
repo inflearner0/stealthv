@@ -129,7 +129,8 @@ $kmDefs = @(
 )
 
 $kmSources = @("svmhv.c", "npt.c", "hook.c", "trace.c", "step.c", "control.c",
-               "hvcall.c", "memory.c", "objects.c")
+               "hvcall.c", "memory.c", "objects.c", "snapshot.c", "call.c",
+               "ibs.c")
 
 foreach ($src in $kmSources) {
     $obj = [IO.Path]::ChangeExtension($src, ".obj")
@@ -147,17 +148,22 @@ Invoke-Tool $ml64 @(
     "/Fo", "$out\svmasm.obj", "$root\driver\svmasm.asm"
 ) "ml64 svmasm.asm"
 
-Invoke-Tool $link @(
+# The object list is derived from $kmSources rather than written out again: the
+# two used to be separate, and adding a file to one and not the other links a
+# driver with everything in it missing - which surfaces as unresolved externals
+# named after the callers, never after the file that was forgotten.
+$kmObjects = @($kmSources | ForEach-Object {
+    "$out\" + [IO.Path]::ChangeExtension($_, ".obj")
+})
+
+Invoke-Tool $link (@(
     "/nologo", "/DRIVER", "/SUBSYSTEM:NATIVE,10.00", "/ENTRY:DriverEntry",
     "/NODEFAULTLIB", "/INCREMENTAL:NO", "/RELEASE", "/DEBUG",
     "/OPT:REF", "/OPT:ICF", "/MANIFEST:NO",
     "/LIBPATH:$kit\Lib\$SdkVersion\km\x64",
     "ntoskrnl.lib", "hal.lib",
-    "/PDB:$out\svmhv.pdb", "/OUT:$out\svmhv.sys",
-    "$out\svmhv.obj", "$out\npt.obj", "$out\hook.obj", "$out\trace.obj",
-    "$out\step.obj", "$out\control.obj", "$out\hvcall.obj", "$out\memory.obj",
-    "$out\objects.obj", "$out\svmasm.obj"
-) "link svmhv.sys"
+    "/PDB:$out\svmhv.pdb", "/OUT:$out\svmhv.sys"
+) + $kmObjects + @("$out\svmasm.obj")) "link svmhv.sys"
 
 # --------------------------------------------------------------- test app
 $umInc = @(

@@ -104,10 +104,19 @@ VOID     SvTraceWatchComplete(_Inout_ SVMHV_WATCH_PENDING* Pending);
 VOID     SvTraceSetBranch(_In_ UINT32 Processor, _In_ UINT64 From,
                           _In_ UINT64 To);
 
+/*
+ * Context is the guest's pushed register frame, or NULL when the caller has
+ * not got one.  Forward-declared rather than included: GUEST_CONTEXT lives in
+ * svmhv.h, which includes this header, so naming the type here would be a
+ * cycle - and every caller is in a translation unit that has both.
+ */
+struct _GUEST_CONTEXT;
+
 VOID     SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
                      _In_ UINT64 Cr3, _In_ UINT32 Processor,
                      _In_reads_(CodeLength) const UINT8* Code,
-                     _In_ UINT32 CodeLength, _In_ BOOLEAN GuestTf);
+                     _In_ UINT32 CodeLength, _In_ BOOLEAN GuestTf,
+                     _In_opt_ const struct _GUEST_CONTEXT* Context);
 
 /*
  * An MSR or I/O port access that somebody asked to be told about.  One shape

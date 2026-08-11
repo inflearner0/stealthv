@@ -369,6 +369,18 @@ typedef struct _SVMHV_HOOK_LIST
  */
 #define SVMHV_TRACE_COVER       7
 
+/*
+ * An Instruction-Based Sampling hit.  Arguments[0] is the linear data address
+ * the sampled micro-op touched, or 0 when it touched none; Arguments[1] is the
+ * raw IBS_OP_DATA, Arguments[2] is 1 for a store and 0 for a load, and
+ * ErrorCode the raw IBS_OP_DATA3 so a client can decode the cache and TLB bits
+ * itself.  Rip is the sampled instruction.
+ *
+ * Unlike every other record here this one costs nothing per event: the
+ * processor picked the instruction, not us.
+ */
+#define SVMHV_TRACE_IBS         8
+
 typedef struct _SVMHV_TRACE_RECORD
 {
     UINT64 Sequence;
@@ -467,6 +479,29 @@ typedef struct _SVMHV_TRACE_RECORD
      */
     UINT64 BranchFrom;
     UINT64 BranchTo;
+
+    /*
+     * Every general-purpose register, for a single-stepped run.
+     *
+     * This is what makes a stepped trace reversible.  A forward trace of RIPs
+     * says what executed; it cannot answer the question anybody actually has in
+     * front of a disassembly, which is "why is this register that value" - and
+     * answering it by running again from the start is exactly what a stepped
+     * window exists to avoid.  With the registers recorded at every step the
+     * question is a walk backwards through the ring: find the last record whose
+     * value differs, and the instruction at its RIP is the one that did it.
+     *
+     * Indexed in x86-64 encoding order, so an index here is the same number a
+     * disassembler prints in a ModRM byte and no translation table is needed:
+     *
+     *   0 RAX  1 RCX  2 RDX  3 RBX  4 RSP  5 RBP  6 RSI  7 RDI  8-15 R8-R15
+     *
+     * RSP comes from the VMCB - the copy in the pushed guest frame is a dummy
+     * slot that exists only to keep the frame aligned.  Zero on every record
+     * type except SVMHV_TRACE_STEP; nothing else runs in a context where all
+     * sixteen are available.
+     */
+    UINT64 Registers[16];
 
     /*
      * Publication protocol, appended so the original record layout remains
@@ -695,6 +730,63 @@ typedef struct _SVMHV_SNAPSHOT
 #define SVMHV_CMD_SWEEP         17
 #define SVMHV_SWEEP_ARGS        16      /* MemoryLength for the above */
 
+/*
+ * Copy-on-write snapshot of a range of guest memory: take it, put it back, or
+ * ask what it is doing.  See driver\snapshot.h for what this restores and, more
+ * to the point, what it does not.
+ *
+ * MemoryAddress is the virtual base and MemoryProcessId the process it belongs
+ * to, 0 for kernel space.  Everything else travels in MemoryData for the same
+ * reason the sweep's does - MemoryLength is the payload length and cannot carry
+ * an argument as well:
+ *
+ *   in    +0  size in bytes          +8  mode      +12 store pages, 0 = all
+ *   out   +0  state  +4 restored     +8  base      +16 size
+ *         +24 dirty pages            +32 store capacity in pages
+ */
+#define SVMHV_CMD_SNAPSHOT      18
+#define SVMHV_SNAPSHOT_ARGS     40      /* MemoryLength for the above */
+
+#define SVMHV_SNAPSHOT_RELEASE  0
+#define SVMHV_SNAPSHOT_TAKE     1
+#define SVMHV_SNAPSHOT_RESTORE  2
+#define SVMHV_SNAPSHOT_QUERY    3
+
+/*
+ * Call a function with arguments of your choosing.  See driver\call.h, and in
+ * particular the part about what the exception handler around it does not
+ * cover - this runs the target, and a target called with arguments it was not
+ * written for takes the machine down.
+ *
+ * MemoryAddress is the function and MemoryProcessId the address space to make
+ * the call in, 0 for system context.
+ *
+ *   in    +0   eight arguments, one qword each    +64  how many are meaningful
+ *   out   +0   return value    +8  cycles elapsed  +16 exception code, or 0
+ */
+#define SVMHV_CMD_CALL          19
+#define SVMHV_CALL_MAX_ARGS     8
+#define SVMHV_CALL_ARGS         72      /* MemoryLength for the above */
+
+/*
+ * Put back the processors a fatal exit left outside SVM.
+ *
+ * Takes no arguments.  MemoryData +0 is how many were down, +8 how many are in
+ * guest mode now and +16 how many there are - so a client can tell "nothing was
+ * wrong" from "nothing came back", which one number could not.
+ */
+#define SVMHV_CMD_REVIVE        20
+#define SVMHV_REVIVE_ARGS       24      /* MemoryLength for the above */
+
+/*
+ * Arm or disarm Instruction-Based Sampling.  MemoryAddress is the interval in
+ * micro-ops, 0 to disarm.  MemoryData comes back with the interval actually
+ * programmed at +0 and the total sample count at +8; a zero interval after
+ * asking for a non-zero one means the processor does not expose IBS.
+ */
+#define SVMHV_CMD_IBS           21
+#define SVMHV_IBS_ARGS          16      /* MemoryLength for the above */
+
 /* How many of each can be armed at once. */
 #define SVMHV_MAX_MSR_WATCHES   16
 #define SVMHV_MAX_IO_WATCHES    16
@@ -737,7 +829,8 @@ typedef struct _SVMHV_CONTROL
  * fires, mcp\svmhv_mcp.py needs the same edit.
  */
 C_ASSERT(sizeof(SVMHV_FILTER)          == 24);
-C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES + 80);
+C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES + 80 +
+                                          16 * sizeof(UINT64));
 C_ASSERT(sizeof(SVMHV_STATS)           == 640);
 C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
@@ -790,10 +883,18 @@ C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Cr3)             ==
          432 + 8 + 8 * SVMHV_MAX_FRAMES);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, BranchFrom)      ==
          432 + 8 + 8 * SVMHV_MAX_FRAMES + 48);
-C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Generation)      ==
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Registers)       ==
          432 + 8 + 8 * SVMHV_MAX_FRAMES + 64);
+/*
+ * Generation and CommitSequence moved when Registers went in ahead of them,
+ * which is the one direction this layout may grow: the publication protocol
+ * needs CommitSequence written last, so a new field cannot be appended after
+ * it - a reader would accept the record before the field was there.
+ */
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Generation)      ==
+         432 + 8 + 8 * SVMHV_MAX_FRAMES + 64 + 16 * sizeof(UINT64));
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CommitSequence)  ==
-         432 + 8 + 8 * SVMHV_MAX_FRAMES + 64 + sizeof(UINT64));
+         432 + 8 + 8 * SVMHV_MAX_FRAMES + 64 + 17 * sizeof(UINT64));
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence)     ==
          2728 + sizeof(SVMHV_HOOK_LIST) + sizeof(SVMHV_SELFTEST) +
          sizeof(SVMHV_FATAL_EXIT) + sizeof(SVMHV_FATAL_RING));
