@@ -115,6 +115,14 @@
 #define SVMHV_HV_NOP            11  /* CPL 0 only -> force a #VMEXIT        */
 #define SVMHV_HV_READ_TRACE_CURSOR 12 /* rdx = absolute seq, rsi = offset    */
 
+/*
+ * Single-step the calling processor for rdx instructions, recording one trace
+ * record each.  Answered next to the other VMCB-editing calls rather than in
+ * hvcall.c, because arming a step means writing this processor's VMCB and the
+ * control worker runs on whichever processor Windows felt like.
+ */
+#define SVMHV_HV_STEP           13  /* rdx = count, or 0 to report instead  */
+
 #define SVMHV_HV_STATUS_OK          0
 #define SVMHV_HV_STATUS_BADCOMMAND  1
 #define SVMHV_HV_STATUS_BADOFFSET   2
@@ -129,6 +137,19 @@
 #define VMEXIT_INVLPGA          0x07A
 #define VMEXIT_CPUID            0x072
 #define VMEXIT_MSR              0x07C
+
+/* Exceptions exit at 0x40 + vector.  #DB is what a single step arrives as. */
+#define VMEXIT_EXCEPTION_BASE   0x040
+#define VMEXIT_EXCEPTION_DB     (VMEXIT_EXCEPTION_BASE + 1)
+
+/*
+ * PUSHF and POPF.  Intercepted only while a processor is single-stepping, so
+ * that the trap flag we set for our own purposes is not the trap flag the guest
+ * reads back.  On Intel there is no equivalent - RFLAGS.TF is simply visible -
+ * which is one more thing this design gets for being on AMD.
+ */
+#define VMEXIT_PUSHF            0x070
+#define VMEXIT_POPF             0x071
 #define VMEXIT_VMRUN            0x080
 #define VMEXIT_VMMCALL          0x081
 #define VMEXIT_VMLOAD           0x082
@@ -158,7 +179,13 @@
 
 /* --------------------------------------------------- intercept vectors */
 
+/* Control area offset 0x008 - one bit per exception vector. */
+#define SVM_INTERCEPT_EXCEPTION(vector)  (1u << (vector))
+#define SVM_EXCEPTION_DB_VECTOR 1
+
 /* Control area offset 0x00C */
+#define SVM_INTERCEPT_PUSHF     (1u << 16)
+#define SVM_INTERCEPT_POPF      (1u << 17)
 #define SVM_INTERCEPT_CPUID     (1u << 18)
 #define SVM_INTERCEPT_INVLPGA   (1u << 26)
 #define SVM_INTERCEPT_MSR       (1u << 28)
@@ -174,6 +201,10 @@
 
 /* NP_ENABLE (control area 0x090) */
 #define SVM_NP_ENABLE           (1ULL << 0)
+
+/* RFLAGS.TF, and the DR6 bit a single-step #DB sets to say it was one. */
+#define SVM_RFLAGS_TF           (1ULL << 8)
+#define SVM_DR6_BS              (1ULL << 14)
 
 /* EVENTINJ (control area 0x0A8) */
 #define SVM_EVENTINJ_VALID      (1ULL << 31)

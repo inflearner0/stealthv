@@ -332,6 +332,14 @@ typedef struct _SVMHV_HOOK_LIST
  */
 #define SVMHV_TRACE_RETURN      3
 
+/*
+ * One instruction of a single-stepped run.  Rip is where it is about to
+ * execute, Rsp and Cr3 the context, Code the bytes, and Arguments[0] the
+ * RFLAGS the guest believes it has - ours with the trap flag put back the way
+ * the guest left it, which is the only version of RFLAGS worth recording.
+ */
+#define SVMHV_TRACE_STEP        4
+
 typedef struct _SVMHV_TRACE_RECORD
 {
     UINT64 Sequence;

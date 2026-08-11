@@ -1175,6 +1175,49 @@ VOID SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
     SvTracePublish(record, sequence);
 }
 
+VOID SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
+                 _In_ UINT64 Cr3, _In_ UINT32 Processor,
+                 _In_reads_(CodeLength) const UINT8* Code,
+                 _In_ UINT32 CodeLength, _In_ BOOLEAN GuestTf)
+{
+    UINT64 sequence;
+    SVMHV_TRACE_RECORD* record = SvTraceClaim(&sequence);
+    UINT64 flags = Rflags;
+
+    if (record == NULL)
+    {
+        return;
+    }
+
+    /* Record the guest's RFLAGS, not ours: our trap flag is an artefact of
+       the measurement and recording it would be recording the instrument. */
+    if (GuestTf)
+    {
+        flags |= SVM_RFLAGS_TF;
+    }
+    else
+    {
+        flags &= ~SVM_RFLAGS_TF;
+    }
+
+    record->Tsc          = __rdtsc();
+    record->Rip          = Rip;
+    record->Rsp          = Rsp;
+    record->Cr3          = Cr3;
+    record->Type         = SVMHV_TRACE_STEP;
+    record->Processor    = Processor;
+    record->Arguments[0] = flags;
+
+    if (CodeLength > sizeof(record->Code))
+    {
+        CodeLength = sizeof(record->Code);
+    }
+    RtlCopyMemory(record->Code, Code, CodeLength);
+    record->CodeLength = CodeLength;
+
+    SvTracePublish(record, sequence);
+}
+
 VOID SvTraceWatchComplete(_Inout_ SVMHV_WATCH_PENDING* Pending)
 {
     SVMHV_TRACE_RECORD* record = Pending->Record;

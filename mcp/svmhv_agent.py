@@ -250,7 +250,7 @@ OPTION_BITS = [
 ]
 KIND_NAMES = {0: "exec", 1: "write-watch", 2: "access-watch"}
 ACTION_NAMES = {0: "trace", 1: "detour", 2: "shellcode"}
-TRACE_TYPES = {0: "exec", 1: "write", 2: "access", 3: "return"}
+TRACE_TYPES = {0: "exec", 1: "write", 2: "access", 3: "return", 4: "step"}
 EXIT_NAMES = {
     0x072: "CPUID", 0x07A: "INVLPGA", 0x07C: "MSR", 0x080: "VMRUN",
     0x081: "VMMCALL", 0x082: "VMLOAD", 0x083: "VMSAVE", 0x084: "STGI",
@@ -448,6 +448,21 @@ def tool_trace(count: int = 40) -> str:
                 f"[{row.get('seq')}] hook {row.get('hook')} cpu{row.get('cpu')} "
                 f"RETURNED {row.get('a0')} after {cycles:,} cycles, "
                 f"to {symbolize(int(row.get('ret', '0'), 0))}")
+        elif kind == 4:
+            # A single step. There is no hook and no faulting address: the
+            # whole record is "this instruction was about to run".
+            code = row.get("code", "")
+            text = ""
+            if code:
+                try:
+                    _, text, _ = disassemble_one(bytes.fromhex(code), 0,
+                                                 int(row.get("rip", "0"), 0))
+                except (ValueError, IndexError):
+                    text = f"({code})"
+            lines.append(
+                f"[{row.get('seq')}] cpu{row.get('cpu')} step "
+                f"{symbolize(int(row.get('rip', '0'), 0))} "
+                f"rflags {int(row.get('a0', '0'), 0):#08x}  {text}")
         else:
             error = int(row.get("err", "0"), 0)
             decoded = [n for b, n in ((1, "present"), (2, "write"),
@@ -606,6 +621,86 @@ def tool_trace_summary(count: int = 200) -> str:
 def tool_trace_reset() -> str:
     status = as_int(pairs(ctl("trace-reset")), "status", -1)
     return "trace ring reset" if status == 0 else f"failed: {status:#010x}"
+
+
+def tool_step(count: int = 16) -> str:
+    """Single-step the processor that issues the request.
+
+    Deliberately not "step this address": the trap flag lives in a VMCB, so a
+    step is armed on a processor, not on a target, and it begins at the
+    instruction after the hypercall that armed it. What gets recorded is
+    svmhvctl's own code — which is the point of having it, because every
+    instruction in it is known and the run can therefore be checked rather
+    than merely observed.
+    """
+    if not 1 <= count <= 4096:
+        return "count must be between 1 and 4096"
+
+    result = pairs(ctl("step", str(count)))
+    text = ctl("trace", str(min(count + 8, 200)))
+    rows = [row for row in records(text, "trace")
+            if int(row.get("type", "0"), 0) == 4]
+
+    lines = [f"armed {count} step(s); {len(rows)} step record(s) came back "
+             f"({as_int(pairs(text), 'produced'):,} produced in all)"]
+
+    # The reading that matters is the one taken while the window was open. A
+    # read afterwards proves nothing: the flag has been put back by then, so a
+    # build that hid nothing would look exactly the same.
+    during = as_int(result, "tf_during", -1)
+    after = as_int(result, "tf_after", -1)
+    exposed = as_int(result, "exposed_windows", 0)
+
+    if during == 0:
+        lines.append("trap flag as the guest read it mid-run: clear - PUSHF "
+                     "is being intercepted and answered")
+    elif during > 0:
+        lines.append("trap flag as the guest read it mid-run: SET - the guest "
+                     "can see it is being stepped")
+    if after > 0:
+        lines.append("trap flag after the run: STILL SET. The window should "
+                     "have disarmed itself - that is a bug, not a concealment "
+                     "weakness.")
+    if exposed:
+        lines.append(f"{exposed} window(s) have given up hiding the flag "
+                     f"because the guest's stack was in an address space the "
+                     f"exit handler could not reach. That is the expected "
+                     f"answer for a user-mode step: the host's CR3 at an exit "
+                     f"is whichever process the processor launched in.")
+    lines.append("")
+
+    # The ring is not per-run, so a short request can be outnumbered by records
+    # left over from a previous one. Show the ends rather than everything.
+    shown = rows[-count:] if count <= len(rows) else rows
+    head, tail = shown[:20], shown[-20:] if len(shown) > 40 else []
+
+    def render(row):
+        code = row.get("code", "")
+        text = ""
+        if code:
+            try:
+                _, text, _ = disassemble_one(bytes.fromhex(code), 0,
+                                             int(row.get("rip", "0"), 0))
+            except (ValueError, IndexError):
+                text = f"({code})"
+        return (f"  {int(row.get('rip', '0'), 0):#018x}  "
+                f"rflags {int(row.get('a0', '0'), 0):#08x}  {text}")
+
+    lines += [render(row) for row in head]
+    if tail:
+        lines.append(f"  ... {len(shown) - 40} more ...")
+        lines += [render(row) for row in tail]
+
+    if not rows:
+        lines.append("  (none - if the driver is loaded and this is empty, "
+                     "the #DB intercept is not reaching the handler)")
+    elif not any(row.get("code") for row in shown):
+        lines.append("")
+        lines.append("No instruction bytes: the same address-space problem. "
+                     "The handler will read them from a kernel RIP, or from "
+                     "anywhere when the processor supports decode assists, "
+                     "and otherwise records the address alone.")
+    return "\n".join(lines)
 
 
 def hook_target(target: str, prolog: int | None,
@@ -5315,6 +5410,24 @@ TOOLS = [
                 "description": "how many newest records to summarise, 1-200"}},
         },
         "handler": lambda a: tool_trace_summary(int(a.get("count", 200))),
+    },
+    {
+        "name": "svmhv_step",
+        "description":
+            "Single-step the guest for N instructions, recording one trace "
+            "record each: RIP, RFLAGS as the guest sees it, and the "
+            "instruction bytes. AMD has no monitor trap flag, so this is "
+            "RFLAGS.TF and #DB - but PUSHF and POPF are intercepted for the "
+            "duration, so the guest reads back the trap flag it set rather "
+            "than ours. The step is armed on the processor that issues it and "
+            "starts at the next instruction, so it steps the client, not a "
+            "target you name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"count": {"type": "integer",
+                                     "description": "instructions, 1-4096"}},
+        },
+        "handler": lambda a: tool_step(int(a.get("count", 16))),
     },
     {
         "name": "svmhv_trace_reset",

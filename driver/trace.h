@@ -88,6 +88,15 @@ VOID     SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
 VOID     SvTraceWatchComplete(_Inout_ SVMHV_WATCH_PENDING* Pending);
 
 /*
+ * One instruction of a single-stepped run.  Host context, GIF clear, same
+ * rules as the watch path: nothing that touches the kernel's own state.
+ */
+VOID     SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
+                     _In_ UINT64 Cr3, _In_ UINT32 Processor,
+                     _In_reads_(CodeLength) const UINT8* Code,
+                     _In_ UINT32 CodeLength, _In_ BOOLEAN GuestTf);
+
+/*
  * Where the ring lives, so a client can read it out of driver memory rather than
  * asking for a copy.  The producer counter is an absolute, monotonic cursor;
  * tracking what has already been seen, and noticing when it has been lapped,

@@ -8,6 +8,7 @@
 #include "npt.h"
 #include "svmhvctl.h"
 #include "trace.h"      /* SVMHV_WATCH_PENDING lives in the VIRTUAL_CPU */
+#include "step.h"       /* and so does SVMHV_STEP_STATE                 */
 
 #define SVMHV_POOL_TAG          'vmvS'      /* "Svmv" */
 #define SVMHV_HOST_STACK_SIZE   0x6000      /* 24 KiB per CPU              */
@@ -121,6 +122,9 @@ typedef struct DECLSPEC_ALIGN(PAGE_SIZE) _VIRTUAL_CPU
      * the exit that completes it is the very next one this processor takes.
      */
     SVMHV_WATCH_PENDING WatchPending;
+
+    /* Whether this processor is single-stepping, and why.  See step.h. */
+    SVMHV_STEP_STATE Step;
     PVOID   HostStackBase;
     HOST_STACK_LAYOUT* Layout;
 

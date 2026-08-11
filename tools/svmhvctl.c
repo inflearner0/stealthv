@@ -32,6 +32,7 @@
 #define HV_SIGNATURE            9
 #define HV_TRACE_CONSUMED       10
 #define HV_READ_TRACE_CURSOR    12
+#define HV_STEP                 13
 
 #define HV_OK                   0
 #define HV_RETRY                4
@@ -1230,6 +1231,66 @@ static int ReadTraceRecord(unsigned __int64 sequence,
     return -1;                          /* unfinished, lapped, or reset */
 }
 
+/*
+ * Single-step this thread for Count instructions.
+ *
+ * There is no target to name: the step is armed on the processor that issues
+ * the hypercall, and takes effect on the instruction after the VMMCALL - so
+ * what gets recorded is this function, right here.  That sounds like a toy and
+ * is exactly the point: it exercises the whole mechanism on code whose every
+ * instruction is known.
+ *
+ * RFLAGS is read twice, and the first read is the one that matters.  It runs
+ * two instructions after the hypercall, while the window is still open, so it
+ * is a PUSHF that the hypervisor has to intercept and answer with the guest's
+ * own trap flag rather than the one it set.  Reading only afterwards - which
+ * this did at first - proves nothing at all: by then the run has ended and the
+ * flag has been put back, so a build that hid nothing would look identical.
+ */
+static int Step(unsigned long count)
+{
+    HV_REGS out;
+    unsigned __int64 status;
+    volatile unsigned __int64 sink = 0;
+    unsigned __int64 during;
+    unsigned __int64 after;
+    unsigned long i;
+
+    if (count == 0 || count > 4096)
+    {
+        fprintf(stderr, "step count must be 1..4096\n");
+        return 2;
+    }
+
+    status = Call(HV_STEP, count, 0, &out);
+    if (status != HV_OK)
+    {
+        fprintf(stderr, "step was refused (status %llu)\n", status);
+        return 2;
+    }
+
+    during = __readeflags();
+
+    /* Instructions for the stepper to count.  Volatile so they survive /O2. */
+    for (i = 0; i < 64; i++)
+    {
+        sink += i;
+    }
+
+    after = __readeflags();
+
+    /* Rdx 0 asks the hypervisor what it did rather than arming another run. */
+    (void)Call(HV_STEP, 0, 0, &out);
+
+    printf("step_requested=%lu\nflags_during=0x%llx\nflags_after=0x%llx\n"
+           "tf_during=%u\ntf_after=%u\nsteps_total=%llu\nexposed_windows=%llu\n"
+           "sink=%llu\n",
+           count, during, after,
+           (unsigned)((during >> 8) & 1), (unsigned)((after >> 8) & 1),
+           out.Rbx, out.Rdx, (unsigned long long)sink);
+    return 0;
+}
+
 static void PrintTraceRecord(const SVMHV_TRACE_RECORD* record)
 {
     printf("trace seq=%llu type=%u hook=%u cpu=%u pid=%u tid=%u irql=%u "
@@ -1485,6 +1546,7 @@ static void Usage(void)
         "  svmhvctl trace-cursor <next_cursor> [count]\n"
         "  svmhvctl selftest\n"
         "  svmhvctl trace-reset\n"
+        "  svmhvctl step <count>\n"
         "  svmhvctl hook-trace  <target> <prolog>\n"
         "  svmhvctl hook-detour <target> <prolog> <detour>\n"
         "  svmhvctl hook-shellcode <target> <prolog> <hexbytes>\n"
@@ -1580,6 +1642,11 @@ int main(int argc, char** argv)
     if (_stricmp(argv[1], "trace-reset") == 0)
     {
         return Submit(SVMHV_CMD_TRACE_RESET, request, 0, NULL) ? 0 : 2;
+    }
+
+    if (_stricmp(argv[1], "step") == 0 && argc >= 3)
+    {
+        return Step(strtoul(argv[2], NULL, 0));
     }
 
     if (_stricmp(argv[1], "unhook") == 0 && argc >= 3)

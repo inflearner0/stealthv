@@ -506,6 +506,44 @@ static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* 
 
         if (STEALTHV_CONTROL_INTERFACE)
         {
+            /*
+             * Arming a single step has to happen here rather than in
+             * hvcall.c, because it edits this processor's VMCB and that is
+             * the one thing the control call cannot reach.  Gated exactly
+             * like every other control command - a caller who can install a
+             * hook can already run code in ring 0, so stepping is not the
+             * thing worth gating separately.
+             */
+            if (Context->Rbx == SVMHV_HV_STEP &&
+                (!STEALTHV_CONTROL_REQUIRE_CPL0 ||
+                 Cpu->GuestVmcb.StateSave.Cpl == 0))
+            {
+                if (Context->Rdx == 0)
+                {
+                    /*
+                     * Report rather than arm.  A caller needs to be able to
+                     * tell "the trap flag was hidden" from "the trap flag was
+                     * never set", and whether hiding it had to be given up
+                     * because the stack was in an address space this processor
+                     * could not reach.  Neither is visible from outside.
+                     */
+                    UINT64 steps;
+                    UINT64 exposed;
+
+                    SvStepCounters(&steps, &exposed);
+                    Context->Rbx = steps;
+                    Context->Rdx = exposed;
+                    Context->Rsi = Cpu->Step.FlagsExposed ? 1u : 0u;
+                }
+                else
+                {
+                    SvStepArm(Cpu, (UINT32)Context->Rdx, SVMHV_STEP_TRACE);
+                }
+                Context->Rax = SVMHV_HV_STATUS_OK;
+                SvAdvanceRip(&Cpu->GuestVmcb, 3);
+                return FALSE;
+            }
+
             SvHandleControlCall(Context, Cpu->GuestVmcb.StateSave.Cpl);
             SvAdvanceRip(&Cpu->GuestVmcb, 3);
             return FALSE;
@@ -785,6 +823,34 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
 
     case VMEXIT_NPF:
         devirtualise = SvHandleNestedPageFault(Cpu);
+        break;
+
+    /*
+     * A single step, or the guest's own debug exception arriving while we
+     * happen to be stepping.  SvStepHandleDebugException tells them apart and
+     * only consumes the first kind; the second is put back, because a guest
+     * that set a hardware breakpoint is entitled to it.
+     */
+    case VMEXIT_EXCEPTION_DB:
+        if (!SvStepHandleDebugException(Cpu))
+        {
+            vmcb->Control.EventInj = SVM_EVENTINJ_VALID |
+                                     SVM_EVENTINJ_TYPE_EXCEPTION |
+                                     SVM_EXCEPTION_DB_VECTOR;
+        }
+        break;
+
+    /*
+     * Only intercepted while stepping, and only so that the trap flag we set
+     * is not the trap flag the guest reads.  Both fall through to running
+     * natively if the guest's stack is not memory we may touch.
+     */
+    case VMEXIT_PUSHF:
+        (VOID)SvStepEmulatePushf(Cpu);
+        break;
+
+    case VMEXIT_POPF:
+        (VOID)SvStepEmulatePopf(Cpu);
         break;
 
     case VMEXIT_VMMCALL:
