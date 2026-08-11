@@ -140,6 +140,13 @@ typedef struct DECLSPEC_ALIGN(PAGE_SIZE) _VIRTUAL_CPU
 
     /* Whether this processor is single-stepping, and why.  See step.h. */
     SVMHV_STEP_STATE Step;
+
+    /*
+     * What the guest last wrote to DEBUGCTL, so a read can be answered with the
+     * guest's own value while ours keeps last-branch recording on underneath.
+     * See STEALTHV_LBR.
+     */
+    UINT64  GuestDebugCtl;
     PVOID   HostStackBase;
     HOST_STACK_LAYOUT* Layout;
 

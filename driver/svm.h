@@ -32,6 +32,7 @@
 
 #define CPUID_SVM_FEATURES      0x8000000A      /* EBX = #ASIDs, EDX = feat */
 #define CPUID_SVM_NESTED_PAGING (1u << 0)
+#define CPUID_SVM_LBR_VIRT      (1u << 1)
 #define CPUID_SVM_NRIP_SAVE     (1u << 3)
 #define CPUID_SVM_FLUSH_BY_ASID (1u << 6)
 
@@ -231,6 +232,22 @@
 
 /* NP_ENABLE (control area 0x090) */
 #define SVM_NP_ENABLE           (1ULL << 0)
+
+/*
+ * LBR_VIRTUALIZATION_ENABLE, VMCB control offset 0x0B8 bit 0.
+ *
+ * With it set, VMRUN and #VMEXIT save and restore DBGCTL and the last-branch
+ * registers alongside the rest of the guest state, so BrFrom and BrTo in the
+ * state save area describe the last control transfer the *guest* made before
+ * the exit.  Without it those fields are not maintained and the host's own
+ * branches overwrite the registers before anything can read them.
+ */
+#define SVM_LBR_VIRTUALIZATION   (1ULL << 0)
+
+/* DEBUGCTL, and the bit in it that turns last-branch recording on. */
+#define MSR_DEBUGCTL             0x000001D9
+#define DEBUGCTL_LBR             (1ULL << 0)
+#define DEBUGCTL_BTF             (1ULL << 1)
 
 /* RFLAGS.TF, and the DR6 bit a single-step #DB sets to say it was one. */
 #define SVM_RFLAGS_TF           (1ULL << 8)

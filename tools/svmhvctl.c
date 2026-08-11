@@ -1353,6 +1353,15 @@ static void PrintTraceRecord(const SVMHV_TRACE_RECORD* record)
         printf(" cr3=0x%llx", (unsigned long long)record->Cr3);
     }
 
+    /* Where control came from, according to the processor rather than to a
+       stack that obfuscated code is free to have made up. */
+    if (record->BranchFrom != 0 || record->BranchTo != 0)
+    {
+        printf(" brfrom=0x%llx brto=0x%llx",
+               (unsigned long long)record->BranchFrom,
+               (unsigned long long)record->BranchTo);
+    }
+
     /*
      * What the watched location held, before the store and after it.  Both are
      * printed even when they are equal - "nothing changed" is an answer, and

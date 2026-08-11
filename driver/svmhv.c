@@ -74,6 +74,7 @@ static UINT64        g_MsrpmPa;
 static PVOID         g_Iopm;               /* 12 KiB, zeroed, never used   */
 static UINT64        g_IopmPa;
 static BOOLEAN       g_NripSupported;
+static BOOLEAN       g_LbrVirtSupported;
 static BOOLEAN       g_ForwardHypercalls;  /* TRUE when running under L0   */
 static BOOLEAN       g_1GbPages;
 static UINT8         g_TlbControl;
@@ -97,6 +98,10 @@ static UINT32 SvOptionBits(VOID)
     /* Reported because of what it costs.  A build running with this on behaves
        so differently that a snapshot which does not say so is misleading. */
     if (STEALTHV_ALWAYS_FLUSH_TLB) bits |= SVMHV_OPT_ALWAYS_FLUSH;
+    /* Both halves, deliberately: asked for and actually available.  Absent
+       here means a record's branch fields are zero because the processor was
+       never recording, not because nothing branched. */
+    if (STEALTHV_LBR && g_LbrVirtSupported) bits |= SVMHV_OPT_LBR;
     if (g_ForwardHypercalls) bits |= SVMHV_OPT_PARENT_HYPERVISOR;
     if (g_1GbPages)        bits |= SVMHV_OPT_1GB_PAGES;
 
@@ -242,6 +247,24 @@ static BOOLEAN SvIsSvmSupported(VOID)
     g_NripSupported = (regs[3] & CPUID_SVM_NRIP_SAVE) != 0;
     g_TlbControl = (regs[3] & CPUID_SVM_FLUSH_BY_ASID) ? SVM_TLB_CONTROL_FLUSH_ASID
                                                        : SVM_TLB_CONTROL_FLUSH_ALL;
+
+    /*
+     * Last-branch virtualisation, and it is not optional to check.
+     *
+     * Setting a VMCB feature bit the processor does not advertise is how a
+     * machine earns VMEXIT_INVALID, and the fact that this one tolerates it
+     * proves nothing about the next.  Measured in this lab: 8000_000A EDX is
+     * 0x000294F9, so nested paging is there in bit 0 and LbrVirt in bit 1 is
+     * *not* - a Hyper-V parent does not hand it down.  Everything about
+     * STEALTHV_LBR is therefore off here, and a record's branch fields are zero
+     * because there is nothing to read rather than because nothing branched.
+     */
+    g_LbrVirtSupported = (regs[3] & CPUID_SVM_LBR_VIRT) != 0;
+    if (STEALTHV_LBR && !g_LbrVirtSupported)
+    {
+        DbgPrint("svmhv: no LBR virtualisation (8000_000A EDX %08x); trace "
+                 "records will carry no branch\n", regs[3]);
+    }
 
     if (STEALTHV_NESTED_PAGING && (regs[3] & CPUID_SVM_NESTED_PAGING) == 0)
     {
@@ -758,6 +781,41 @@ static VOID SvHandleMsr(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context
     }
 
     /*
+     * DEBUGCTL, if we are the ones who turned last-branch recording on.
+     *
+     * Exactly the shape of the EFER case above: the guest is told the LBR and
+     * BTF bits it set, and ours stays set underneath.  A write keeps our bit
+     * whatever the guest asked for, so a driver clearing DEBUGCTL - which is a
+     * perfectly ordinary thing to do - does not silently switch the instrument
+     * off and leave every later record saying the branch was zero.
+     */
+    if (STEALTHV_LBR && g_LbrVirtSupported && msr == MSR_DEBUGCTL)
+    {
+        if (isWrite)
+        {
+            value = ((UINT64)(UINT32)Context->Rdx << 32) | (UINT32)Context->Rax;
+            Cpu->GuestDebugCtl = value;
+            vmcb->StateSave.DbgCtl = value | DEBUGCTL_LBR;
+        }
+        else
+        {
+            value = Cpu->GuestDebugCtl;
+            Context->Rax = (UINT32)value;
+            Context->Rdx = (UINT32)(value >> 32);
+        }
+
+        if (SvIsMsrWatched(msr))
+        {
+            SvTraceRegister(SVMHV_TRACE_MSR, vmcb->StateSave.Rip,
+                            vmcb->StateSave.Cr3, Cpu->Index,
+                            msr, value, isWrite ? 1u : 0u, 8, 0);
+        }
+
+        SvAdvanceRip(vmcb, 2);
+        return;
+    }
+
+    /*
      * Everything else is only here because enabling the MSR intercept traps
      * every MSR the MSRPM does not describe, so pass it through untouched.  An
      * MSR that does not exist has to keep raising #GP in the guest rather than
@@ -1256,6 +1314,18 @@ BOOLEAN SvHandleVmExit(_In_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* Context,
     }
 
     /*
+     * The last branch the guest took before this exit, stashed once so every
+     * recorder below picks it up without being handed it.  Only meaningful with
+     * LBR virtualisation on; without it the fields are not maintained and both
+     * are zero, which is what a record should then say.
+     */
+    if (STEALTHV_LBR && g_LbrVirtSupported)
+    {
+        SvTraceSetBranch(Cpu->Index, vmcb->StateSave.BrFrom,
+                         vmcb->StateSave.BrTo);
+    }
+
+    /*
      * A watch step that is not going to end the way it was supposed to.
      *
      * It ends at the #DB one instruction later.  Anything else arriving first
@@ -1577,6 +1647,26 @@ static VOID SvPrepareVmcb(_Inout_ VIRTUAL_CPU* Cpu, _In_ const CONTEXT* Guest)
            decides memory types.  Leaving it zero makes every page uncacheable
            and the guest crawls to a halt. */
         vmcb->StateSave.GPat = __readmsr(MSR_PAT);
+    }
+
+    if (STEALTHV_LBR && g_LbrVirtSupported)
+    {
+        /*
+         * Last-branch recording, so an exit can say where control came from.
+         *
+         * Both halves are needed and neither is enough alone: the control bit
+         * makes VMRUN and #VMEXIT save and restore the branch registers with
+         * the rest of the guest state, and DBGCTL.LBR is what makes the
+         * processor record anything into them in the first place.  Without the
+         * control bit the host's own branches overwrite them before the handler
+         * can look; without DBGCTL.LBR they stay zero.
+         *
+         * The guest's own DBGCTL is not lost - SvHandleMsr reports back
+         * whatever it set, the same way EFER reports SVME clear.
+         */
+        vmcb->Control.LbrVirtualizationEnable |= SVM_LBR_VIRTUALIZATION;
+        vmcb->StateSave.DbgCtl |= DEBUGCTL_LBR;
+        SvSetMsrIntercept((UINT8*)g_Msrpm, MSR_DEBUGCTL);
     }
 
     vmcb->StateSave.Es = SvBuildSegment((UINT16)Guest->SegEs, gdtr.Base);

@@ -94,6 +94,47 @@
 #define STEALTHV_ALWAYS_FLUSH_TLB   0
 
 /*
+ * Last-branch recording, so a trace record can say where control came from.
+ *
+ * The stack walk in trace.c reports candidates rather than a call stack, and on
+ * obfuscated or virtualised code it reports very little that is true.  The
+ * processor knows the answer exactly: with LBR virtualisation on, every exit
+ * carries the last branch the guest took, and that is a fact no amount of
+ * flattening or junk-frame construction can lie about.  It is what makes a
+ * first-execution record from the coverage sweep say *who jumped into* a page
+ * nobody declared, which is the question that record exists to raise.
+ *
+ * It costs one guest-visible bit, and that bit is hidden the same way EFER.SVME
+ * is: DEBUGCTL is intercepted and reports the LBR and BTF bits the guest set
+ * rather than the one we set underneath.  DEBUGCTL is written rarely - this is
+ * nothing like the EFER intercept's cost, which is paid on every synthetic MSR
+ * a Hyper-V guest touches.
+ *
+ * Only exits carry it.  A trace hook's recorder runs in guest context, several
+ * jumps deep in the thunk, by which time the last branch is one of ours - so
+ * exec-hook records deliberately leave the fields zero rather than record a
+ * measurement of the instrument.
+ */
+#define STEALTHV_LBR                1
+
+/*
+ * Intercept CPUID and record every one, with the leaf and where it came from.
+ *
+ * Off, and it has to default off: not intercepting CPUID is the single most
+ * important concealment decision in this driver.  It is what makes
+ * rdtsc-cpuid-rdtsc measure exactly what the bare processor measures, because
+ * it is the bare processor - 2376 cycles either way, against 12309 for a build
+ * that did intercept.  Turning this on gives that up completely and is visible
+ * to the first piece of code that times a CPUID, which is most of them.
+ *
+ * It exists because "which instruction detected the hypervisor" is otherwise
+ * unanswerable, and one run with it on answers it.  Arm it, learn the leaf,
+ * turn it off - the same standing as STEALTHV_ALWAYS_FLUSH_TLB, which is kept
+ * for comparison and is not a setting to run.
+ */
+#define STEALTHV_WATCH_CPUID        0
+
+/*
  * Answer the control CPUID leaf and run the worker thread that services it.
  *
  * This is the last thing between "instrumentable" and "not there at all", and

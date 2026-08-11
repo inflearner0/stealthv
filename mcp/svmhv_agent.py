@@ -246,7 +246,7 @@ OPTION_BITS = [
     (0x0001, "nested-paging"), (0x0002, "hide-svm-cpuid"),
     (0x0004, "hide-efer"), (0x0008, "tsc-offset"), (0x0010, "hide-pages"),
     (0x0020, "parent-hypervisor"), (0x0040, "1gb-pages"),
-    (0x0080, "always-flush-tlb"),
+    (0x0080, "always-flush-tlb"), (0x0100, "lbr"),
 ]
 KIND_NAMES = {0: "exec", 1: "write-watch", 2: "access-watch"}
 ACTION_NAMES = {0: "trace", 1: "detour", 2: "shellcode"}
@@ -278,6 +278,20 @@ MSR_NAMES = {
     0x000000E7: "IA32_MPERF",
     0x000000E8: "IA32_APERF",
 }
+
+
+def branch_line(row):
+    """Where control came from, as the processor recorded it.
+
+    Worth more than the stack candidates on anything obfuscated: a flattened
+    or virtualised function can build whatever frames it likes, and cannot
+    touch what the branch predictor wrote down.
+    """
+    frm = int(row.get("brfrom", "0"), 0)
+    to = int(row.get("brto", "0"), 0)
+    if not frm and not to:
+        return None
+    return f"      last branch {symbolize(frm)} -> {symbolize(to)}"
 
 
 def msr_name(number: int) -> str:
@@ -518,11 +532,15 @@ def tool_trace(count: int = 40) -> str:
                 f"to {symbolize(int(row.get('ret', '0'), 0))}")
         elif kind == 7:
             raw = int(row.get("err", "0"), 0)
-            lines.append(
+            entry = [
                 f"[{row.get('seq')}] cpu{row.get('cpu')} coverage: gpa "
                 f"{int(row.get('a0', '0'), 0):#014x} first "
                 f"{'executed' if raw & 16 else 'written'} from "
-                f"{symbolize(int(row.get('rip', '0'), 0))}")
+                f"{symbolize(int(row.get('rip', '0'), 0))}"]
+            branch = branch_line(row)
+            if branch:
+                entry.append(branch)
+            lines.append("\n".join(entry))
         elif kind == 5:
             written = int(row.get("a2", "0"), 0)
             lines.append(
@@ -612,6 +630,9 @@ def tool_trace(count: int = 40) -> str:
             cr3 = row.get("cr3")
             if cr3:
                 entry.append(f"      cr3 {cr3}")
+            branch = branch_line(row)
+            if branch:
+                entry.append(branch)
             lines.append("\n".join(entry))
     return "\n".join(lines)
 

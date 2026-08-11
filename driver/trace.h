@@ -91,6 +91,19 @@ VOID     SvTraceWatchComplete(_Inout_ SVMHV_WATCH_PENDING* Pending);
  * One instruction of a single-stepped run.  Host context, GIF clear, same
  * rules as the watch path: nothing that touches the kernel's own state.
  */
+/*
+ * Stash the last branch this processor's guest took, read out of the VMCB once
+ * per exit.  Every recorder that runs in host context picks it up from here.
+ *
+ * A stash rather than a parameter on each of them: the value is a property of
+ * the exit, not of the record, and threading it through four signatures would
+ * mean every future recorder having to remember to carry it.  Written once at
+ * the top of the exit handler, read within the same exit, per processor - so
+ * there is nothing to synchronise.
+ */
+VOID     SvTraceSetBranch(_In_ UINT32 Processor, _In_ UINT64 From,
+                          _In_ UINT64 To);
+
 VOID     SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
                      _In_ UINT64 Cr3, _In_ UINT32 Processor,
                      _In_reads_(CodeLength) const UINT8* Code,

@@ -30,6 +30,7 @@
 #define SVMHV_OPT_PARENT_HYPERVISOR 0x0020
 #define SVMHV_OPT_1GB_PAGES         0x0040
 #define SVMHV_OPT_ALWAYS_FLUSH      0x0080
+#define SVMHV_OPT_LBR               0x0100
 
 #define SVMHV_MAX_REPORTED_CPUS     64
 
@@ -450,6 +451,24 @@ typedef struct _SVMHV_TRACE_RECORD
     UINT8  Code[16];
 
     /*
+     * The last branch the guest took before this record was made, straight out
+     * of the processor.  Zero when it was not available.
+     *
+     * The stack walk above reports candidates, and on obfuscated code it
+     * reports very little that is true; these two are a fact.  On a
+     * first-execution record from a coverage sweep BranchFrom is the
+     * instruction that jumped into a page nobody declared, which is the whole
+     * question that record raises.
+     *
+     * Only records made at an exit carry them.  An exec hook's recorder runs in
+     * guest context, several jumps into the thunk, where the last branch is one
+     * of ours - so those leave the fields zero rather than record the
+     * instrument.
+     */
+    UINT64 BranchFrom;
+    UINT64 BranchTo;
+
+    /*
      * Publication protocol, appended so the original record layout remains
      * readable by v1 consumers.  A recorder first clears CommitSequence,
      * fills every preceding field, then stores Sequence + 1 here with a full
@@ -718,7 +737,7 @@ typedef struct _SVMHV_CONTROL
  * fires, mcp\svmhv_mcp.py needs the same edit.
  */
 C_ASSERT(sizeof(SVMHV_FILTER)          == 24);
-C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES + 64);
+C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES + 80);
 C_ASSERT(sizeof(SVMHV_STATS)           == 640);
 C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
@@ -769,10 +788,12 @@ C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CaptureLength)   == 164);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CaptureData)     == 172);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Cr3)             ==
          432 + 8 + 8 * SVMHV_MAX_FRAMES);
-C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Generation)      ==
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, BranchFrom)      ==
          432 + 8 + 8 * SVMHV_MAX_FRAMES + 48);
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Generation)      ==
+         432 + 8 + 8 * SVMHV_MAX_FRAMES + 64);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CommitSequence)  ==
-         432 + 8 + 8 * SVMHV_MAX_FRAMES + 48 + sizeof(UINT64));
+         432 + 8 + 8 * SVMHV_MAX_FRAMES + 64 + sizeof(UINT64));
 C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence)     ==
          2728 + sizeof(SVMHV_HOOK_LIST) + sizeof(SVMHV_SELFTEST) +
          sizeof(SVMHV_FATAL_EXIT) + sizeof(SVMHV_FATAL_RING));

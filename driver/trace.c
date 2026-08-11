@@ -1058,6 +1058,36 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
     return (info.BlockStub != NULL) ? info.BlockStub : info.Trampoline;
 }
 
+/* ---------------------------------------------------------- last branch */
+
+typedef struct _TRACE_BRANCH
+{
+    UINT64 From;
+    UINT64 To;
+} TRACE_BRANCH;
+
+static TRACE_BRANCH g_Branch[SVMHV_MAX_REPORTED_CPUS];
+
+VOID SvTraceSetBranch(_In_ UINT32 Processor, _In_ UINT64 From, _In_ UINT64 To)
+{
+    if (Processor < SVMHV_MAX_REPORTED_CPUS)
+    {
+        g_Branch[Processor].From = From;
+        g_Branch[Processor].To = To;
+    }
+}
+
+/* Fill in a host-context record's branch fields, if this processor has any. */
+static VOID SvTraceApplyBranch(_Inout_ SVMHV_TRACE_RECORD* Record,
+                               _In_ UINT32 Processor)
+{
+    if (Processor < SVMHV_MAX_REPORTED_CPUS)
+    {
+        Record->BranchFrom = g_Branch[Processor].From;
+        Record->BranchTo = g_Branch[Processor].To;
+    }
+}
+
 /* ----------------------------------------------------------- watch path */
 
 /*
@@ -1135,6 +1165,7 @@ VOID SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
     record->Processor = Processor;
     record->Cr3       = Cr3;
     record->CodeLength = SvTraceCodeAt(Rip, record->Code, sizeof(record->Code));
+    SvTraceApplyBranch(record, Processor);
 
     /*
      * The value, if the page has an alias.  The GPA an #NPF reports is the
@@ -1207,6 +1238,7 @@ VOID SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
     record->Type         = SVMHV_TRACE_STEP;
     record->Processor    = Processor;
     record->Arguments[0] = flags;
+    SvTraceApplyBranch(record, Processor);
 
     if (CodeLength > sizeof(record->Code))
     {
@@ -1241,6 +1273,12 @@ VOID SvTraceUserExec(_In_ UINT32 HookId, _In_ UINT64 Target, _In_ UINT64 Rsp,
     record->Processor     = Processor;
     record->ReturnAddress = ReturnAddress;
 
+    /*
+     * No branch fields here on purpose.  The last branch before this exit is
+     * the jump the patched shadow page makes into our own stub, so recording it
+     * would be recording the instrument rather than the guest.
+     */
+
     for (i = 0; i < 4; i++)
     {
         record->Arguments[i] = Arguments[i];
@@ -1272,6 +1310,7 @@ VOID SvTraceRegister(_In_ UINT32 Type, _In_ UINT64 Rip, _In_ UINT64 Cr3,
     record->Arguments[1] = Value;
     record->Arguments[2] = IsWrite;
     record->Arguments[3] = Width;
+    SvTraceApplyBranch(record, Processor);
 
     SvTracePublish(record, sequence);
 }
