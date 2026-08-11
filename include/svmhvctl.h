@@ -372,6 +372,19 @@ typedef struct _SVMHV_TRACE_RECORD
     UINT32 FrameCount;
     UINT32 FrameReserved;
     UINT64 Frames[SVMHV_MAX_FRAMES];
+
+    /*
+     * Publication protocol, appended so the original record layout remains
+     * readable by v1 consumers.  A recorder first clears CommitSequence,
+     * fills every preceding field, then stores Sequence + 1 here with a full
+     * barrier.  Readers must verify it before and after copying a record.
+     *
+     * Generation changes on trace-reset.  Sequence itself never goes
+     * backwards, so { Generation, Sequence } is also a durable cursor that
+     * distinguishes a reset from a quiet trace.
+     */
+    UINT64 Generation;
+    UINT64 CommitSequence;              /* 0 while being written; seq + 1 valid */
 } SVMHV_TRACE_RECORD;
 
 /* ------------------------------------------------------------- self test */
@@ -480,6 +493,14 @@ typedef struct _SVMHV_SNAPSHOT
     /* Appended last on purpose: every offset above is hardcoded by clients
        that have no compiler to compute it, so nothing may move. */
     SVMHV_FATAL_EXIT Fatal;
+
+    /*
+     * Snapshot seqlock.  The control worker makes it odd before updating the
+     * snapshot and publishes an even, non-zero value afterwards.  A reader
+     * accepts a snapshot only when this value was the same even number before
+     * and after all of its windows were copied.
+     */
+    UINT64 PublishSequence;
 } SVMHV_SNAPSHOT;
 
 /* --------------------------------------------------------------- doorbell */
@@ -489,7 +510,7 @@ typedef struct _SVMHV_SNAPSHOT
  * stale symbol file cannot make it write commands into unrelated memory.
  */
 #define SVMHV_CONTROL_MAGIC     0x4C544356484D5653ULL
-#define SVMHV_CONTROL_VERSION   1
+#define SVMHV_CONTROL_VERSION   2
 
 #define SVMHV_CMD_NONE          0
 #define SVMHV_CMD_HOOK_INSTALL  1
@@ -539,7 +560,7 @@ typedef struct _SVMHV_CONTROL
      */
     UINT64 SnapshotAddress;
     UINT64 TraceRingAddress;
-    UINT64 TraceProducedAddress;        /* volatile LONG64, monotonic        */
+    UINT64 TraceProducedAddress;        /* volatile LONG64, absolute cursor  */
     UINT64 TraceRingRecords;            /* power of two                      */
     UINT64 TraceRecordSize;
     UINT64 NptPrimaryPml4;              /* virtual, so a client can walk it  */
@@ -555,7 +576,7 @@ typedef struct _SVMHV_CONTROL
  * fires, mcp\svmhv_mcp.py needs the same edit.
  */
 C_ASSERT(sizeof(SVMHV_FILTER)          == 24);
-C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES);
+C_ASSERT(sizeof(SVMHV_TRACE_RECORD)    == 432 + 8 + 8 * SVMHV_MAX_FRAMES + 16);
 C_ASSERT(sizeof(SVMHV_STATS)           == 640);
 C_ASSERT(sizeof(SVMHV_EXIT_HISTOGRAM)  == 2072);
 C_ASSERT(sizeof(SVMHV_HOOK_INFO)       == 64);
@@ -576,7 +597,8 @@ C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, Fatal)     == 2728 + sizeof(SVMHV_HOOK_LIS
                                                     sizeof(SVMHV_SELFTEST));
 C_ASSERT(sizeof(SVMHV_SNAPSHOT)                  == 2728 + sizeof(SVMHV_HOOK_LIST) +
                                                     sizeof(SVMHV_SELFTEST) +
-                                                    sizeof(SVMHV_FATAL_EXIT));
+                                                    sizeof(SVMHV_FATAL_EXIT) +
+                                                    sizeof(UINT64));
 
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Sequence)             == 16);
 C_ASSERT(FIELD_OFFSET(SVMHV_CONTROL, Completed)            == 24);
@@ -598,3 +620,10 @@ C_ASSERT(FIELD_OFFSET(SVMHV_HOOK_REQUEST, Shellcode)       == 296);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, ProcessName)     == 148);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CaptureLength)   == 164);
 C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CaptureData)     == 172);
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, Generation)      ==
+         432 + 8 + 8 * SVMHV_MAX_FRAMES);
+C_ASSERT(FIELD_OFFSET(SVMHV_TRACE_RECORD, CommitSequence)  ==
+         432 + 8 + 8 * SVMHV_MAX_FRAMES + sizeof(UINT64));
+C_ASSERT(FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence)     ==
+         2728 + sizeof(SVMHV_HOOK_LIST) + sizeof(SVMHV_SELFTEST) +
+         sizeof(SVMHV_FATAL_EXIT));

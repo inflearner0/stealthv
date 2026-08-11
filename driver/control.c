@@ -209,8 +209,27 @@ static VOID SvControlDisarmRunaways(VOID)
 
 /* ------------------------------------------------------------- snapshot */
 
+/*
+ * The worker is the sole snapshot writer.  The trailing sequence is therefore
+ * a compact seqlock: odd says a refresh is in progress, even says every field
+ * preceding it belongs to one coherent publication.  Readers use it before and
+ * after their 48-byte hypercall windows.
+ */
+static VOID SvSnapshotBeginUpdate(VOID)
+{
+    InterlockedIncrement64((volatile LONG64*)&g_Snapshot.PublishSequence);
+    KeMemoryBarrier();
+}
+
+static VOID SvSnapshotEndUpdate(VOID)
+{
+    KeMemoryBarrier();
+    InterlockedIncrement64((volatile LONG64*)&g_Snapshot.PublishSequence);
+}
+
 static VOID SvControlRefresh(VOID)
 {
+    SvSnapshotBeginUpdate();
     g_Snapshot.Tsc = __rdtsc();
     g_Snapshot.Refreshes++;
 
@@ -218,6 +237,7 @@ static VOID SvControlRefresh(VOID)
     SvFillExitHistogram(&g_Snapshot.Histogram);
     SvHookList(&g_Snapshot.Hooks);
     SvFillFatalExit(&g_Snapshot.Fatal);
+    SvSnapshotEndUpdate();
 }
 
 /*
@@ -274,8 +294,15 @@ static NTSTATUS SvControlExecute(_In_ UINT32 Command)
         return SvHookRemove((PVOID)g_Control.Request.Target);
 
     case SVMHV_CMD_SELFTEST:
-        SvRunSelfTest(&g_Snapshot.SelfTest);
+    {
+        SVMHV_SELFTEST selfTest;
+
+        SvRunSelfTest(&selfTest);
+        SvSnapshotBeginUpdate();
+        g_Snapshot.SelfTest = selfTest;
+        SvSnapshotEndUpdate();
         return STATUS_SUCCESS;
+    }
 
     case SVMHV_CMD_TRACE_RESET:
         SvTraceReset();
@@ -412,6 +439,7 @@ NTSTATUS SvControlStart(VOID)
 
     RtlZeroMemory(&g_Control, sizeof(g_Control));
     RtlZeroMemory(&g_Snapshot, sizeof(g_Snapshot));
+    g_Snapshot.PublishSequence = 2;       /* initial stable, non-zero state */
 
     KeInitializeEvent(&g_StopEvent, NotificationEvent, FALSE);
     g_Stopping = 0;

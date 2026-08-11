@@ -56,18 +56,27 @@ VOID     SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
 
 /*
  * Where the ring lives, so a client can read it out of driver memory rather than
- * asking for a copy.  The producer counter is monotonic; tracking what has
- * already been seen, and noticing when it has been lapped, is the client's job.
+ * asking for a copy.  The producer counter is an absolute, monotonic cursor;
+ * tracking what has already been seen, and noticing when it has been lapped,
+ * is the client's job.
  */
 VOID     SvTraceDescribeRing(_Out_ UINT64* Ring, _Out_ UINT64* Produced,
                              _Out_ UINT64* Records, _Out_ UINT64* RecordSize);
+
+/*
+ * A stable cursor generation, the oldest sequence still belonging to it, and
+ * the one-past-most-recent claimed sequence.  Generation is odd only while a
+ * reset is in progress, in which case a client must retry rather than consume.
+ */
+VOID     SvTraceCursorState(_Out_ UINT64* Head, _Out_ UINT64* Floor,
+                            _Out_ UINT64* Generation);
 VOID     SvTraceReset(VOID);
 
 /*
- * A client publishing how far it has drained the ring.  Nothing else moves the
- * consumer index - clients read the ring directly - so without this the driver
- * cannot tell a record that was overwritten unread from one that was read the
- * instant it appeared, and the drop counter says everything was lost.
+ * An optional acknowledgement that is strictly telemetry: it changes only the
+ * driver's overwrite/loss accounting, never the trace contents.  Sequence is
+ * the absolute cursor returned by SvTraceCursorState, not a reset-relative
+ * count.  Readers do not need to call this in order to retain their cursor.
  */
 VOID     SvTraceSetConsumed(_In_ UINT64 Sequence);
 

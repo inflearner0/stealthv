@@ -48,6 +48,134 @@ static UINT64 SvReadWindow(_Inout_ GUEST_CONTEXT* Context,
     return SVMHV_HV_STATUS_OK;
 }
 
+/*
+ * A snapshot spans hundreds of 48-byte hypercall windows.  A raw window is
+ * still available to v1 clients (ExpectedSequence == 0), while v2 clients pin
+ * every window to one even publish sequence and retry a whole snapshot when a
+ * refresh overlaps it.
+ */
+static UINT64 SvReadSnapshotWindow(_Inout_ GUEST_CONTEXT* Context,
+                                   _In_ UINT64 Offset,
+                                   _In_ UINT64 ExpectedSequence)
+{
+    UINT64 status;
+
+    /* The client samples this field before and after a protected view.  Read
+       it atomically rather than relying on a generic byte copy to preserve the
+       seqlock's single-word semantics. */
+    if (ExpectedSequence == 0 &&
+        Offset == FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence))
+    {
+        Context->Rbx = (UINT64)InterlockedCompareExchange64(
+            (volatile LONG64*)&g_Snapshot.PublishSequence, 0, 0);
+        Context->Rdx = 0;
+        Context->Rsi = 0;
+        Context->Rdi = 0;
+        Context->R8 = 0;
+        Context->R9 = 0;
+        return SVMHV_HV_STATUS_OK;
+    }
+
+    if (ExpectedSequence != 0)
+    {
+        const UINT64 before = (UINT64)InterlockedCompareExchange64(
+            (volatile LONG64*)&g_Snapshot.PublishSequence, 0, 0);
+
+        if ((ExpectedSequence & 1) != 0 || before != ExpectedSequence)
+        {
+            return SVMHV_HV_STATUS_RETRY;
+        }
+    }
+
+    status = SvReadWindow(Context, (const UINT8*)&g_Snapshot,
+                          sizeof(g_Snapshot), Offset);
+    if (status != SVMHV_HV_STATUS_OK || ExpectedSequence == 0)
+    {
+        return status;
+    }
+
+    KeMemoryBarrier();
+    if ((UINT64)InterlockedCompareExchange64(
+            (volatile LONG64*)&g_Snapshot.PublishSequence, 0, 0) !=
+        ExpectedSequence)
+    {
+        return SVMHV_HV_STATUS_RETRY;
+    }
+
+    return SVMHV_HV_STATUS_OK;
+}
+
+/*
+ * Copy one window of an absolute trace cursor only if its slot remained the
+ * same fully-published record for the entire copy.  The control client retries
+ * the record as a unit, so it can never compose one trace event from two slot
+ * incarnations.
+ */
+static UINT64 SvReadTraceCursorWindow(_Inout_ GUEST_CONTEXT* Context,
+                                      _In_ UINT64 Sequence,
+                                      _In_ UINT64 Offset)
+{
+    UINT64 ring;
+    UINT64 producedAddress;
+    UINT64 records;
+    UINT64 recordSize;
+    UINT64 head;
+    UINT64 floor;
+    UINT64 generation;
+    const SVMHV_TRACE_RECORD* record;
+    const UINT64 expected = Sequence + 1;
+    UINT64 status;
+
+    SvTraceDescribeRing(&ring, &producedAddress, &records, &recordSize);
+    if (ring == 0 || records == 0)
+    {
+        return SVMHV_HV_STATUS_UNAVAILABLE;
+    }
+    if ((Offset & 7) != 0 || Offset >= recordSize)
+    {
+        return SVMHV_HV_STATUS_BADOFFSET;
+    }
+
+    SvTraceCursorState(&head, &floor, &generation);
+    if ((generation & 1) != 0 || Sequence < floor || Sequence >= head)
+    {
+        return SVMHV_HV_STATUS_RETRY;
+    }
+
+    record = &((const SVMHV_TRACE_RECORD*)ring)[Sequence % records];
+    if ((UINT64)InterlockedCompareExchange64(
+            (volatile LONG64*)&record->CommitSequence, 0, 0) != expected ||
+        record->Sequence != Sequence || record->Generation != generation)
+    {
+        return SVMHV_HV_STATUS_RETRY;
+    }
+
+    status = SvReadWindow(Context, (const UINT8*)record,
+                          (SIZE_T)recordSize, Offset);
+    if (status != SVMHV_HV_STATUS_OK)
+    {
+        return status;
+    }
+
+    KeMemoryBarrier();
+    if ((UINT64)InterlockedCompareExchange64(
+            (volatile LONG64*)&record->CommitSequence, 0, 0) != expected ||
+        record->Sequence != Sequence || record->Generation != generation)
+    {
+        return SVMHV_HV_STATUS_RETRY;
+    }
+
+    /* A concurrent reset makes an otherwise valid old-generation record stale. */
+    SvTraceCursorState(&head, &floor, &generation);
+    if ((generation & 1) != 0 || Sequence < floor || Sequence >= head ||
+        record->Generation != generation)
+    {
+        return SVMHV_HV_STATUS_RETRY;
+    }
+
+    return SVMHV_HV_STATUS_OK;
+}
+
 VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context, _In_ UINT8 Cpl)
 {
     const UINT64 command = Context->Rbx;
@@ -125,8 +253,7 @@ VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context, _In_ UINT8 Cpl)
         break;
 
     case SVMHV_HV_READ_SNAPSHOT:
-        status = SvReadWindow(Context, (const UINT8*)&g_Snapshot,
-                              sizeof(g_Snapshot), argument);
+        status = SvReadSnapshotWindow(Context, argument, argument2);
         break;
 
     case SVMHV_HV_READ_REQUEST:
@@ -169,14 +296,23 @@ VOID SvHandleControlCall(_Inout_ GUEST_CONTEXT* Context, _In_ UINT8 Cpl)
         UINT64 producedAddress;
         UINT64 records;
         UINT64 recordSize;
+        UINT64 head;
+        UINT64 floor;
+        UINT64 generation;
 
         SvTraceDescribeRing(&ring, &producedAddress, &records, &recordSize);
-        Context->Rbx = (ring != 0 && producedAddress != 0)
-                     ? *(const volatile UINT64*)producedAddress : 0;
+        SvTraceCursorState(&head, &floor, &generation);
+        Context->Rbx = (ring != 0 && producedAddress != 0) ? head : 0;
         Context->Rdx = records;
         Context->Rsi = recordSize;
+        Context->Rdi = floor;
+        Context->R8  = generation;
         break;
     }
+
+    case SVMHV_HV_READ_TRACE_CURSOR:
+        status = SvReadTraceCursorWindow(Context, argument, argument2);
+        break;
 
     default:
         status = SVMHV_HV_STATUS_BADCOMMAND;

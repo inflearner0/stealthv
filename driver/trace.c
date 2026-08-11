@@ -79,15 +79,33 @@ static ULONG SvTraceStackCandidates(_In_ UINT64 Rsp,
 }
 
 /*
- * Power of two, so the modulo is a mask.  4096 records is about 640 KiB, which
- * buys roughly a second of a moderately busy hook before a client that is
+ * Power of two, so the modulo is a mask.  4096 records is a little over 2 MiB,
+ * which buys roughly a second of a moderately busy hook before a client that is
  * draining once a second starts losing the oldest of them.
  */
 #define TRACE_RING_RECORDS  4096
 #define TRACE_RING_MASK     (TRACE_RING_RECORDS - 1)
 
 static SVMHV_TRACE_RECORD* g_Ring;
-static volatile LONG64     g_Produced;      /* monotonic; & MASK gives a slot */
+/*
+ * Absolute, never-reused sequence numbers.  Reset deliberately does not put
+ * this counter back to zero: an old reader must never mistake a record from a
+ * previous trace generation for a newly produced record in the same slot.
+ */
+static volatile LONG64     g_Produced;
+
+/*
+ * An even generation is stable; an odd generation means SvTraceReset is
+ * publishing a new cursor floor.  Records carry the even generation observed
+ * when they were claimed, and clients reject records from another generation.
+ */
+static volatile LONG64     g_Generation;
+static volatile LONG64     g_ResetFloor;
+static volatile LONG64     g_ResetProduced;
+static volatile LONG64     g_ResetDropped;
+static volatile LONG64     g_ResetFiltered;
+/* Claims only hold this tiny gate until g_Produced has advanced. */
+static volatile LONG       g_Claiming;
 
 /*
  * How far a client says it has drained.  Nothing in the driver consumes the
@@ -99,7 +117,20 @@ static volatile LONG64     g_Produced;      /* monotonic; & MASK gives a slot */
 static volatile LONG64     g_Consumed;
 static volatile LONG64     g_Dropped;
 static volatile LONG64     g_Filtered;
-static KSPIN_LOCK          g_DrainLock;
+
+static UINT64 SvTraceLoad64(_In_ const volatile LONG64* Value)
+{
+    return (UINT64)InterlockedCompareExchange64((volatile LONG64*)Value, 0, 0);
+}
+
+/* Publish only after every ordinary record field is visible to another CPU. */
+static VOID SvTracePublish(_Inout_ SVMHV_TRACE_RECORD* Record,
+                           _In_ UINT64 Sequence)
+{
+    KeMemoryBarrier();
+    InterlockedExchange64((volatile LONG64*)&Record->CommitSequence,
+                          (LONG64)(Sequence + 1));
+}
 
 /*
  * A hook whose detour is traced must not be able to trace itself.
@@ -190,8 +221,6 @@ VOID SvTraceLastExec(_Out_writes_(4) UINT64* Arguments, _Out_ UINT32* Records)
 
 NTSTATUS SvTraceInitialize(VOID)
 {
-    KeInitializeSpinLock(&g_DrainLock);
-
     g_Ring = (SVMHV_TRACE_RECORD*)ExAllocatePool2(
                 POOL_FLAG_NON_PAGED,
                 sizeof(SVMHV_TRACE_RECORD) * TRACE_RING_RECORDS,
@@ -205,6 +234,13 @@ NTSTATUS SvTraceInitialize(VOID)
     g_Consumed = 0;
     g_Dropped = 0;
     g_Filtered = 0;
+    g_Generation = 2;                 /* stable, non-zero seqlock value */
+    g_ResetFloor = 0;
+    g_ResetProduced = 0;
+    g_ResetDropped = 0;
+    g_ResetFiltered = 0;
+    g_Claiming = 0;
+    RtlZeroMemory(g_Ring, sizeof(SVMHV_TRACE_RECORD) * TRACE_RING_RECORDS);
     RtlZeroMemory((PVOID)g_InRecorder, sizeof(g_InRecorder));
 
     return STATUS_SUCCESS;
@@ -222,9 +258,17 @@ VOID SvTraceFree(VOID)
 VOID SvTraceCounters(_Out_ UINT64* Produced, _Out_ UINT64* Dropped,
                      _Out_ UINT64* Filtered)
 {
-    *Produced = (UINT64)g_Produced;
-    *Dropped  = (UINT64)g_Dropped;
-    *Filtered = (UINT64)g_Filtered;
+    const UINT64 produced = SvTraceLoad64(&g_Produced);
+    const UINT64 dropped = SvTraceLoad64(&g_Dropped);
+    const UINT64 filtered = SvTraceLoad64(&g_Filtered);
+    const UINT64 producedBase = SvTraceLoad64(&g_ResetProduced);
+    const UINT64 droppedBase = SvTraceLoad64(&g_ResetDropped);
+    const UINT64 filteredBase = SvTraceLoad64(&g_ResetFiltered);
+
+    /* Reset is a logical generation boundary, not a destructive ring clear. */
+    *Produced = (produced >= producedBase) ? produced - producedBase : 0;
+    *Dropped  = (dropped >= droppedBase) ? dropped - droppedBase : 0;
+    *Filtered = (filtered >= filteredBase) ? filtered - filteredBase : 0;
 }
 
 /*
@@ -236,11 +280,35 @@ VOID SvTraceCounters(_Out_ UINT64* Produced, _Out_ UINT64* Dropped,
 static SVMHV_TRACE_RECORD* SvTraceClaim(_Out_ UINT64* Sequence)
 {
     LONG64 sequence;
+    UINT64 generation;
+    SVMHV_TRACE_RECORD* record;
 
     *Sequence = 0;
 
     if (g_Ring == NULL)
     {
+        return NULL;
+    }
+
+    /*
+     * Reset needs a precise floor: an old-generation claim must either advance
+     * g_Produced before the reset sees the gate empty, or not advance it at
+     * all.  The gate covers only two atomic reads and one increment, never the
+     * record formatting path, so reset does not wait for captures or page
+     * faults and hook paths never spin waiting for reset.
+     */
+    generation = SvTraceLoad64(&g_Generation);
+    if ((generation & 1) != 0)
+    {
+        return NULL;
+    }
+
+    InterlockedIncrement(&g_Claiming);
+    KeMemoryBarrier();
+    if (generation != SvTraceLoad64(&g_Generation) ||
+        (generation & 1) != 0)
+    {
+        InterlockedDecrement(&g_Claiming);
         return NULL;
     }
 
@@ -254,9 +322,22 @@ static SVMHV_TRACE_RECORD* SvTraceClaim(_Out_ UINT64* Sequence)
     {
         InterlockedIncrement64(&g_Dropped);
     }
+    InterlockedDecrement(&g_Claiming);
 
     *Sequence = (UINT64)sequence;
-    return &g_Ring[sequence & TRACE_RING_MASK];
+    record = &g_Ring[sequence & TRACE_RING_MASK];
+
+    /*
+     * Invalidate the old incarnation before touching anything it contains.
+     * A reader that started before this store will see a different commit
+     * sequence afterwards; one that starts after it gets RETRY until the
+     * final SvTracePublish below.
+     */
+    InterlockedExchange64((volatile LONG64*)&record->CommitSequence, 0);
+    RtlZeroMemory(record, FIELD_OFFSET(SVMHV_TRACE_RECORD, CommitSequence));
+    record->Sequence = (UINT64)sequence;
+    record->Generation = generation;
+    return record;
 }
 
 /* --------------------------------------------------------------- filters */
@@ -708,8 +789,6 @@ UINT64 SvTraceReturnEntry(_In_ UINT64 Rax, _In_ UINT64 Rsp)
 
             if (record != NULL)
             {
-                RtlZeroMemory(record, sizeof(*record));
-                record->Sequence = sequence;
                 record->Tsc = __rdtsc();
                 record->Type = SVMHV_TRACE_RETURN;
                 record->HookId = (UINT32)frame->HookId;
@@ -722,6 +801,7 @@ UINT64 SvTraceReturnEntry(_In_ UINT64 Rax, _In_ UINT64 Rsp)
                 record->Processor = KeGetCurrentProcessorIndex();
                 record->ProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
                 record->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
+                SvTracePublish(record, sequence);
             }
 
             return address;
@@ -828,8 +908,6 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
 
         if (record != NULL)
         {
-            RtlZeroMemory(record, sizeof(*record));
-            record->Sequence = sequence;
             record->Tsc      = __rdtsc();
             record->Rip      = info.Target;
             record->Rsp      = OriginalRsp;
@@ -923,6 +1001,7 @@ PVOID SvTraceExecEntry(_In_ UINT64 HookId, _In_ TRACE_FRAME* Frame,
         if (record != NULL)
         {
             record->Spoofed = spoofed;
+            SvTracePublish(record, sequence);
         }
 
         g_LastArguments[0] = arguments[0];
@@ -973,8 +1052,6 @@ VOID SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
         return;
     }
 
-    RtlZeroMemory(record, sizeof(*record));
-    record->Sequence  = sequence;
     record->Tsc       = __rdtsc();
     record->Rip       = Rip;
     record->Gpa       = Gpa;
@@ -982,15 +1059,16 @@ VOID SvTraceWatchHit(_In_ UINT32 HookId, _In_ UINT32 Type, _In_ UINT64 Rip,
     record->HookId    = HookId;
     record->Type      = Type;
     record->Processor  = Processor;
+    SvTracePublish(record, sequence);
 }
 
 /* --------------------------------------------------------------- clients */
 
 /*
  * Where the ring is, so a client can read it directly instead of asking the
- * driver to copy it.  The consumer index is the client's own business: the
- * producer counter is monotonic, so a client remembers what it has already seen
- * and works out for itself whether it has been lapped.
+ * driver to copy it.  Produced is an absolute cursor, not the reset-relative
+ * trace-record counter shown in stats.  It never goes backwards for the
+ * lifetime of this driver instance.
  */
 VOID SvTraceDescribeRing(_Out_ UINT64* Ring, _Out_ UINT64* Produced,
                          _Out_ UINT64* Records, _Out_ UINT64* RecordSize)
@@ -999,6 +1077,52 @@ VOID SvTraceDescribeRing(_Out_ UINT64* Ring, _Out_ UINT64* Produced,
     *Produced   = (UINT64)&g_Produced;
     *Records    = TRACE_RING_RECORDS;
     *RecordSize = sizeof(SVMHV_TRACE_RECORD);
+}
+
+/*
+ * The durable cursor boundary for a client that wants non-destructive reads.
+ * Generation is a tiny seqlock around Floor: readers only accept an even,
+ * unchanged generation.  A record has to match both this generation and its
+ * own committed absolute sequence before the client prints or advances past it.
+ */
+VOID SvTraceCursorState(_Out_ UINT64* Head, _Out_ UINT64* Floor,
+                        _Out_ UINT64* Generation)
+{
+    UINT64 generation = 0;
+    UINT64 floor = 0;
+    UINT64 head = 0;
+    ULONG attempt;
+
+    for (attempt = 0; attempt < 8; attempt++)
+    {
+        const UINT64 before = SvTraceLoad64(&g_Generation);
+
+        if ((before & 1) != 0)
+        {
+            continue;
+        }
+
+        head = SvTraceLoad64(&g_Produced);
+        floor = SvTraceLoad64(&g_ResetFloor);
+        if (head > TRACE_RING_RECORDS && floor < head - TRACE_RING_RECORDS)
+        {
+            floor = head - TRACE_RING_RECORDS;
+        }
+        generation = SvTraceLoad64(&g_Generation);
+        if (generation == before && (generation & 1) == 0)
+        {
+            *Head = head;
+            *Floor = floor;
+            *Generation = generation;
+            return;
+        }
+    }
+
+    /* A reset is exceptionally short.  Tell the client to retry rather than
+       returning a floor from one generation and a head from another. */
+    *Head = 0;
+    *Floor = 0;
+    *Generation = SvTraceLoad64(&g_Generation) | 1;
 }
 
 /*
@@ -1011,10 +1135,11 @@ VOID SvTraceSetConsumed(_In_ UINT64 Sequence)
 {
     LONG64 wanted = (LONG64)Sequence;
     LONG64 current;
+    const LONG64 produced = (LONG64)SvTraceLoad64(&g_Produced);
 
-    if (wanted > g_Produced)
+    if (wanted > produced)
     {
-        wanted = g_Produced;
+        wanted = produced;
     }
 
     do
@@ -1030,18 +1155,36 @@ VOID SvTraceSetConsumed(_In_ UINT64 Sequence)
 
 VOID SvTraceReset(VOID)
 {
-    KIRQL irql;
+    UINT64 head;
 
-    KeAcquireSpinLock(&g_DrainLock, &irql);
-    g_Produced = 0;
-    g_Consumed = 0;
-    g_Dropped = 0;
-    g_Filtered = 0;
-    g_LastExecRecords = 0;
-    RtlZeroMemory(g_LastArguments, sizeof(g_LastArguments));
-    if (g_Ring != NULL)
+    /*
+     * Never clear an actively-written ring.  Producers run from arbitrary
+     * hooks (and from the #NPF handler), so a spin lock held by the worker
+     * never excluded them.  Advancing the absolute cursor floor instead makes
+     * reset atomic from the reader's point of view and leaves in-flight writers
+     * harmlessly tagged with the generation they started in.
+     */
+    InterlockedIncrement64(&g_Generation);       /* odd: reset in progress */
+    KeMemoryBarrier();
+
+    /* See SvTraceClaim: a claim that could still use the old generation must
+       have advanced g_Produced before it drops this gate. */
+    while (InterlockedCompareExchange(&g_Claiming, 0, 0) != 0)
     {
-        RtlZeroMemory(g_Ring, sizeof(SVMHV_TRACE_RECORD) * TRACE_RING_RECORDS);
+        KeStallExecutionProcessor(1);
     }
-    KeReleaseSpinLock(&g_DrainLock, irql);
+
+    head = SvTraceLoad64(&g_Produced);
+    InterlockedExchange64(&g_ResetFloor, (LONG64)head);
+    InterlockedExchange64(&g_ResetProduced, (LONG64)head);
+    InterlockedExchange64(&g_ResetDropped, g_Dropped);
+    InterlockedExchange64(&g_ResetFiltered, g_Filtered);
+    SvTraceSetConsumed(head);
+
+    InterlockedExchange(&g_LastExecRecords, 0);
+    RtlZeroMemory(g_LastArguments, sizeof(g_LastArguments));
+    g_LastReturn = 0;
+
+    KeMemoryBarrier();
+    InterlockedIncrement64(&g_Generation);       /* even: new generation */
 }

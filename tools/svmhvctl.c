@@ -31,8 +31,10 @@
 #define HV_UNLOAD               8
 #define HV_SIGNATURE            9
 #define HV_TRACE_CONSUMED       10
+#define HV_READ_TRACE_CURSOR    12
 
 #define HV_OK                   0
+#define HV_RETRY                4
 #define HV_ABSENT               0xFFFFFFFFFFFFFFFFULL   /* VMMCALL raised #UD */
 #define HV_READ_WINDOW          48
 
@@ -51,13 +53,15 @@
 #define SNAP_HOOKS              2728
 #define SNAP_SELFTEST           19120
 #define SNAP_FATAL              19296
-#define SNAP_SIZE               19376
+#define SNAP_PUBLISH            19376
+#define SNAP_SIZE               19384
 
 C_ASSERT(SNAP_STATS     == FIELD_OFFSET(SVMHV_SNAPSHOT, Stats));
 C_ASSERT(SNAP_HISTOGRAM == FIELD_OFFSET(SVMHV_SNAPSHOT, Histogram));
 C_ASSERT(SNAP_HOOKS     == FIELD_OFFSET(SVMHV_SNAPSHOT, Hooks));
 C_ASSERT(SNAP_SELFTEST  == FIELD_OFFSET(SVMHV_SNAPSHOT, SelfTest));
 C_ASSERT(SNAP_FATAL     == FIELD_OFFSET(SVMHV_SNAPSHOT, Fatal));
+C_ASSERT(SNAP_PUBLISH   == FIELD_OFFSET(SVMHV_SNAPSHOT, PublishSequence));
 C_ASSERT(SNAP_SIZE      == sizeof(SVMHV_SNAPSHOT));
 
 #define REQ_TARGET              0
@@ -102,6 +106,8 @@ typedef struct _HV_REGS
 {
     unsigned __int64 Rax, Rbx, Rcx, Rdx, Rsi, Rdi, R8, R9;
 } HV_REGS;
+
+static unsigned __int64 g_ControlVersion;
 
 extern void AsmHypercall(HV_REGS* Regs);
 
@@ -149,6 +155,7 @@ static int Present(void)
     {
         return 0;
     }
+    g_ControlVersion = regs.Rdx;
     return regs.Rbx == SVMHV_CONTROL_MAGIC;
 }
 
@@ -175,10 +182,17 @@ static unsigned int WaitBackoffMs(int attempt)
     return (attempt < WAIT_SHORT_ATTEMPTS) ? 1u : 50u;
 }
 
-/* Read Length bytes from one of the driver's structures, 48 at a time. */
-static int ReadBlock(unsigned __int64 command, unsigned __int64 index,
-                     unsigned __int64 offset, unsigned char* out,
-                     unsigned int length)
+/*
+ * Read Length bytes from one of the driver's structures, 48 at a time.
+ *
+ * Return 1 for a complete copy, 0 for a hard hypercall failure, and -1 when a
+ * v2 snapshot/trace record changed during a protected copy.  Callers that need
+ * a coherent multi-window object retry from byte zero on -1.
+ */
+static int ReadBlockEx(unsigned __int64 command, unsigned __int64 index,
+                       unsigned __int64 offset, unsigned char* out,
+                       unsigned int length,
+                       unsigned __int64 expectedSequence)
 {
     unsigned int done = 0;
 
@@ -189,13 +203,21 @@ static int ReadBlock(unsigned __int64 command, unsigned __int64 index,
         unsigned int chunk = length - done;
         unsigned __int64 status;
 
-        if (command == HV_READ_TRACE)
+        if (command == HV_READ_TRACE || command == HV_READ_TRACE_CURSOR)
         {
             status = Call(command, index, offset + done, &regs);
+        }
+        else if (command == HV_READ_SNAPSHOT)
+        {
+            status = Call(command, offset + done, expectedSequence, &regs);
         }
         else
         {
             status = Call(command, offset + done, 0, &regs);
+        }
+        if (status == HV_RETRY)
+        {
+            return -1;
         }
         if (status != HV_OK)
         {
@@ -216,6 +238,80 @@ static int ReadBlock(unsigned __int64 command, unsigned __int64 index,
     }
 
     return 1;
+}
+
+static int ReadBlock(unsigned __int64 command, unsigned __int64 index,
+                     unsigned __int64 offset, unsigned char* out,
+                     unsigned int length)
+{
+    return ReadBlockEx(command, index, offset, out, length, 0) == 1;
+}
+
+typedef struct _SNAPSHOT_PART
+{
+    unsigned __int64 Offset;
+    unsigned char* Out;
+    unsigned int Length;
+} SNAPSHOT_PART;
+
+/*
+ * The snapshot is written in place, so no individual 48-byte read can make a
+ * view coherent.  Pin every requested part to one even publish sequence and
+ * restart if the control worker refreshed it underneath us.  Views request
+ * only the fields they print, rather than paying to copy the entire snapshot.
+ */
+static int ReadSnapshotParts(SNAPSHOT_PART* parts, unsigned int partCount)
+{
+    unsigned int attempt;
+
+    for (attempt = 0; attempt < 8; attempt++)
+    {
+        unsigned __int64 sequence = 0;
+        const int state = ReadBlockEx(HV_READ_SNAPSHOT, 0, SNAP_PUBLISH,
+                                      (unsigned char*)&sequence,
+                                      sizeof(sequence), 0);
+        unsigned int part;
+        int copied = 1;
+        int finalState;
+        unsigned __int64 finalSequence = 0;
+
+        if (state == 0)
+        {
+            return 0;
+        }
+        if (state != 1 || sequence == 0 || (sequence & 1) != 0)
+        {
+            Sleep(1);
+            continue;
+        }
+
+        for (part = 0; part < partCount; part++)
+        {
+            copied = ReadBlockEx(HV_READ_SNAPSHOT, 0, parts[part].Offset,
+                                 parts[part].Out, parts[part].Length, sequence);
+            if (copied != 1)
+            {
+                break;
+            }
+        }
+        finalState = (copied == 1)
+                   ? ReadBlockEx(HV_READ_SNAPSHOT, 0, SNAP_PUBLISH,
+                                 (unsigned char*)&finalSequence,
+                                 sizeof(finalSequence), 0)
+                   : copied;
+        if (finalState == 1 && finalSequence == sequence)
+        {
+            return 1;
+        }
+        if (finalState == 0)
+        {
+            return 0;
+        }
+        Sleep(1);
+    }
+
+    fprintf(stderr, "could not acquire a coherent snapshot; it kept changing\n");
+    return 0;
 }
 
 /* Fill the request block a qword at a time, then ring the doorbell and wait. */
@@ -918,23 +1014,15 @@ static int ApplyOptions(unsigned char* request, int argc, char** argv, int index
  * will look healthy.  Printed as part of the ordinary status because the whole
  * point of the record is that nobody has to know to go looking for it.
  */
-static void PrintFatal(void)
+static void PrintFatal(const SVMHV_FATAL_EXIT* fatal)
 {
     static const char* const reasons[] =
     {
         "none", "guest-triple-fault", "unhandled-exit-code",
         "npf-unmapped", "npf-retry-limit"
     };
-    SVMHV_FATAL_EXIT fatal;
-
-    if (!ReadBlock(HV_READ_SNAPSHOT, 0, SNAP_FATAL, (unsigned char*)&fatal,
-                   sizeof(fatal)))
-    {
-        return;
-    }
-
-    printf("fatal_count=%llu\n", fatal.Count);
-    if (fatal.Count == 0)
+    printf("fatal_count=%llu\n", fatal->Count);
+    if (fatal->Count == 0)
     {
         return;
     }
@@ -944,24 +1032,27 @@ static void PrintFatal(void)
            "fatal_exitintinfo=0x%llx\n"
            "fatal_rip=0x%llx\nfatal_rsp=0x%llx\nfatal_cr2=0x%llx\n"
            "fatal_cr3=0x%llx\n",
-           (fatal.Reason < sizeof(reasons) / sizeof(reasons[0]))
-               ? reasons[fatal.Reason] : "unknown",
-           fatal.Processor, fatal.ExitCode, fatal.ExitInfo1, fatal.ExitInfo2,
-           fatal.ExitIntInfo, fatal.Rip, fatal.Rsp, fatal.Cr2, fatal.Cr3);
+           (fatal->Reason < sizeof(reasons) / sizeof(reasons[0]))
+               ? reasons[fatal->Reason] : "unknown",
+           fatal->Processor, fatal->ExitCode, fatal->ExitInfo1, fatal->ExitInfo2,
+           fatal->ExitIntInfo, fatal->Rip, fatal->Rsp, fatal->Cr2, fatal->Cr3);
 }
 
 static void PrintStats(void)
 {
-    unsigned char raw[SNAP_SIZE];
     SVMHV_STATS stats;
+    SVMHV_FATAL_EXIT fatal;
+    SNAPSHOT_PART parts[2] =
+    {
+        { SNAP_STATS, (unsigned char*)&stats, sizeof(stats) },
+        { SNAP_FATAL, (unsigned char*)&fatal, sizeof(fatal) }
+    };
     unsigned int i;
 
-    if (!ReadBlock(HV_READ_SNAPSHOT, 0, SNAP_STATS, (unsigned char*)&stats,
-                   sizeof(stats)))
+    if (!ReadSnapshotParts(parts, sizeof(parts) / sizeof(parts[0])))
     {
         return;
     }
-    (void)raw;
 
     printf("cpus=%u\noptions=0x%04x\nactive_hooks=%u\nsplit_pages=%u\n",
            stats.CpuCount, stats.Options, stats.ActiveHooks,
@@ -981,16 +1072,16 @@ static void PrintStats(void)
         printf("cpu%u_exits=%llu\n", i, stats.PerCpuExits[i]);
     }
 
-    PrintFatal();
+    PrintFatal(&fatal);
 }
 
 static void PrintHooks(void)
 {
     SVMHV_HOOK_LIST list;
+    SNAPSHOT_PART part = { SNAP_HOOKS, (unsigned char*)&list, sizeof(list) };
     unsigned int i;
 
-    if (!ReadBlock(HV_READ_SNAPSHOT, 0, SNAP_HOOKS, (unsigned char*)&list,
-                   sizeof(list)))
+    if (!ReadSnapshotParts(&part, 1))
     {
         return;
     }
@@ -1010,10 +1101,11 @@ static void PrintHooks(void)
 static void PrintHistogram(void)
 {
     SVMHV_EXIT_HISTOGRAM histogram;
+    SNAPSHOT_PART part =
+        { SNAP_HISTOGRAM, (unsigned char*)&histogram, sizeof(histogram) };
     unsigned int i;
 
-    if (!ReadBlock(HV_READ_SNAPSHOT, 0, SNAP_HISTOGRAM,
-                   (unsigned char*)&histogram, sizeof(histogram)))
+    if (!ReadSnapshotParts(&part, 1))
     {
         return;
     }
@@ -1033,10 +1125,10 @@ static void PrintHistogram(void)
 static void PrintSelfTest(void)
 {
     SVMHV_SELFTEST test;
+    SNAPSHOT_PART part = { SNAP_SELFTEST, (unsigned char*)&test, sizeof(test) };
     unsigned int i;
 
-    if (!ReadBlock(HV_READ_SNAPSHOT, 0, SNAP_SELFTEST, (unsigned char*)&test,
-                   sizeof(test)))
+    if (!ReadSnapshotParts(&part, 1))
     {
         return;
     }
@@ -1062,93 +1154,273 @@ static void PrintSelfTest(void)
     printf("\n");
 }
 
+typedef struct _TRACE_STATE
+{
+    unsigned __int64 Head;              /* one past the last claimed record */
+    unsigned __int64 Records;
+    unsigned __int64 RecordSize;
+    unsigned __int64 Floor;             /* oldest cursor that can still read */
+    unsigned __int64 Generation;
+} TRACE_STATE;
+
+static int ReadTraceState(TRACE_STATE* state)
+{
+    unsigned int attempt;
+
+    for (attempt = 0; attempt < 8; attempt++)
+    {
+        HV_REGS regs;
+
+        if (Call(HV_TRACE_STATE, 0, 0, &regs) != HV_OK)
+        {
+            fprintf(stderr, "no trace ring\n");
+            return 0;
+        }
+
+        state->Head = regs.Rbx;
+        state->Records = regs.Rdx;
+        state->RecordSize = regs.Rsi;
+        state->Floor = regs.Rdi;
+        state->Generation = regs.R8;
+        if (state->Records != 0 &&
+            state->RecordSize != sizeof(SVMHV_TRACE_RECORD))
+        {
+            fprintf(stderr, "trace record ABI size %llu is incompatible with "
+                            "this client (%u)\n",
+                    state->RecordSize, (unsigned int)sizeof(SVMHV_TRACE_RECORD));
+            return 0;
+        }
+        if ((state->Generation & 1) == 0)
+        {
+            return 1;
+        }
+        Sleep(1);
+    }
+
+    fprintf(stderr, "trace reset did not finish\n");
+    return 0;
+}
+
+/* Read a whole trace record only from one committed slot incarnation. */
+static int ReadTraceRecord(unsigned __int64 sequence,
+                           unsigned __int64 generation,
+                           SVMHV_TRACE_RECORD* record)
+{
+    unsigned int attempt;
+
+    for (attempt = 0; attempt < 4; attempt++)
+    {
+        const int copied = ReadBlockEx(HV_READ_TRACE_CURSOR, sequence, 0,
+                                       (unsigned char*)record, sizeof(*record),
+                                       0);
+
+        if (copied == 1 && record->Sequence == sequence &&
+            record->Generation == generation &&
+            record->CommitSequence == sequence + 1)
+        {
+            return 1;
+        }
+        if (copied == 0)
+        {
+            return 0;
+        }
+        Sleep(1);
+    }
+
+    return -1;                          /* unfinished, lapped, or reset */
+}
+
+static void PrintTraceRecord(const SVMHV_TRACE_RECORD* record)
+{
+    printf("trace seq=%llu type=%u hook=%u cpu=%u pid=%u tid=%u irql=%u "
+           "spoofed=%u proc=%.15s "
+           "tsc=%llu rip=0x%llx rsp=0x%llx ret=0x%llx gpa=0x%llx err=0x%llx "
+           "a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx s0=0x%llx s1=0x%llx",
+           record->Sequence, record->Type, record->HookId, record->Processor,
+           record->ProcessId, record->ThreadId, record->Irql,
+           record->Spoofed,
+           (record->ProcessName[0] != 0) ? record->ProcessName : "-",
+           record->Tsc,
+           record->Rip, record->Rsp, record->ReturnAddress, record->Gpa,
+           record->ErrorCode, record->Arguments[0], record->Arguments[1],
+           record->Arguments[2], record->Arguments[3],
+           record->StackArguments[0], record->StackArguments[1]);
+
+    /* The stack, when the walk managed one. */
+    if (record->FrameCount != 0)
+    {
+        unsigned int f;
+        printf(" frames=");
+        for (f = 0; f < record->FrameCount && f < SVMHV_MAX_FRAMES; f++)
+        {
+            printf("%s0x%llx", (f != 0) ? "," : "",
+                   (unsigned long long)record->Frames[f]);
+        }
+    }
+
+    /* Captures go out as hex so the client can decide what they were. */
+    {
+        unsigned int c;
+        for (c = 0; c < SVMHV_MAX_CAPTURES; c++)
+        {
+            unsigned int b;
+            if (record->CaptureLength[c] == 0) { continue; }
+            printf(" cap%u=", c);
+            for (b = 0; b < record->CaptureLength[c] &&
+                        b < SVMHV_CAPTURE_MAX; b++)
+            {
+                printf("%02x", record->CaptureData[c][b]);
+            }
+        }
+    }
+    printf("\n");
+}
+
+/*
+ * Tell the driver how far this collector has read.
+ *
+ * It erases nothing and it is not required to keep a cursor - the cursor is the
+ * client's own business now.  What it is required for is the loss accounting:
+ * the driver counts a record as dropped when it overwrites one nobody has
+ * claimed to have read, so with no collector ever publishing a watermark
+ * "dropped" degenerates into "produced minus the size of the ring" and stops
+ * being able to distinguish a client that fell behind from one that kept up.
+ * Only the cursor view publishes it; "trace" is a peek and acknowledging from a
+ * peek is what made this number lie in the other direction.
+ */
+static void PublishConsumed(unsigned __int64 cursor)
+{
+    (void)Call(HV_TRACE_CONSUMED, cursor, 0, NULL);
+}
+
+/* The convenient view: a non-destructive look at the latest committed records. */
 static void PrintTrace(unsigned int count)
 {
-    HV_REGS regs;
-    unsigned __int64 produced;
-    unsigned __int64 records;
-    unsigned __int64 recordSize;
+    TRACE_STATE state;
     unsigned __int64 first;
     unsigned __int64 index;
 
-    if (Call(HV_TRACE_STATE, 0, 0, &regs) != HV_OK)
-    {
-        fprintf(stderr, "no trace ring\n");
-        return;
-    }
-    produced = regs.Rbx;
-    records = regs.Rdx;
-    recordSize = regs.Rsi;
-
-    printf("produced=%llu\nring_records=%llu\nrecord_size=%llu\n",
-           produced, records, recordSize);
-    if (produced == 0 || records == 0)
+    if (!ReadTraceState(&state))
     {
         return;
     }
-    if (count > produced) { count = (unsigned int)produced; }
-    if (count > records)  { count = (unsigned int)records; }
 
-    first = produced - count;
-    for (index = first; index < produced; index++)
+    printf("produced=%llu\nring_records=%llu\nrecord_size=%llu\n"
+           "cursor_floor=%llu\ntrace_generation=%llu\n",
+           state.Head, state.Records, state.RecordSize,
+           state.Floor, state.Generation);
+    if (state.Records == 0 || state.Head <= state.Floor || count == 0)
+    {
+        return;
+    }
+    if ((unsigned __int64)count > state.Head - state.Floor)
+    {
+        count = (unsigned int)(state.Head - state.Floor);
+    }
+    if ((unsigned __int64)count > state.Records)
+    {
+        count = (unsigned int)state.Records;
+    }
+
+    first = state.Head - count;
+    if (first < state.Floor)
+    {
+        first = state.Floor;
+    }
+    for (index = first; index < state.Head; index++)
     {
         SVMHV_TRACE_RECORD record;
+        const int copied = ReadTraceRecord(index, state.Generation, &record);
 
-        if (!ReadBlock(HV_READ_TRACE, index % records, 0,
-                       (unsigned char*)&record, sizeof(record)))
+        if (copied == 1)
+        {
+            PrintTraceRecord(&record);
+        }
+        else if (copied < 0)
+        {
+            printf("trace_retry_seq=%llu\n", index);
+        }
+        else
         {
             return;
         }
-        printf("trace seq=%llu type=%u hook=%u cpu=%u pid=%u tid=%u irql=%u "
-               "spoofed=%u proc=%.15s "
-               "tsc=%llu rip=0x%llx rsp=0x%llx ret=0x%llx gpa=0x%llx err=0x%llx "
-               "a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx s0=0x%llx s1=0x%llx",
-               record.Sequence, record.Type, record.HookId, record.Processor,
-               record.ProcessId, record.ThreadId, record.Irql,
-               record.Spoofed,
-               (record.ProcessName[0] != 0) ? record.ProcessName : "-",
-               record.Tsc,
-               record.Rip, record.Rsp, record.ReturnAddress, record.Gpa,
-               record.ErrorCode, record.Arguments[0], record.Arguments[1],
-               record.Arguments[2], record.Arguments[3],
-               record.StackArguments[0], record.StackArguments[1]);
+    }
+}
 
-        /* The stack, when the walk managed one. */
-        if (record.FrameCount != 0)
+/*
+ * A continuation-friendly view for collectors.  The caller persists
+ * next_cursor and never needs to acknowledge/erase trace data globally.
+ */
+static void PrintTraceCursor(unsigned __int64 cursor, unsigned int count)
+{
+    TRACE_STATE state;
+    TRACE_STATE after;
+    unsigned int printed = 0;
+
+    if (!ReadTraceState(&state))
+    {
+        return;
+    }
+    if (cursor < state.Floor)
+    {
+        printf("cursor_lost=1\n");
+        cursor = state.Floor;
+    }
+    if (cursor > state.Head)
+    {
+        printf("cursor_future=1\n");
+        cursor = state.Head;
+    }
+
+    printf("cursor=%llu\ncursor_floor=%llu\ntrace_generation=%llu\n",
+           cursor, state.Floor, state.Generation);
+    while (cursor < state.Head && printed < count)
+    {
+        SVMHV_TRACE_RECORD record;
+        const int copied = ReadTraceRecord(cursor, state.Generation, &record);
+
+        if (copied == 1)
         {
-            unsigned int f;
-            printf(" frames=");
-            for (f = 0; f < record.FrameCount && f < SVMHV_MAX_FRAMES; f++)
-            {
-                printf("%s0x%llx", (f != 0) ? "," : "",
-                       (unsigned long long)record.Frames[f]);
-            }
+            PrintTraceRecord(&record);
+            cursor++;
+            printed++;
+            continue;
         }
-
-        /* Captures go out as hex so the client can decide what they were. */
+        if (copied < 0)
         {
-            unsigned int c;
-            for (c = 0; c < SVMHV_MAX_CAPTURES; c++)
+            if (ReadTraceState(&after))
             {
-                unsigned int b;
-                if (record.CaptureLength[c] == 0) { continue; }
-                printf(" cap%u=", c);
-                for (b = 0; b < record.CaptureLength[c] &&
-                            b < SVMHV_CAPTURE_MAX; b++)
+                if (after.Generation != state.Generation)
                 {
-                    printf("%02x", record.CaptureData[c][b]);
+                    printf("trace_reset=1\nnext_cursor=%llu\n", after.Floor);
+                }
+                else if (cursor < after.Floor)
+                {
+                    printf("cursor_lost=1\nnext_cursor=%llu\n", after.Floor);
+                }
+                else
+                {
+                    printf("cursor_pending=%llu\n", cursor);
                 }
             }
         }
-        printf("\n");
+        PublishConsumed(cursor);
+        return;
     }
 
-    /*
-     * Tell the driver how far we got.  Nothing else moves its consumer index,
-     * and until something does it has to assume every record it overwrites was
-     * lost - which makes the dropped count in "status" meaningless.
-     */
-    (void)Call(HV_TRACE_CONSUMED, produced, 0, NULL);
+    if (!ReadTraceState(&after))
+    {
+        return;
+    }
+    if (after.Generation != state.Generation)
+    {
+        printf("trace_reset=1\nnext_cursor=%llu\n", after.Floor);
+    }
+    else
+    {
+        printf("next_cursor=%llu\n", cursor);
+    }
+    PublishConsumed(cursor);
 }
 
 /* ------------------------------------------------------------------ main */
@@ -1180,6 +1452,7 @@ static void Usage(void)
         "  svmhvctl present\n"
         "  svmhvctl status | hooks | histogram | selftest-result\n"
         "  svmhvctl trace [count]\n"
+        "  svmhvctl trace-cursor <next_cursor> [count]\n"
         "  svmhvctl selftest\n"
         "  svmhvctl trace-reset\n"
         "  svmhvctl hook-trace  <target> <prolog>\n"
@@ -1238,8 +1511,15 @@ int main(int argc, char** argv)
 
     if (_stricmp(argv[1], "present") == 0)
     {
-        printf("present=1\n");
+        printf("present=1\ncontrol_version=%llu\n", g_ControlVersion);
         return 0;
+    }
+    if (g_ControlVersion != SVMHV_CONTROL_VERSION)
+    {
+        fprintf(stderr, "control ABI version %llu is incompatible with this "
+                        "client (expected %u)\n",
+                g_ControlVersion, SVMHV_CONTROL_VERSION);
+        return 1;
     }
     if (_stricmp(argv[1], "status") == 0)          { PrintStats();     return 0; }
     if (_stricmp(argv[1], "hooks") == 0)           { PrintHooks();     return 0; }
@@ -1249,6 +1529,14 @@ int main(int argc, char** argv)
     if (_stricmp(argv[1], "trace") == 0)
     {
         PrintTrace((argc > 2) ? (unsigned int)strtoul(argv[2], NULL, 0) : 40);
+        return 0;
+    }
+
+    if (_stricmp(argv[1], "trace-cursor") == 0 && argc >= 3)
+    {
+        PrintTraceCursor(strtoull(argv[2], NULL, 0),
+                         (argc > 3) ? (unsigned int)strtoul(argv[3], NULL, 0)
+                                    : 40);
         return 0;
     }
 

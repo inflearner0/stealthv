@@ -95,10 +95,10 @@
 #define SVMHV_HV_WRITE_REQUEST  1   /* rdx = offset, rsi = value            */
 #define SVMHV_HV_SUBMIT         2   /* rdx = command  -> rbx = sequence     */
 #define SVMHV_HV_POLL           3   /* -> rbx = completed, rdx = status     */
-#define SVMHV_HV_READ_SNAPSHOT  4   /* rdx = offset -> 48 bytes             */
+#define SVMHV_HV_READ_SNAPSHOT  4   /* rdx = offset, rsi = expected seq     */
 #define SVMHV_HV_READ_REQUEST   5   /* rdx = offset -> 48 bytes             */
-#define SVMHV_HV_READ_TRACE     6   /* rdx = index, rsi = offset -> 48      */
-#define SVMHV_HV_TRACE_STATE    7   /* -> produced, records, record size    */
+#define SVMHV_HV_READ_TRACE     6   /* legacy: rdx = index, rsi = offset    */
+#define SVMHV_HV_TRACE_STATE    7   /* -> head, records, size, floor, gen   */
 #define SVMHV_HV_UNLOAD         8   /* CPL 0 only -> devirtualise           */
 #define SVMHV_HV_SIGNATURE      9   /* -> rbx/rdx/rsi = "SVMHV-SIMPLE"      */
 #define SVMHV_HV_TRACE_CONSUMED 10  /* rdx = sequence drained up to         */
@@ -113,11 +113,13 @@
  * installs hooks, and a hook that is not flushed is a hook that does not fire.
  */
 #define SVMHV_HV_NOP            11  /* CPL 0 only -> force a #VMEXIT        */
+#define SVMHV_HV_READ_TRACE_CURSOR 12 /* rdx = absolute seq, rsi = offset    */
 
 #define SVMHV_HV_STATUS_OK          0
 #define SVMHV_HV_STATUS_BADCOMMAND  1
 #define SVMHV_HV_STATUS_BADOFFSET   2
 #define SVMHV_HV_STATUS_UNAVAILABLE 3
+#define SVMHV_HV_STATUS_RETRY       4   /* record/snapshot changed while read */
 
 /* How many bytes one read command returns. */
 #define SVMHV_HV_READ_WINDOW    48
