@@ -5820,6 +5820,16 @@ TOOLS = [
                     "'notepad.exe'; Windows keeps 15 characters of the name"},
                 "pid": {"type": "integer", "description":
                     "only fire for this process id"},
+                "in_process": {"type": "integer", "description":
+                    "the target is a USER-mode address in this process. Not "
+                    "the same as pid, which narrows recording once a hook is "
+                    "placed; this says which address space the target is in. "
+                    "The page must be private to the process - an image page "
+                    "is shared with every process that has it mapped, and a "
+                    "stub exists in only one of them, so the driver refuses "
+                    "those. A user-mode hook records the four argument "
+                    "registers and the address space and nothing that needs "
+                    "guest context: no captures, no filters, no process name."},
                 "caller_base": {"type": "string", "description":
                     "hex base of a module; with caller_size, fires only when the "
                     "return address is inside it - i.e. only when THAT driver "
@@ -5845,12 +5855,18 @@ TOOLS = [
             },
             "required": ["target"],
         },
+        # in_process belongs in this list and was missing from it: hook_options
+        # has always known how to send it, and tool_hook_trace has always read
+        # it, but the handler dropped it on the floor - which nobody could see
+        # while a user-mode execution hook was refused by the driver anyway.
+        # Without it the target address is resolved, and installed, against
+        # whichever address space the worker happened to be in.
         "handler": lambda a: tool_hook_trace(
             a["target"], (int(a["prolog_length"]) if a.get("prolog_length") else None),
             **{k: a[k] for k in (
                 "process", "pid", "caller_base", "caller_size", "filter_expr",
                 "capture", "capture2", "spoof", "spoof2", "block",
-                "capture_return", "capture_stack") if k in a}),
+                "capture_return", "capture_stack", "in_process") if k in a}),
     },
     {
         "name": "svmhv_hook_detour",

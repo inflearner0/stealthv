@@ -1218,6 +1218,37 @@ VOID SvTraceStep(_In_ UINT64 Rip, _In_ UINT64 Rsp, _In_ UINT64 Rflags,
     SvTracePublish(record, sequence);
 }
 
+VOID SvTraceUserExec(_In_ UINT32 HookId, _In_ UINT64 Target, _In_ UINT64 Rsp,
+                     _In_ UINT64 Cr3, _In_ UINT32 Processor,
+                     _In_reads_(4) const UINT64* Arguments,
+                     _In_ UINT64 ReturnAddress)
+{
+    UINT64 sequence;
+    SVMHV_TRACE_RECORD* record = SvTraceClaim(&sequence);
+    ULONG i;
+
+    if (record == NULL)
+    {
+        return;
+    }
+
+    record->Tsc           = __rdtsc();
+    record->Rip           = Target;
+    record->Rsp           = Rsp;
+    record->Cr3           = Cr3;
+    record->HookId        = HookId;
+    record->Type          = SVMHV_TRACE_EXEC;
+    record->Processor     = Processor;
+    record->ReturnAddress = ReturnAddress;
+
+    for (i = 0; i < 4; i++)
+    {
+        record->Arguments[i] = Arguments[i];
+    }
+
+    SvTracePublish(record, sequence);
+}
+
 VOID SvTraceRegister(_In_ UINT32 Type, _In_ UINT64 Rip, _In_ UINT64 Cr3,
                      _In_ UINT32 Processor, _In_ UINT64 Which,
                      _In_ UINT64 Value, _In_ UINT32 IsWrite,

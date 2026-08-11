@@ -812,6 +812,47 @@ static BOOLEAN SvHandleVmmcall(_Inout_ VIRTUAL_CPU* Cpu, _Inout_ GUEST_CONTEXT* 
     UINT32 callCode;
 
     /*
+     * A user-mode execution hook, reporting from the target's own address
+     * space.  Checked first and answered here rather than through the control
+     * interface, because everything it needs is already in front of us and
+     * because it must return without touching a single register the traced
+     * function is about to use.
+     *
+     * The stub pushed RAX before the call, so the guest's RSP is eight below
+     * what the function was entered with, and the return address is at [RSP+8]
+     * - which is guest *user* memory and not read here.  What the record
+     * carries is the four argument registers, which are the whole point.
+     */
+    if (Context->Rax == SVMHV_UMHOOK_MAGIC)
+    {
+        SVM_HOOK_USER_INFO info;
+
+        if (SvHookUserInfo((UINT32)Context->R11, &info))
+        {
+            UINT64 arguments[4];
+
+            arguments[0] = Context->Rcx;
+            arguments[1] = Context->Rdx;
+            arguments[2] = Context->R8;
+            arguments[3] = Context->R9;
+
+            SvTraceUserExec((UINT32)Context->R11, info.Target,
+                            Cpu->GuestVmcb.StateSave.Rsp + 8,
+                            Cpu->GuestVmcb.StateSave.Cr3, Cpu->Index,
+                            arguments, 0);
+            SvHookCountHit((UINT32)Context->R11);
+        }
+
+        /*
+         * RAX is the one register the stub does not need back - it pops the
+         * value it saved - so leaving the magic in it is harmless, and writing
+         * anything else would be a change to state the function owns.
+         */
+        SvAdvanceRip(&Cpu->GuestVmcb, 3);
+        return FALSE;
+    }
+
+    /*
      * Ours?  Checked before anything else, and only on the exact magic, so a
      * VMMCALL from anybody else - a Hyper-V enlightenment, or a probe testing
      * whether the instruction faults - takes the paths below untouched.

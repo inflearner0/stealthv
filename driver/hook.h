@@ -105,6 +105,20 @@ ULONG    SvHookActiveCount(VOID);
 BOOLEAN  SvHookTraceInfo(_In_ UINT32 HookId, _Out_ SVM_HOOK_TRACE_INFO* Info);
 VOID     SvHookCountHit(_In_ UINT32 HookId);
 
+/*
+ * What the exit handler needs when a user-mode hook's stub reports in.  A
+ * separate and much smaller thing than SVM_HOOK_TRACE_INFO because that is
+ * read in guest context, where filters and captures are legal, and this is
+ * read with GIF clear where nothing is.
+ */
+typedef struct _SVM_HOOK_USER_INFO
+{
+    UINT64 Target;
+    UINT32 ProcessId;
+} SVM_HOOK_USER_INFO;
+
+BOOLEAN  SvHookUserInfo(_In_ UINT32 HookId, _Out_ SVM_HOOK_USER_INFO* Info);
+
 /* Executable kernel memory, for trampolines, stubs and shellcode. */
 PVOID    SvHookAllocateExecutable(_In_ SIZE_T Size);
 VOID     SvHookFreeExecutable(_In_ PVOID Va);

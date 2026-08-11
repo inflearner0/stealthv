@@ -8,6 +8,44 @@
 #include "control.h"    /* SvIsHypervisorMemory: what a watch may not touch */
 #include "memory.h"     /* SvMemoryAttachProcess: user-mode targets        */
 
+/*
+ * Exported by ntoskrnl and declared only in ntifs.h, which this driver does not
+ * include.  Used for exactly one thing: putting a user-mode hook's stub inside
+ * the target process, while attached to it.
+ */
+NTSYSAPI NTSTATUS NTAPI ZwAllocateVirtualMemory(
+    _In_ HANDLE ProcessHandle, _Inout_ PVOID* BaseAddress,
+    _In_ ULONG_PTR ZeroBits, _Inout_ PSIZE_T RegionSize,
+    _In_ ULONG AllocationType, _In_ ULONG Protect);
+
+NTSYSAPI NTSTATUS NTAPI ZwFreeVirtualMemory(
+    _In_ HANDLE ProcessHandle, _Inout_ PVOID* BaseAddress,
+    _Inout_ PSIZE_T RegionSize, _In_ ULONG FreeType);
+
+NTSYSAPI NTSTATUS NTAPI ZwQueryVirtualMemory(
+    _In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
+    _In_ ULONG MemoryInformationClass, _Out_ PVOID MemoryInformation,
+    _In_ SIZE_T MemoryInformationLength, _Out_opt_ PSIZE_T ReturnLength);
+
+/* MemoryBasicInformation, and what ZwQueryVirtualMemory fills in for it. */
+#define SVMHV_MEMORY_BASIC_INFORMATION_CLASS 0
+
+typedef struct _SVMHV_MEMORY_BASIC_INFORMATION
+{
+    PVOID  BaseAddress;
+    PVOID  AllocationBase;
+    ULONG  AllocationProtect;
+    ULONG  Reserved0;
+    SIZE_T RegionSize;
+    ULONG  State;
+    ULONG  Protect;
+    ULONG  Type;
+    ULONG  Reserved1;
+} SVMHV_MEMORY_BASIC_INFORMATION;
+
+/* The pseudo-handle for "the process this thread is attached to". */
+#define SVMHV_CURRENT_PROCESS   ((HANDLE)(LONG_PTR)-1)
+
 typedef struct _SVM_HOOK
 {
     volatile LONG Active;
@@ -36,6 +74,14 @@ typedef struct _SVM_HOOK
      * IRQL, which is what makes reading through it legal at the fault.
      */
     PVOID   WatchVa;
+
+    /*
+     * A user-mode execution hook's page, inside the target process, holding
+     * its trampoline and the stub that reports the call.  Non-NULL only for
+     * those - and the reason such a hook can exist at all; see
+     * SvHookBuildUserDetour.
+     */
+    PVOID   UserStub;
 
     /*
      * Non-zero when the target is a user-mode address, and the reason the MDL
@@ -562,6 +608,61 @@ static VOID SvWriteAbsoluteJmp(_Out_writes_bytes_(SVMHV_JMP_LENGTH) UINT8* At,
     *(UINT64*)(At + 6) = (UINT64)Target;
 }
 
+/*
+ * The stub for a user-mode execution hook, in the target process's own memory.
+ *
+ * This is the whole reason user-mode execution hooks were refused before.  A
+ * detour has to be jumped to, and everywhere this driver can put one - the
+ * trace stub, a shellcode page, a trampoline - is kernel memory; jumping there
+ * from CPL 3 faults, and SMEP would stop it even if the mapping allowed it.  So
+ * the detour goes in the process instead, and the way back into the hypervisor
+ * is not a jump at all but a VMMCALL, which has no privilege requirement and is
+ * already intercepted.  The control channel has answered at CPL 3 since it was
+ * written; this is the same door.
+ *
+ * The stub, entered with the target's arguments exactly as its caller left
+ * them:
+ *
+ *      push rax                    ; AL carries the vararg vector count
+ *      mov  r11, <hook id>         ; volatile, never an argument
+ *      mov  rax, SVMHV_UMHOOK_MAGIC
+ *      vmmcall                     ; the hypervisor records the call
+ *      pop  rax
+ *      jmp  [rip+0] -> trampoline  ; on into the real function
+ *
+ * R11 and RAX are the only registers it touches, and RAX is put back.  RBX is
+ * deliberately not used, which is why this command has a magic of its own
+ * rather than a command number in RBX like everything else: RBX is
+ * non-volatile, and a stub that clobbered it would corrupt the caller.
+ */
+#define SVMHV_UMSTUB_SIZE   (1 + 10 + 10 + 3 + 1 + SVMHV_JMP_LENGTH)
+
+static VOID SvBuildUserStub(_Out_writes_bytes_(SVMHV_UMSTUB_SIZE) UINT8* At,
+                            _In_ UINT32 HookId, _In_ PVOID Trampoline)
+{
+    ULONG i = 0;
+
+    At[i++] = 0x50;                                 /* push rax             */
+
+    At[i++] = 0x49;                                 /* mov r11, imm64       */
+    At[i++] = 0xBB;
+    *(UINT64*)(At + i) = HookId;
+    i += 8;
+
+    At[i++] = 0x48;                                 /* mov rax, imm64       */
+    At[i++] = 0xB8;
+    *(UINT64*)(At + i) = SVMHV_UMHOOK_MAGIC;
+    i += 8;
+
+    At[i++] = 0x0F;                                 /* vmmcall              */
+    At[i++] = 0x01;
+    At[i++] = 0xD9;
+
+    At[i++] = 0x58;                                 /* pop rax              */
+
+    SvWriteAbsoluteJmp(At + i, Trampoline);
+}
+
 static PVOID SvHookAllocateStub(_In_ ULONG Size)
 {
     UINT8* stub;
@@ -808,6 +909,105 @@ static NTSTATUS SvHookApplyPolicy(_Inout_ SVM_HOOK* Hook,
     return STATUS_SUCCESS;
 }
 
+/*
+ * Put a user-mode hook's trampoline and stub inside the target process.
+ *
+ * The caller is attached, so NtCurrentProcess() is the target and an ordinary
+ * allocation lands in its address space.  One page holds both: the trampoline
+ * (the original prologue plus a jump back past it) and the stub that reports
+ * the call.  Left writable as well as executable, because the whole page is
+ * ours and re-arming rewrites it; a hook that wanted to be invisible to the
+ * process would want RX, and would then have to unprotect to remove itself.
+ */
+static NTSTATUS SvHookBuildUserDetour(_Inout_ SVM_HOOK* Hook,
+                                      _In_ ULONG PrologLength,
+                                      _In_ PVOID ReturnTo)
+{
+    SIZE_T size = PAGE_SIZE;
+    PVOID base = NULL;
+    NTSTATUS status;
+    UINT8* page;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    if (PrologLength + SVMHV_JMP_LENGTH + SVMHV_UMSTUB_SIZE > PAGE_SIZE)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = ZwAllocateVirtualMemory(SVMHV_CURRENT_PROCESS, &base, 0, &size,
+                                     MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_EXECUTE_READWRITE);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    page = (UINT8*)base;
+    RtlZeroMemory(page, PAGE_SIZE);
+
+    /* Trampoline first, at offset 0, so the address handed back to a caller
+       is the page itself and is easy to recognise in a trace. */
+    RtlCopyMemory(page, Hook->OriginalProlog, PrologLength);
+    SvWriteAbsoluteJmp(page + PrologLength, ReturnTo);
+
+    Hook->Trampoline = page;
+    Hook->TrampolineCapacity = PrologLength + SVMHV_JMP_LENGTH;
+
+    SvBuildUserStub(page + Hook->TrampolineCapacity,
+                    (UINT32)(Hook - g_Hooks), Hook->Trampoline);
+
+    Hook->UserStub = base;
+    Hook->DetourVa = page + Hook->TrampolineCapacity;
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Give a user hook's page back.  Only ever called with the target process
+ * attached, and only while the hook's mappings are already restored - a
+ * processor still inside the stub with the page freed underneath it would be
+ * executing whatever the allocator handed out next.
+ */
+static VOID SvHookFreeUserDetour(_Inout_ SVM_HOOK* Hook)
+{
+    SIZE_T size = 0;
+    PVOID base = Hook->UserStub;
+
+    if (base == NULL)
+    {
+        return;
+    }
+
+    Hook->UserStub = NULL;
+    Hook->Trampoline = NULL;
+    Hook->DetourVa = NULL;
+    Hook->TrampolineCapacity = 0;
+    (VOID)ZwFreeVirtualMemory(SVMHV_CURRENT_PROCESS, &base, &size, MEM_RELEASE);
+}
+
+BOOLEAN SvHookUserInfo(_In_ UINT32 HookId, _Out_ SVM_HOOK_USER_INFO* Info)
+{
+    const SVM_HOOK* hook;
+
+    Info->Target = 0;
+    Info->ProcessId = 0;
+
+    if (HookId >= SVMHV_MAX_HOOKS)
+    {
+        return FALSE;
+    }
+
+    hook = &g_Hooks[HookId];
+    if (hook->Active == 0 || hook->UserStub == NULL)
+    {
+        return FALSE;
+    }
+
+    Info->Target = (UINT64)hook->TargetVa;
+    Info->ProcessId = hook->TargetProcessId;
+    return TRUE;
+}
+
 /* ------------------------------------------------------------- install */
 
 static NTSTATUS SvHookPrepareDetour(_Inout_ SVM_HOOK* Hook,
@@ -894,22 +1094,76 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         }
 
         /*
-         * Watchpoints only, for now, and the reason is worth writing down
-         * because it is not a policy decision.
+         * Execution hooks work here now, and the way they do is worth writing
+         * down because the refusal that used to be here had the right reason.
          *
-         * A watch executes nothing: the fault handler records the access and
-         * switches this processor's view, which works identically whoever owns
-         * the page.  An exec hook has to jump somewhere, and everywhere this
-         * driver can put a detour - the trace stub, a shellcode page, a
-         * trampoline - is kernel memory.  Jumping there from CPL 3 faults, and
-         * on any modern processor SMEP would stop it even if the mapping
-         * allowed it.  Making exec hooks work in user mode means allocating the
-         * detour inside the target process, which is a different piece of work
-         * and not one to fake.
+         * A watch executes nothing, so it never cared whose page it was.  An
+         * exec hook has to jump somewhere, and everywhere this driver can put a
+         * detour - the trace stub, a shellcode page, a trampoline - is kernel
+         * memory: jumping there from CPL 3 faults, and SMEP would stop it even
+         * if the mapping allowed it.  So the detour is not in kernel memory.
+         * It is a page allocated inside the target process, and the way back
+         * into the hypervisor is a VMMCALL rather than a jump - an instruction
+         * with no privilege requirement, already intercepted, and already
+         * answered at CPL 3 because that is how the control channel has always
+         * worked.
+         *
+         * What a user-mode exec hook does not get is everything that needs
+         * guest context: no argument captures, no filters, no process name.
+         * The stub reports from an exit with GIF clear, where dereferencing a
+         * caller's pointer or calling Ps* is not legal.  It records the four
+         * argument registers and the address space, which is what the
+         * mechanism can honestly deliver.
+         */
+        if (Request->Kind == SVMHV_HOOK_EXEC &&
+            Request->Action != SVMHV_ACTION_TRACE)
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        /*
+         * And it has to be a page this process alone owns.
+         *
+         * A hook is keyed on a guest *physical* page, and an image page is
+         * shared: every process that has ntdll mapped is executing the same
+         * physical bytes.  Patch the shadow copy of one and every one of them
+         * jumps to a stub that exists in exactly one address space - which for
+         * all the others is whatever their own memory happens to hold there.
+         * That is not a hook, it is a way to corrupt every process on the
+         * machine at once.
+         *
+         * MEM_PRIVATE is the test, and it is not a narrow one: a manually
+         * mapped payload - the thing this feature exists for - is private by
+         * construction, because there is no file behind it.  Hooking a shared
+         * export means hooking it for everybody, which is what a kernel hook on
+         * the syscall it reaches already does.
          */
         if (Request->Kind == SVMHV_HOOK_EXEC)
         {
-            return STATUS_NOT_SUPPORTED;
+            SVMHV_MEMORY_BASIC_INFORMATION info;
+            SVMHV_ATTACH probe = { 0 };
+            NTSTATUS query;
+
+            status = SvMemoryAttachProcess(Request->TargetProcessId, &probe);
+            if (!NT_SUCCESS(status))
+            {
+                return status;
+            }
+            query = ZwQueryVirtualMemory(SVMHV_CURRENT_PROCESS, target,
+                                         SVMHV_MEMORY_BASIC_INFORMATION_CLASS,
+                                         &info, sizeof(info), NULL);
+            SvMemoryDetachProcess(&probe);
+
+            if (!NT_SUCCESS(query))
+            {
+                /* Distinct from every other refusal here, so that "the probe
+                   itself failed" is never mistaken for "the page is shared". */
+                return STATUS_NOT_IMPLEMENTED;
+            }
+            if (info.Type != MEM_PRIVATE)
+            {
+                return STATUS_SHARING_VIOLATION;
+            }
         }
     }
     if (Request->Kind > SVMHV_HOOK_ACCESS)
@@ -1315,7 +1569,21 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         goto done;
     }
 
-    if (isExec)
+    if (isExec && Request->TargetProcessId != 0)
+    {
+        /*
+         * A user-mode target: both halves live in the process, because both
+         * are executed at CPL 3.  We are attached here, so "this process" is
+         * the target's.
+         */
+        status = SvHookBuildUserDetour(hook, Request->PrologLength,
+                                       (UINT8*)target + Request->PrologLength);
+        if (!NT_SUCCESS(status))
+        {
+            goto done;
+        }
+    }
+    else if (isExec)
     {
         hook->Trampoline = SvBuildTrampoline(hook->OriginalProlog,
                                              Request->PrologLength,
@@ -1332,6 +1600,10 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         {
             goto done;
         }
+    }
+
+    if (isExec)
+    {
 
         /*
          * Patch the copy, not the original.  Anything past the jump up to the
@@ -1474,6 +1746,33 @@ NTSTATUS SvHookRemove(_In_ PVOID Target)
          */
         if (hook->TargetProcessId != 0 && hook->Mdl != NULL && hook->OwnsPage)
         {
+            /*
+             * The stub page goes back to the process too, and it has to be
+             * done from inside that process.  Safe here and not earlier: the
+             * flush above means no processor is still using a translation that
+             * could put it inside the stub, and the shadow copy no longer
+             * jumps to it.
+             */
+            if (hook->UserStub != NULL)
+            {
+                SVMHV_ATTACH attach = { 0 };
+
+                if (NT_SUCCESS(SvMemoryAttachProcess(hook->TargetProcessId,
+                                                     &attach)))
+                {
+                    SvHookFreeUserDetour(hook);
+                    SvMemoryDetachProcess(&attach);
+                }
+                else
+                {
+                    /* The process is gone; its address space went with it. */
+                    hook->UserStub = NULL;
+                    hook->Trampoline = NULL;
+                    hook->DetourVa = NULL;
+                    hook->TrampolineCapacity = 0;
+                }
+            }
+
             /* The alias is a mapping of these pages, so it goes first - and it
                has to go at all, or the process keeps a system PTE per removed
                hook for as long as the driver is loaded. */

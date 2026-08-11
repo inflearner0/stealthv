@@ -109,6 +109,19 @@ VOID     SvTraceRegister(_In_ UINT32 Type, _In_ UINT64 Rip, _In_ UINT64 Cr3,
                          _In_ UINT32 Width, _In_ UINT64 Raw);
 
 /*
+ * A user-mode execution hook firing.  Host context with GIF clear, which is
+ * what makes this a different function from SvTraceExecEntry rather than a
+ * parameter to it: no Ps* calls, so no process id and no image name, and no
+ * argument captures, because dereferencing a pointer needs a context where a
+ * page fault is legal.  CR3 is what identifies the process instead.
+ */
+VOID     SvTraceUserExec(_In_ UINT32 HookId, _In_ UINT64 Target,
+                         _In_ UINT64 Rsp, _In_ UINT64 Cr3,
+                         _In_ UINT32 Processor,
+                         _In_reads_(4) const UINT64* Arguments,
+                         _In_ UINT64 ReturnAddress);
+
+/*
  * Where the ring lives, so a client can read it out of driver memory rather than
  * asking for a copy.  The producer counter is an absolute, monotonic cursor;
  * tracking what has already been seen, and noticing when it has been lapped,

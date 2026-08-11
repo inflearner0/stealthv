@@ -123,6 +123,24 @@
  */
 #define SVMHV_HV_STEP           13  /* rdx = count, or 0 to report instead  */
 
+/*
+ * A user-mode execution hook reporting that its target was called.
+ *
+ * Its own magic in RAX rather than a command under the ordinary one, because
+ * the ordinary ABI puts the command in RBX and RBX is non-volatile: a stub that
+ * used it would have to save and restore it around every call, and a stub that
+ * forgot would corrupt the caller.  With this, the whole stub touches R11 and
+ * RAX - R11 is volatile and is not an argument or part of the varargs
+ * convention, and RAX is pushed and popped around the call because AL carries
+ * the vector-register count into a varargs function and a hook must not be
+ * able to break printf.
+ *
+ * The hook id is in R11.  Nothing is returned: the handler must leave every
+ * other register exactly as it found it, because those are the traced
+ * function's arguments.
+ */
+#define SVMHV_UMHOOK_MAGIC      0x53564D485648554DULL   /* 'SVMHVHUM' */
+
 #define SVMHV_HV_STATUS_OK          0
 #define SVMHV_HV_STATUS_BADCOMMAND  1
 #define SVMHV_HV_STATUS_BADOFFSET   2

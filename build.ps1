@@ -194,6 +194,18 @@ Invoke-Tool $cl (@("/nologo", "/W4", "/WX", "/O2", "/MT", "/Zi", "/FC") + $umInc
     "/LIBPATH:$kit\Lib\$SdkVersion\ucrt\x64"
 )) "cl svmhvctl.c"
 
+# ------------------------------------------------- user-mode hook target
+# Something for a user-mode execution hook to hook; see tools\umtarget.c.
+
+Invoke-Tool $cl (@("/nologo", "/W4", "/WX", "/O2", "/MT", "/Zi", "/FC") + $umInc + @(
+    "/Fo$out\", "/Fd$out\umtarget.pdb", "/Fe$out\umtarget.exe",
+    "$root\tools\umtarget.c",
+    "/link", "/INCREMENTAL:NO",
+    "/LIBPATH:$msvc\lib\x64",
+    "/LIBPATH:$kit\Lib\$SdkVersion\um\x64",
+    "/LIBPATH:$kit\Lib\$SdkVersion\ucrt\x64"
+)) "cl umtarget.c"
+
 # ------------------------------------------------------------------ signing
 if ($Sign) {
     $signtool = "$kit\bin\$SdkVersion\x64\signtool.exe"
