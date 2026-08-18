@@ -9,7 +9,7 @@
         .\build.ps1            # compile + link
         .\build.ps1 -Sign      # also create/reuse a test certificate and sign
         .\build.ps1 -Fixtures  # also build tools\umtarget.exe, a hook target
-        .\build.ps1 -ManualMap # bin\svmhv-mm.sys, the flavour that never
+        .\build.ps1 -ManualMap # bin\svmhv-manualmap.sys, the flavour that never
                                # touches its DRIVER_OBJECT.  The driver only:
                                # the tools are the same binary either way.
 
@@ -41,8 +41,8 @@ $out  = Join-Path $root "bin"
 $objDir     = $out
 $driverName = "svmhv"
 if ($ManualMap) {
-    $objDir     = Join-Path $out "mm"
-    $driverName = "svmhv-mm"
+    $objDir     = Join-Path $out "manualmap"
+    $driverName = "svmhv-manualmap"
 }
 
 # ---------------------------------------------------------------- toolchain

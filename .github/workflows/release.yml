@@ -29,10 +29,10 @@ jobs:
 
       - name: Build and test-sign the manual-map flavour
         shell: pwsh
-        # svmhv-mm.sys: the same driver with STEALTHV_MANUAL_MAP=1, which makes
-        # the entry point ignore both of its parameters. It is signed for
-        # symmetry rather than for need - a mapper never asks - so the two
-        # artefacts differ only in the constant they were built with.
+        # svmhv-manualmap.sys: the same driver with STEALTHV_MANUAL_MAP=1,
+        # which makes the entry point ignore both of its parameters. It is
+        # signed for symmetry rather than for need - a mapper never asks - so
+        # the two artefacts differ only in the constant they were built with.
         run: .\build.ps1 -ManualMap -Sign
 
       - name: Package
@@ -48,19 +48,21 @@ jobs:
 
           $stage = "stage\stealthv-$tag"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item bin\svmhv.sys, bin\svmhv-mm.sys, bin\svmhvctl.exe,
+          Copy-Item bin\svmhv.sys, bin\svmhv-manualmap.sys, bin\svmhvctl.exe,
                     bin\hvtest.exe, bin\svmhv-test.cer $stage
           Copy-Item mcp\svmhv_agent.py $stage
           Copy-Item README.md, LICENSE $stage
           Copy-Item mcp\README.md "$stage\MCP.md"
 
           # A fatal-exit RIP is only useful when it can be symbolized against the
-          # exact binary that produced it.  Keep symbols in a separate archive so
-          # the ordinary lab package remains small, and record the source and ABI
-          # identity next to both packages.
-          $symbols = "stage\stealthv-$tag-symbols"
+          # exact binary that produced it, and the two used to ship apart - which
+          # meant the archive somebody actually downloaded was the one that could
+          # not answer the question the driver exists to answer. They travel
+          # together now, in symbols\ inside the one archive, and the build
+          # manifest records the source and ABI identity alongside them.
+          $symbols = "$stage\symbols"
           New-Item -ItemType Directory -Path $symbols -Force | Out-Null
-          Copy-Item bin\svmhv.pdb, bin\svmhv-mm.pdb, bin\svmhvctl.pdb,
+          Copy-Item bin\svmhv.pdb, bin\svmhv-manualmap.pdb, bin\svmhvctl.pdb,
                     bin\hvtest.pdb $symbols
 
           $abiLine = Select-String -Path include\svmhvctl.h `
@@ -76,9 +78,9 @@ jobs:
             files = @()
           }
           foreach ($file in @(
-              'bin\svmhv.sys', 'bin\svmhv-mm.sys',
+              'bin\svmhv.sys', 'bin\svmhv-manualmap.sys',
               'bin\svmhvctl.exe', 'bin\hvtest.exe',
-              'bin\svmhv.pdb', 'bin\svmhv-mm.pdb',
+              'bin\svmhv.pdb', 'bin\svmhv-manualmap.pdb',
               'bin\svmhvctl.pdb', 'bin\hvtest.pdb')) {
             $hash = Get-FileHash $file -Algorithm SHA256
             $manifest.files += [ordered]@{
@@ -87,7 +89,6 @@ jobs:
             }
           }
           $manifest | ConvertTo-Json -Depth 4 | Out-File "$stage\BUILD-MANIFEST.json" -Encoding utf8
-          Copy-Item "$stage\BUILD-MANIFEST.json" "$symbols\BUILD-MANIFEST.json"
 
           # The certificate in here is generated fresh by every build and is
           # worth exactly nothing as a trust anchor - say so where somebody
@@ -109,34 +110,35 @@ jobs:
 
           Two drivers, one source, one compile-time constant apart:
 
-            svmhv.sys     load it as a service. It registers an unload routine,
-                          so "sc stop" devirtualises and cleans up.
-            svmhv-mm.sys  built with STEALTHV_MANUAL_MAP=1. The entry point
-                          ignores both parameters, so a mapper may call it with
-                          NULL, with its own base and size, or with anything
-                          else. There is no unload routine in this one and
-                          nothing could call it if there were: the way out is a
-                          reboot. Kernel SEH also depends on your mapper
-                          inserting the image into the loader's function table -
-                          if it does not, the __try blocks in here are decoration.
+            svmhv.sys
+                Load it as a service. It registers an unload routine, so
+                "sc stop" devirtualises and cleans up.
+
+            svmhv-manualmap.sys
+                Built with STEALTHV_MANUAL_MAP=1. The entry point ignores both
+                parameters, so a mapper may call it with NULL, with its own base
+                and size, or with anything else. There is no unload routine in
+                this one and nothing could call it if there were: the way out is
+                a reboot. Kernel SEH also depends on your mapper inserting the
+                image into the loader's function table - if it does not, the
+                __try blocks in here are decoration.
 
           Do not manual-map svmhv.sys. It writes DriverUnload through the
           pointer it was handed, and a mapper does not have to hand it one.
+
+          symbols\ holds the PDBs for everything above. Keep them with the lab
+          evidence: a fatal-exit RIP means nothing without the binary it came
+          from, and BUILD-MANIFEST.json says which build that is.
 
           See README.md, and MCP.md for the MCP server.
           "@ | Out-File "$stage\RELEASE.txt" -Encoding utf8
 
           Compress-Archive -Path "$stage\*" -DestinationPath "stealthv-$tag.zip"
-          Compress-Archive -Path "$symbols\*" -DestinationPath "stealthv-$tag-symbols.zip"
           Get-FileHash "stealthv-$tag.zip" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  stealthv-$tag.zip" } |
             Out-File "stealthv-$tag.zip.sha256" -Encoding utf8
-          Get-FileHash "stealthv-$tag-symbols.zip" -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash)  stealthv-$tag-symbols.zip" } |
-            Out-File "stealthv-$tag-symbols.zip.sha256" -Encoding utf8
 
           Get-Content "stealthv-$tag.zip.sha256"
-          Get-Content "stealthv-$tag-symbols.zip.sha256"
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -155,17 +157,17 @@ jobs:
             kernel hooks that are invisible to anything reading memory. Run it on
             a machine you own.
 
-            Two builds of the same driver: `svmhv.sys` to load as a service, and
-            `svmhv-mm.sys` for a manual mapper — the second ignores both of the
-            parameters its entry point is handed and has no unload routine, so
-            the only way out of it is a reboot. Do not manual-map `svmhv.sys`;
-            it writes `DriverUnload` through a pointer a mapper need not have
-            given it. `RELEASE.txt` in the archive has the rest.
+            Two builds of the same driver: `svmhv.sys` to load as a service,
+            and `svmhv-manualmap.sys` for a manual mapper — the second ignores
+            both of the parameters its entry point is handed and has no unload
+            routine, so the only way out of it is a reboot. Do not manual-map
+            `svmhv.sys`; it writes `DriverUnload` through a pointer a mapper
+            need not have given it. `RELEASE.txt` in the archive has the rest.
 
-            The separate `-symbols` archive contains the matching PDBs and a
-            build manifest with the source commit, control ABI version, and
-            SHA-256 hashes. Keep it with the lab evidence when investigating a
-            fatal RIP or trace.
+            One archive, with the PDBs in `symbols/` inside it and a
+            `BUILD-MANIFEST.json` giving the source commit, control ABI version
+            and SHA-256 of every binary. Keep the lot together: a fatal RIP or a
+            trace is only readable against the exact build that produced it.
 
             Long-duration stability under load is **not** verified — see *What is
             and is not tested* in the README before relying on it.

@@ -264,10 +264,10 @@ pieces and read the coverage between them.
 ## The manual-map build
 
 `build.ps1 -ManualMap` compiles the same sources with `STEALTHV_MANUAL_MAP=1`
-and links `bin\svmhv-mm.sys` from objects in `bin\mm\`. The objects are what the
-constant changed, so they cannot be shared with the ordinary build - a mixture
-would link cleanly and fault on load, which is why the flavours have a directory
-each.
+and links `bin\svmhv-manualmap.sys` from objects in `bin\manualmap\`. The
+objects are what the constant changed, so they cannot be shared with the
+ordinary build - a mixture would link cleanly and fault on load, which is why
+the flavours have a directory each.
 
 **It is a build flag and not a runtime check, and that is the whole point.** A
 mapper calls the entry point with whatever it likes: NULL, its own allocation

@@ -50,7 +50,7 @@ only — no pip step on a machine with no internet.
 ### Manual mapping
 
 ```powershell
-.\build.ps1 -ManualMap -Sign      # bin\svmhv-mm.sys
+.\build.ps1 -ManualMap -Sign      # bin\svmhv-manualmap.sys
 ```
 
 The same driver with `STEALTHV_MANUAL_MAP=1`. Its entry point ignores both
@@ -64,7 +64,7 @@ manual-map build and nothing could call one, so the way out is a reboot. And
 kernel SEH finds unwind information through the loader's function table, which
 a manually mapped image is not in unless your mapper puts it there — ntoskrnl
 exports nothing to do it from inside — so every `__try` in the driver is worth
-only as much as your mapper makes it. `svmhv-mm.sys` has been built and its
+only as much as your mapper makes it. `svmhv-manualmap.sys` has been built and its
 entry point disassembled; it has not been mapped and run.
 
 ## Tools

@@ -46,14 +46,14 @@ jobs:
         run: |
           # /WX means a warning already failed the step; this is about the
           # artefacts existing and being the right shape.
-          $expected = 'bin\svmhv.sys', 'bin\svmhv-mm.sys',
+          $expected = 'bin\svmhv.sys', 'bin\svmhv-manualmap.sys',
                       'bin\svmhvctl.exe', 'bin\hvtest.exe'
           foreach ($file in $expected) {
             if (-not (Test-Path $file)) { throw "missing: $file" }
           }
           Get-ChildItem $expected | Select-Object Name, Length | Format-Table -AutoSize
 
-          foreach ($name in 'svmhv.sys', 'svmhv-mm.sys') {
+          foreach ($name in 'svmhv.sys', 'svmhv-manualmap.sys') {
             $driver = Get-Item "bin\$name"
             if ($driver.Length -lt 20kb) { throw "$name is suspiciously small" }
           }
@@ -110,7 +110,7 @@ jobs:
           name: stealthv-build
           path: |
             bin/svmhv.sys
-            bin/svmhv-mm.sys
+            bin/svmhv-manualmap.sys
             bin/svmhvctl.exe
             bin/hvtest.exe
           if-no-files-found: error
