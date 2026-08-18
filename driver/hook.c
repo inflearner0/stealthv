@@ -305,24 +305,45 @@ NTSTATUS SvHookInitialize(VOID)
     RtlZeroMemory(g_Hooks, sizeof(g_Hooks));
 
     /*
-     * Registered unconditionally, because a user-mode hook can be installed at
+     * Attempted unconditionally, because a user-mode hook can be installed at
      * any time and there is no second chance to notice the process leaving.
+     *
+     * A manually mapped driver never gets it, and this used to be fatal for
+     * exactly the wrong reason.  PsSetCreateProcessNotifyRoutine checks that
+     * the caller's image was loaded and signed by the kernel loader; an image
+     * the loader never loaded fails that with STATUS_ACCESS_DENIED, this
+     * routine returned it, and DriverEntry treated it as a failed load - so the
+     * whole hypervisor refused to start over a callback that only user-mode
+     * hooks need.  It never reached VMRUN, and the only evidence was one
+     * DbgPrint saying user-mode hooks would be unsafe.
+     *
+     * So it is not fatal now.  Everything keyed on a kernel page - the exec
+     * hooks, the watches, the sweeps, the snapshot - works without it, and
+     * SvHookInstall refuses user-mode targets instead: at the point of use,
+     * where the caller sees the refusal, and about the thing that is actually
+     * unsafe without it.
      */
     status = PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, FALSE);
-    if (!NT_SUCCESS(status))
+    if (NT_SUCCESS(status))
     {
-        DbgPrint("svmhv: no process-exit notification (%08X); user-mode hooks "
-                 "will not be safe\n", status);
-        return status;
+        g_ProcessNotifyRegistered = TRUE;
     }
-    g_ProcessNotifyRegistered = TRUE;
+    else
+    {
+        DbgPrint("svmhv: no process-exit notification (%08X); kernel hooks are "
+                 "unaffected, user-mode hooks will be refused\n", status);
+    }
 
     g_TrampolinePage = (UINT8*)SvHookAllocateExecutable(PAGE_SIZE);
     if (g_TrampolinePage == NULL)
     {
-        /* Every failure from here on has to take the callback back out first. */
-        (VOID)PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, TRUE);
-        g_ProcessNotifyRegistered = FALSE;
+        /* Every failure from here on has to take the callback back out first -
+           if there is one to take out. */
+        if (g_ProcessNotifyRegistered)
+        {
+            (VOID)PsSetCreateProcessNotifyRoutine(SvHookProcessNotify, TRUE);
+            g_ProcessNotifyRegistered = FALSE;
+        }
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1091,6 +1112,23 @@ NTSTATUS SvHookInstall(_Inout_ SVMHV_HOOK_REQUEST* Request)
         if (Request->TargetProcessId == 0)
         {
             return STATUS_INVALID_PARAMETER;
+        }
+
+        /*
+         * And refused outright when the process-exit callback is not
+         * registered, which is every manually mapped build - see
+         * SvHookInitialize.
+         *
+         * A user-mode hook is on a physical page that belongs to a process.
+         * When the process dies that page goes back on the free list and is
+         * handed to somebody else, and the callback is the only thing that
+         * takes the hook off before that happens.  Without it the hook stays on
+         * a page that now holds unrelated data, and the first thing to execute
+         * there runs a detour aimed at a function that no longer exists.
+         */
+        if (!g_ProcessNotifyRegistered)
+        {
+            return STATUS_NOT_SUPPORTED;
         }
 
         /*

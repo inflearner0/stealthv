@@ -308,9 +308,35 @@ exception inside one is an unhandled kernel exception. `call.c` is the one that
 notices, and CLAUDE.md is already honest about how little that guard buys even
 on a properly loaded driver.
 
-**It has never been mapped.** It compiles, CI compiles it, and its entry point
-has been disassembled. Nothing here has been loaded by a mapper and run, so
-treat it exactly like `ibs.c`: the gate has been tested and the path has not.
+**The callbacks a manually mapped image cannot register are the interesting
+part, and one of them used to stop the load dead.**
+`PsSetCreateProcessNotifyRoutine` verifies that the caller's image was loaded and
+signed by the kernel loader; an image the loader never loaded fails it with
+`STATUS_ACCESS_DENIED`. `SvHookInitialize` returned that status, DriverEntry
+treats a failed `SvHookInitialize` as a failed load - and so the entire
+hypervisor refused to start, on any machine, over a callback that only user-mode
+hooks need. It never reached `VMRUN`, and the only evidence was one `DbgPrint`
+saying user-mode hooks would be unsafe followed by silence.
+
+It is not fatal now. The registration is attempted, the failure is logged, and
+`SvHookInstall` refuses *user-mode targets* instead - at the point of use, with
+`STATUS_NOT_SUPPORTED`, about the thing that is actually unsafe without it. A
+user-mode hook keys on a physical page belonging to a process; when that process
+dies the page is recycled, and the callback is the only thing that takes the
+hook off before somebody else's data is sitting under a detour. Everything keyed
+on a kernel page - the exec hooks, the watches, the sweeps, the snapshot - never
+needed it.
+
+The probe in `objects.c` registers four more of the same family
+(`PsSetCreateThreadNotifyRoutine`, `PsSetLoadImageNotifyRoutine`,
+`CmRegisterCallback`) and will fail the same way. That one is started on demand
+by `probe on`, so it blocks nothing - it simply will not work under a mapper.
+
+**It has never been mapped from this repository.** It compiles, CI compiles it,
+and its entry point has been disassembled. The load blocker above was found from
+a `DbgPrint` log taken on somebody else's bare-metal machine, which is also the
+only place the manual-map path has ever run - so treat the rest of it like
+`ibs.c`: the gate has been tested here and the path has not.
 
 ## Known open items
 
