@@ -332,11 +332,50 @@ The probe in `objects.c` registers four more of the same family
 `CmRegisterCallback`) and will fail the same way. That one is started on demand
 by `probe on`, so it blocks nothing - it simply will not work under a mapper.
 
-**It has never been mapped from this repository.** It compiles, CI compiles it,
-and its entry point has been disassembled. The load blocker above was found from
-a `DbgPrint` log taken on somebody else's bare-metal machine, which is also the
-only place the manual-map path has ever run - so treat the rest of it like
-`ibs.c`: the gate has been tested here and the path has not.
+**Never read your own PE headers without asking whether they are there.**
+`SvSetImageExtent` did, and the comment next to it said the read was safe
+because "the page is ours either way". kdmapper prints `Skipped 0x1000 bytes of
+PE Header` and means it: the header page is not mapped at all. An absent kernel
+page is not an exception anybody can catch - `MiSystemFault` calls
+`KeBugCheckEx` - so the machine died at the fourth instruction of DriverEntry
+with `0x50 PAGE_FAULT_IN_NONPAGED_AREA`, reading its own image base, before the
+driver had done anything. It is `MmIsAddressValid` on both header pages now, and
+the 1 MiB fallback when either is absent. Note the two mappers disagree: the one
+on the bare-metal machine left the page mapped but blank, which is why the
+fallback *looked* exercised there.
+
+**Do not manual-map `svmhv.sys`, and check which file the mapper was given.**
+The first crash reported against this was `0x3B` with `rcx` zero at
+`mov qword ptr [rcx+68h],rax` - `DriverObject->DriverUnload`, from the service
+build. The wrong `.sys` had been handed to the mapper. That is worth recognising
+by sight: offset 0x68 is `DriverUnload`, 0x18 `DriverStart`, 0x20 `DriverSize`,
+and `0xC035001E` nearby is this driver's `STATUS_HV_FEATURE_UNAVAILABLE`.
+
+**It maps, it passes, and then the machine resets.** With the header read fixed,
+kdmapper reports `DriverEntry returned 0x0`, `hvtest` says `PRESENT` with
+`RESULT: OK`, `svmhvctl status` reports eight processors and `fatal_count=0`,
+and `selftest` returns `passed=0x0fff`. Eight seconds later the guest reset:
+Kernel-Power 41, no bugcheck, no dump - the same silent reset in the open items
+below, now seen under a manual map as well. An earlier run through `mapload.sys`
+survived about ninety seconds and then took `0x3B` in `nt!RtlClearBitsEx` inside
+Defender's process. So the load path is tested and the steady state is not:
+"manual mapping works" is a claim about the first few seconds only.
+
+**`tools/mapload.c` is the harness**, built by `build.ps1 -Fixtures`. It maps
+the image the way a mapper does and is loaded as a service rather than through a
+vulnerable driver, since testsigning is already on here. It reports through
+`sc start` - DriverEntry returns whatever the mapped image returned - and writes
+the stage it reached to `C:\lab\mapload-stage.txt`, because the first version
+collapsed its own allocation failure and svmhv's into one `sc` error code and
+could not tell them apart. Its own allocation is `POOL_FLAG_NON_PAGED_EXECUTE`,
+not contiguous: asking `MmAllocateContiguousNodeMemory` for a whole image fails
+on a fragmented guest and reads exactly like the mapped driver refusing.
+
+**And give the guest room.** At about 300 MB free, both flavours failed - the
+manual map with `STATUS_INSUFFICIENT_RESOURCES` and the service build by loading
+and then bugchecking `0xEF CRITICAL_PROCESS_DIED`. At 4 GB with dynamic memory
+off, the same binaries passed first time. A memory-starved guest looks exactly
+like a broken driver from outside.
 
 ## Known open items
 

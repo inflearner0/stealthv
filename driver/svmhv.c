@@ -2830,14 +2830,25 @@ static VOID SvDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
  * reference to it is relocated like any other address, so it is correct
  * wherever the mapper put us.  The length is in the PE headers at that address.
  *
- * A mapper that allocates SizeOfImage and copies only the sections leaves that
- * first page mapped but blank, which is a legitimate thing for it to do and has
- * to be survivable here: reading it is safe (the page is ours either way), and
- * when it does not describe a PE image the extent falls back to a span large
- * enough to cover any build of this driver.  Over-stating it costs nothing but
- * a refused watchpoint on whatever follows us in memory; under-stating it would
- * let a watch be armed on our own globals, which is the one outcome SvOwnsPage
- * exists to prevent.
+ * The headers may not be there at all, and this is where the first version was
+ * wrong.  It assumed the worst a mapper would do was leave that first page
+ * mapped but blank - "reading it is safe, the page is ours either way" - and
+ * kdmapper does not leave it mapped.  The read faulted on an absent kernel
+ * page, which is not an exception anybody can catch: MiSystemFault decides the
+ * reference is invalid and calls KeBugCheckEx.  It took the machine down at the
+ * fourth instruction of DriverEntry with 0x50 PAGE_FAULT_IN_NONPAGED_AREA,
+ * reading the image base, before this driver had done anything at all.
+ *
+ * So nothing is read without asking first.  MmIsAddressValid is exactly the
+ * right question here - the mapping is whatever the loader made it and will not
+ * change underneath us - and both pages have to be asked about separately,
+ * since e_lfanew can put the NT headers in the page after the DOS header.
+ *
+ * When they cannot be read the extent falls back to a span large enough to
+ * cover any build of this driver.  Over-stating it costs nothing but a refused
+ * watchpoint on whatever follows us in memory; under-stating it would let a
+ * watch be armed on our own globals, which is the one outcome SvOwnsPage exists
+ * to prevent.
  */
 #define SVMHV_ASSUMED_IMAGE_SIZE    (1024u * 1024u)
 
@@ -2851,7 +2862,8 @@ static VOID SvSetImageExtent(VOID)
     g_ImageBase = (PVOID)dos;
     g_ImageSize = SVMHV_ASSUMED_IMAGE_SIZE;
 
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
+    if (!MmIsAddressValid((PVOID)dos) ||
+        dos->e_magic != IMAGE_DOS_SIGNATURE ||
         dos->e_lfanew <= 0 ||
         (ULONG)dos->e_lfanew > PAGE_SIZE - sizeof(IMAGE_NT_HEADERS64))
     {
@@ -2859,7 +2871,8 @@ static VOID SvSetImageExtent(VOID)
     }
 
     nt = (const IMAGE_NT_HEADERS64*)((const UINT8*)dos + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+    if (!MmIsAddressValid((PVOID)nt) ||
+        nt->Signature != IMAGE_NT_SIGNATURE ||
         nt->OptionalHeader.SizeOfImage == 0)
     {
         return;

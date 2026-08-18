@@ -134,6 +134,8 @@ function Invoke-Tool {
 # shown to the code-integrity path.  It costs a second and it means the two
 # artefacts differ only in the constant they were built with.
 function Invoke-SignDriver {
+    param([string]$Name = $driverName)
+
     $signtool = "$kit\bin\$SdkVersion\x64\signtool.exe"
     $cert = Get-ChildItem Cert:\CurrentUser\My |
                 Where-Object { $_.Subject -eq "CN=svmhv-test" } |
@@ -146,7 +148,7 @@ function Invoke-SignDriver {
     }
     Invoke-Tool $signtool @(
         "sign", "/v", "/fd", "SHA256", "/sha1", $cert.Thumbprint,
-        "$out\$driverName.sys"
+        "$out\$Name.sys"
     ) "signtool"
 
     # Export the public cert so the guest can trust it.
@@ -284,6 +286,29 @@ if ($Fixtures) {
         "/LIBPATH:$kit\Lib\$SdkVersion\um\x64",
         "/LIBPATH:$kit\Lib\$SdkVersion\ucrt\x64"
     )) "cl umtarget.c"
+
+    # mapload.sys - the manual mapper, so svmhv-manualmap.sys can be tested
+    # without one from somewhere else.  A driver, so it compiles against km\
+    # rather than um\; tools\mapload.c says why it is loaded as a service
+    # instead of doing what a real mapper does to reach ring 0.
+    Invoke-Tool $cl (@(
+        "/nologo", "/c", "/W4", "/WX", "/O2", "/Oi", "/GS-", "/Gy", "/Zi", "/FC",
+        "/Zc:wchar_t", "/Zc:inline", "/kernel"
+    ) + $kmDefs + $kmInc + @(
+        "/Fo$out\mapload.obj", "/Fd$out\mapload.pdb", "$root\tools\mapload.c"
+    )) "cl mapload.c"
+
+    Invoke-Tool $link @(
+        "/nologo", "/DRIVER", "/SUBSYSTEM:NATIVE,10.00", "/ENTRY:DriverEntry",
+        "/NODEFAULTLIB", "/INCREMENTAL:NO", "/RELEASE", "/DEBUG",
+        "/OPT:REF", "/OPT:ICF", "/MANIFEST:NO",
+        "/LIBPATH:$kit\Lib\$SdkVersion\km\x64",
+        "ntoskrnl.lib",
+        "/PDB:$out\mapload.pdb", "/OUT:$out\mapload.sys",
+        "$out\mapload.obj"
+    ) "link mapload.sys"
+
+    if ($Sign) { Invoke-SignDriver -Name "mapload" }
 }
 
 # ------------------------------------------------------------------ signing
