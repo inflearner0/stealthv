@@ -189,3 +189,38 @@
  * unload the hypervisor.
  */
 #define STEALTHV_CONTROL_REQUIRE_CPL0   0
+
+/*
+ * Build for manual mapping: never touch the DRIVER_OBJECT the entry point was
+ * handed.
+ *
+ * This has to be a build flag rather than a runtime check, and that is the
+ * whole reason it exists.  A manual mapper calls the entry point with whatever
+ * it likes - NULL, its own allocation base and size, a fabricated object - and
+ * a non-NULL pointer that is not a DRIVER_OBJECT is indistinguishable from a
+ * real one until the driver writes DriverUnload through it.  So the choice is
+ * made at compile time or not at all.
+ *
+ * With this at 1:
+ *
+ *   - both parameters are ignored, so any mapper's calling convention works;
+ *   - the image extent SvOwnsPage compares against comes from __ImageBase and
+ *     the PE headers instead of DriverStart/DriverSize;
+ *   - no unload routine is registered, and there is none in the binary - a
+ *     manually mapped image is never unloaded by the loader, so the cleanup
+ *     path could not run and pretending otherwise would only make it look as
+ *     though it could.
+ *
+ * What this flag cannot do is register the image's .pdata with the kernel, and
+ * that is worth knowing before relying on the manual-map build.  Kernel-mode
+ * SEH finds unwind information through the loader's inverted function table,
+ * which is built when a driver is loaded properly; ntoskrnl exports no
+ * RtlAddFunctionTable to do it by hand.  Every __try in here is therefore only
+ * as good as the mapper - if it does not insert the image into that table, an
+ * exception inside one of them is an unhandled kernel exception rather than a
+ * caught one.  The __try in call.c is the one that matters, and CLAUDE.md is
+ * already honest about how little it buys even on a properly loaded driver.
+ */
+#ifndef STEALTHV_MANUAL_MAP
+#define STEALTHV_MANUAL_MAP         0
+#endif

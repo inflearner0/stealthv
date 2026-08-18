@@ -261,6 +261,57 @@ because the driver's own limit is about table pages and this one is about
 whether the guest can keep up. If a bigger range is genuinely needed, arm it in
 pieces and read the coverage between them.
 
+## The manual-map build
+
+`build.ps1 -ManualMap` compiles the same sources with `STEALTHV_MANUAL_MAP=1`
+and links `bin\svmhv-mm.sys` from objects in `bin\mm\`. The objects are what the
+constant changed, so they cannot be shared with the ordinary build - a mixture
+would link cleanly and fault on load, which is why the flavours have a directory
+each.
+
+**It is a build flag and not a runtime check, and that is the whole point.** A
+mapper calls the entry point with whatever it likes: NULL, its own allocation
+base and size, a fabricated object. A non-NULL pointer that is not a
+`DRIVER_OBJECT` is indistinguishable from a real one right up to the moment the
+driver writes `DriverUnload` through it, so the decision cannot be deferred to
+run time. With the constant set, both parameters are ignored and the entry point
+provably never touches RCX or RDX - which is checkable, and was checked, by
+disassembling the first instructions of both binaries.
+
+The extent `SvOwnsPage` compares against then comes from `SvSetImageExtent`
+instead of `DriverStart`/`DriverSize`. `__ImageBase` is reached RIP-relatively,
+so it is right wherever the mapper put the image and does not even depend on the
+relocations being applied; `SizeOfImage` is read from the PE headers at that
+address. A mapper that allocates `SizeOfImage` and copies only sections leaves
+that first page blank, which is legitimate, so a header that does not look like
+a PE image falls back to a 1 MiB span. Over-stating the extent costs a refused
+watchpoint on whatever follows us in memory; under-stating it would let a watch
+be armed on our own globals, which is the outcome `SvOwnsPage` exists to
+prevent.
+
+Two things it does not give you, and both matter more than the flag does.
+
+**There is no unload routine in the binary at all.** `SvDriverUnload` is
+`#if`'d out, because nothing could call it: an image the loader never loaded is
+an image the loader never unloads. Everything that path does - devirtualise,
+release the snapshot, disarm IBS, stop the probes, free the nested page tables -
+simply does not happen, and the way out of a manually mapped hypervisor is a
+reboot. If that ever needs to change, the honest fix is a control command that
+runs the teardown and leaves the image mapped, not a fake `DRIVER_OBJECT`.
+
+**Kernel SEH depends on the mapper.** x64 exception dispatch finds unwind
+information through the loader's inverted function table, which is built when a
+driver is loaded properly. ntoskrnl exports no `RtlAddFunctionTable` - it is not
+in `ntoskrnl.lib`, which was checked - so the image cannot insert itself. If the
+mapper does not do it, every `__try` in this driver is decoration and an
+exception inside one is an unhandled kernel exception. `call.c` is the one that
+notices, and CLAUDE.md is already honest about how little that guard buys even
+on a properly loaded driver.
+
+**It has never been mapped.** It compiles, CI compiles it, and its entry point
+has been disassembled. Nothing here has been loaded by a mapper and run, so
+treat it exactly like `ibs.c`: the gate has been tested and the path has not.
+
 ## Known open items
 
 - Long-duration stability under concurrent load is unverified; `soak.ps1` has
@@ -323,6 +374,7 @@ pieces and read the coverage between them.
   installed. `cursortests.ps1` waits for ordinary system activity instead. Worth
   noting the guest itself survived both: `LastBootUpTime` never moved.
 - The resume-from-sleep path has never run; see above.
+- The manual-map build has never been mapped; see above.
 - A processor that comes online *after* load has no per-processor slot and stays
   unvirtualised. It is no longer an out-of-bounds array index, but it is still a
   gap: closing it means `KeRegisterProcessorChangeCallback`.
@@ -674,6 +726,7 @@ in `HKLM` for anyone curious about the machine.
 | `STEALTHV_ALWAYS_FLUSH_TLB` | 0 | flush the ASID every entry — **leave this off** |
 | `STEALTHV_CONTROL_INTERFACE` | 1 | answer the control leaf and run its worker |
 | `STEALTHV_CONTROL_REQUIRE_CPL0` | 0 | answer the control channel only in ring 0 |
+| `STEALTHV_MANUAL_MAP` | 0 | ignore the `DRIVER_OBJECT`; `build.ps1 -ManualMap` |
 
 Everything defaults to the most concealed setting it can. Two of them are worth
 understanding before you change anything.

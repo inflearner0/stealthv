@@ -9,6 +9,9 @@
         .\build.ps1            # compile + link
         .\build.ps1 -Sign      # also create/reuse a test certificate and sign
         .\build.ps1 -Fixtures  # also build tools\umtarget.exe, a hook target
+        .\build.ps1 -ManualMap # bin\svmhv-mm.sys, the flavour that never
+                               # touches its DRIVER_OBJECT.  The driver only:
+                               # the tools are the same binary either way.
 
     driver\    the kernel driver
     include\   the control interface, shared with the tools
@@ -19,6 +22,7 @@
 param(
     [switch]$Sign,
     [switch]$Fixtures,          # tools\umtarget.exe; see the section below
+    [switch]$ManualMap,         # STEALTHV_MANUAL_MAP; see driver\config.h
     [string]$SdkVersion,        # default: newest WDK with km\ headers
     [string]$VsPath,            # default: whatever vswhere reports
     [string]$KitRoot            # default: Program Files (x86)\Windows Kits\10
@@ -27,6 +31,19 @@ param(
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $out  = Join-Path $root "bin"
+
+# The two driver flavours differ by one compile-time constant, and they must not
+# share object files: the objects are exactly what that constant changed, so
+# linking a mixture would produce a driver that half-ignores its DRIVER_OBJECT -
+# which would link cleanly and fault on load.  Manual-map objects therefore go
+# in a subdirectory of their own, and the .sys and .pdb are named apart so both
+# flavours can sit in bin\ at once.
+$objDir     = $out
+$driverName = "svmhv"
+if ($ManualMap) {
+    $objDir     = Join-Path $out "mm"
+    $driverName = "svmhv-mm"
+}
 
 # ---------------------------------------------------------------- toolchain
 # Discovered rather than hardcoded, because this also has to build on a CI
@@ -97,6 +114,7 @@ Write-Host "toolset : $msvc" -ForegroundColor DarkGray
 Write-Host "wdk     : $kit ($SdkVersion)" -ForegroundColor DarkGray
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory $out | Out-Null }
+if (-not (Test-Path $objDir)) { New-Item -ItemType Directory $objDir | Out-Null }
 
 # cl and link need the toolchain's own directory on PATH (mspdb*.dll etc).
 $env:PATH = "$msvc\bin\Hostx64\x64;$kit\bin\$SdkVersion\x64;$env:PATH"
@@ -108,6 +126,32 @@ function Invoke-Tool {
     Write-Host "[$What]" -ForegroundColor Cyan
     & $Exe @ToolArgs
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+}
+
+# A signature is what lets Windows load the driver as a service on a testsigning
+# machine.  It is signed in the manual-map flavour too, which needs it for
+# nothing at all: a mapper does not check, and a driver loaded by one was never
+# shown to the code-integrity path.  It costs a second and it means the two
+# artefacts differ only in the constant they were built with.
+function Invoke-SignDriver {
+    $signtool = "$kit\bin\$SdkVersion\x64\signtool.exe"
+    $cert = Get-ChildItem Cert:\CurrentUser\My |
+                Where-Object { $_.Subject -eq "CN=svmhv-test" } |
+                Select-Object -First 1
+    if (-not $cert) {
+        Write-Host "[creating test certificate CN=svmhv-test]" -ForegroundColor Cyan
+        $cert = New-SelfSignedCertificate -Subject "CN=svmhv-test" `
+                    -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My `
+                    -KeyUsage DigitalSignature -NotAfter (Get-Date).AddYears(5)
+    }
+    Invoke-Tool $signtool @(
+        "sign", "/v", "/fd", "SHA256", "/sha1", $cert.Thumbprint,
+        "$out\$driverName.sys"
+    ) "signtool"
+
+    # Export the public cert so the guest can trust it.
+    Export-Certificate -Cert $cert -FilePath "$out\svmhv-test.cer" -Force | Out-Null
+    Write-Host "certificate exported to $out\svmhv-test.cer"
 }
 
 # ------------------------------------------------------------------ driver
@@ -128,6 +172,11 @@ $kmDefs = @(
     "/DNTDDI_VERSION=0x0A00000C", "/D_WIN32_WINNT=0x0A00", "/DWINVER=0x0A00"
 )
 
+# config.h leaves this one #ifndef'd so the command line can win.  Every other
+# option in there is deliberately not reachable this way: a build flavour that
+# changes what the driver conceals should be a commit, not an argument.
+if ($ManualMap) { $kmDefs += "/DSTEALTHV_MANUAL_MAP=1" }
+
 $kmSources = @("svmhv.c", "npt.c", "hook.c", "trace.c", "step.c", "control.c",
                "hvcall.c", "memory.c", "objects.c", "snapshot.c", "call.c",
                "ibs.c", "usercall.c")
@@ -139,13 +188,13 @@ foreach ($src in $kmSources) {
         "/Zc:wchar_t", "/Zc:inline", "/kernel",
         "/wd4324"   # VIRTUAL_CPU is page-aligned on purpose
     ) + $kmDefs + $kmInc + @(
-        "/Fo$out\$obj", "/Fd$out\svmhv.pdb", "$root\driver\$src"
+        "/Fo$objDir\$obj", "/Fd$out\$driverName.pdb", "$root\driver\$src"
     )) "cl $src"
 }
 
 Invoke-Tool $ml64 @(
     "/nologo", "/c", "/W3", "/Zi",
-    "/Fo", "$out\svmasm.obj", "$root\driver\svmasm.asm"
+    "/Fo", "$objDir\svmasm.obj", "$root\driver\svmasm.asm"
 ) "ml64 svmasm.asm"
 
 # The object list is derived from $kmSources rather than written out again: the
@@ -153,7 +202,7 @@ Invoke-Tool $ml64 @(
 # driver with everything in it missing - which surfaces as unresolved externals
 # named after the callers, never after the file that was forgotten.
 $kmObjects = @($kmSources | ForEach-Object {
-    "$out\" + [IO.Path]::ChangeExtension($_, ".obj")
+    "$objDir\" + [IO.Path]::ChangeExtension($_, ".obj")
 })
 
 Invoke-Tool $link (@(
@@ -162,8 +211,24 @@ Invoke-Tool $link (@(
     "/OPT:REF", "/OPT:ICF", "/MANIFEST:NO",
     "/LIBPATH:$kit\Lib\$SdkVersion\km\x64",
     "ntoskrnl.lib", "hal.lib",
-    "/PDB:$out\svmhv.pdb", "/OUT:$out\svmhv.sys"
-) + $kmObjects + @("$out\svmasm.obj")) "link svmhv.sys"
+    "/PDB:$out\$driverName.pdb", "/OUT:$out\$driverName.sys"
+) + $kmObjects + @("$objDir\svmasm.obj")) "link $driverName.sys"
+
+# The tools are flavour-independent - they talk to whatever is answering the
+# VMMCALL channel, and neither of them cares how the driver got loaded - so a
+# manual-map build stops at the driver rather than rebuilding two identical
+# binaries over the ones an ordinary build just produced.
+if ($ManualMap) {
+    if ($Sign) { Invoke-SignDriver }
+
+    Write-Host ""
+    Write-Host "built (manual map):" -ForegroundColor Green
+    Get-ChildItem "$out\$driverName.sys" |
+        Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+    Write-Host "This one ignores its DRIVER_OBJECT and has no unload routine." `
+        -ForegroundColor DarkGray
+    return
+}
 
 # --------------------------------------------------------------- test app
 $umInc = @(
@@ -222,26 +287,7 @@ if ($Fixtures) {
 }
 
 # ------------------------------------------------------------------ signing
-if ($Sign) {
-    $signtool = "$kit\bin\$SdkVersion\x64\signtool.exe"
-    $cert = Get-ChildItem Cert:\CurrentUser\My |
-                Where-Object { $_.Subject -eq "CN=svmhv-test" } |
-                Select-Object -First 1
-    if (-not $cert) {
-        Write-Host "[creating test certificate CN=svmhv-test]" -ForegroundColor Cyan
-        $cert = New-SelfSignedCertificate -Subject "CN=svmhv-test" `
-                    -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My `
-                    -KeyUsage DigitalSignature -NotAfter (Get-Date).AddYears(5)
-    }
-    Invoke-Tool $signtool @(
-        "sign", "/v", "/fd", "SHA256", "/sha1", $cert.Thumbprint,
-        "$out\svmhv.sys"
-    ) "signtool"
-
-    # Export the public cert so the guest can trust it.
-    Export-Certificate -Cert $cert -FilePath "$out\svmhv-test.cer" -Force | Out-Null
-    Write-Host "certificate exported to $out\svmhv-test.cer"
-}
+if ($Sign) { Invoke-SignDriver }
 
 Write-Host ""
 Write-Host "built:" -ForegroundColor Green

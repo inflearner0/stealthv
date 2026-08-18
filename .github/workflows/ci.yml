@@ -34,19 +34,29 @@ jobs:
         shell: pwsh
         run: .\build.ps1
 
+      - name: Build the manual-map flavour
+        shell: pwsh
+        # One compile-time constant apart, and the difference is in the entry
+        # point - which is the one function nothing here can run. Compiling it
+        # is all this can honestly check, so it is what it checks.
+        run: .\build.ps1 -ManualMap
+
       - name: Check what came out
         shell: pwsh
         run: |
           # /WX means a warning already failed the step; this is about the
           # artefacts existing and being the right shape.
-          $expected = 'bin\svmhv.sys', 'bin\svmhvctl.exe', 'bin\hvtest.exe'
+          $expected = 'bin\svmhv.sys', 'bin\svmhv-mm.sys',
+                      'bin\svmhvctl.exe', 'bin\hvtest.exe'
           foreach ($file in $expected) {
             if (-not (Test-Path $file)) { throw "missing: $file" }
           }
           Get-ChildItem $expected | Select-Object Name, Length | Format-Table -AutoSize
 
-          $driver = Get-Item 'bin\svmhv.sys'
-          if ($driver.Length -lt 20kb) { throw "svmhv.sys is suspiciously small" }
+          foreach ($name in 'svmhv.sys', 'svmhv-mm.sys') {
+            $driver = Get-Item "bin\$name"
+            if ($driver.Length -lt 20kb) { throw "$name is suspiciously small" }
+          }
 
       - name: Exercise the non-loaded control probe
         shell: pwsh
@@ -100,6 +110,7 @@ jobs:
           name: stealthv-build
           path: |
             bin/svmhv.sys
+            bin/svmhv-mm.sys
             bin/svmhvctl.exe
             bin/hvtest.exe
           if-no-files-found: error

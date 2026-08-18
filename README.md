@@ -47,6 +47,26 @@ session the moment the hypervisor loads and does not recover until reboot, so a
 host-side server puts the fragile part in the wrong place. Standard library
 only — no pip step on a machine with no internet.
 
+### Manual mapping
+
+```powershell
+.\build.ps1 -ManualMap -Sign      # bin\svmhv-mm.sys
+```
+
+The same driver with `STEALTHV_MANUAL_MAP=1`. Its entry point ignores both
+parameters, so it does not care whether your mapper passes a `DRIVER_OBJECT`, a
+NULL, or its own base and size; the image extent it needs comes from
+`__ImageBase` and the PE headers instead. **Do not manual-map `svmhv.sys`** —
+that one writes `DriverUnload` through the pointer it was handed.
+
+Two things to know before relying on it. There is no unload routine in the
+manual-map build and nothing could call one, so the way out is a reboot. And
+kernel SEH finds unwind information through the loader's function table, which
+a manually mapped image is not in unless your mapper puts it there — ntoskrnl
+exports nothing to do it from inside — so every `__try` in the driver is worth
+only as much as your mapper makes it. `svmhv-mm.sys` has been built and its
+entry point disassembled; it has not been mapped and run.
+
 ## Tools
 
 Each is `svmhv_` plus the name.
@@ -129,6 +149,9 @@ it rather than guessing.
   it refuses there and has never taken a sample in this lab.
 - **The guest still resets occasionally**, idle as well as loaded, with no
   bugcheck and no dump. `LastBootUpTime` is the only honest instrument.
+- **The manual-map build has never been mapped.** It compiles, and its entry
+  point provably touches neither parameter; that is the whole of what has been
+  checked.
 
 `CLAUDE.md` has the engineering detail: the bugs that shaped the design, and
 what every instrument here lies about.

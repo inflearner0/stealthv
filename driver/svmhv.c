@@ -34,6 +34,10 @@
 #include "snapshot.h"
 #include "ibs.h"
 
+#if STEALTHV_MANUAL_MAP
+#include <ntimage.h>
+#endif
+
 #ifndef STATUS_HV_FEATURE_UNAVAILABLE
 #define STATUS_HV_FEATURE_UNAVAILABLE ((NTSTATUS)0xC0350011L)
 #endif
@@ -41,7 +45,9 @@
 NTSYSAPI    VOID    NTAPI RtlCaptureContext(PCONTEXT ContextRecord);
 
 DRIVER_INITIALIZE DriverEntry;
+#if !STEALTHV_MANUAL_MAP
 static DRIVER_UNLOAD     SvDriverUnload;
+#endif
 static KDEFERRED_ROUTINE SvVirtualizeDpc;
 static KDEFERRED_ROUTINE SvDevirtualizeDpc;
 
@@ -2712,6 +2718,15 @@ VOID SvFillExitHistogram(_Out_ SVMHV_EXIT_HISTOGRAM* Histogram)
 
 /* --------------------------------------------------------- entry/exit */
 
+/*
+ * There is no unload routine in a manual-map build, and that is not an
+ * oversight.  Nothing can call it: an image the loader never loaded is an image
+ * the loader never unloads, so a cleanup path compiled in here would be
+ * unreachable code that reads like an exit somebody could take.  The way out of
+ * a manually mapped hypervisor is a reboot.
+ */
+#if !STEALTHV_MANUAL_MAP
+
 static VOID SvDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 {
     ULONG i;
@@ -2804,6 +2819,57 @@ static VOID SvDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     DbgPrint("svmhv: unloaded\n");
 }
 
+#endif  /* !STEALTHV_MANUAL_MAP */
+
+#if STEALTHV_MANUAL_MAP
+
+/*
+ * Where this image starts and how far it runs, without a DRIVER_OBJECT to ask.
+ *
+ * __ImageBase is the linker's own symbol for the start of the image, and a
+ * reference to it is relocated like any other address, so it is correct
+ * wherever the mapper put us.  The length is in the PE headers at that address.
+ *
+ * A mapper that allocates SizeOfImage and copies only the sections leaves that
+ * first page mapped but blank, which is a legitimate thing for it to do and has
+ * to be survivable here: reading it is safe (the page is ours either way), and
+ * when it does not describe a PE image the extent falls back to a span large
+ * enough to cover any build of this driver.  Over-stating it costs nothing but
+ * a refused watchpoint on whatever follows us in memory; under-stating it would
+ * let a watch be armed on our own globals, which is the one outcome SvOwnsPage
+ * exists to prevent.
+ */
+#define SVMHV_ASSUMED_IMAGE_SIZE    (1024u * 1024u)
+
+extern IMAGE_DOS_HEADER __ImageBase;
+
+static VOID SvSetImageExtent(VOID)
+{
+    const IMAGE_DOS_HEADER* dos = &__ImageBase;
+    const IMAGE_NT_HEADERS64* nt;
+
+    g_ImageBase = (PVOID)dos;
+    g_ImageSize = SVMHV_ASSUMED_IMAGE_SIZE;
+
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew <= 0 ||
+        (ULONG)dos->e_lfanew > PAGE_SIZE - sizeof(IMAGE_NT_HEADERS64))
+    {
+        return;
+    }
+
+    nt = (const IMAGE_NT_HEADERS64*)((const UINT8*)dos + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.SizeOfImage == 0)
+    {
+        return;
+    }
+
+    g_ImageSize = nt->OptionalHeader.SizeOfImage;
+}
+
+#endif  /* STEALTHV_MANUAL_MAP */
+
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
     NTSTATUS status;
@@ -2811,6 +2877,18 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
+#if STEALTHV_MANUAL_MAP
+    /*
+     * Neither parameter is looked at.  A mapper calls this with whatever it
+     * likes, and a bad DRIVER_OBJECT pointer is indistinguishable from a good
+     * one until it is written through; see STEALTHV_MANUAL_MAP in config.h.
+     */
+    UNREFERENCED_PARAMETER(DriverObject);
+    SvSetImageExtent();
+
+    DbgPrint("svmhv: loading (manual-map build), image %p + %lx\n",
+             g_ImageBase, g_ImageSize);
+#else
     DriverObject->DriverUnload = SvDriverUnload;
 
     /* Remembered so a watchpoint can be refused on any of our own globals;
@@ -2819,6 +2897,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     g_ImageSize = DriverObject->DriverSize;
 
     DbgPrint("svmhv: loading\n");
+#endif
 
     if (!SvIsSvmSupported())
     {
